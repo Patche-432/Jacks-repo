@@ -2248,7 +2248,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="panel-title">Configuration</div>
 
     <label>Symbols (comma-separated)</label>
-    <input id="cfg-symbols" value="EURUSD" />
+    <input id="cfg-symbols" value="EURUSD,USDJPY,GBPUSD,AUDUSD,USDCAD,USDCHF" />
 
     <label>Lot Size</label>
     <input id="cfg-volume" type="number" value="0.01" step="0.01" />
@@ -2743,7 +2743,7 @@ if __name__ == "__main__":
     if "--run" in sys.argv:
         # Headless bot mode — no Flask
         bot = Bot(
-            symbols=[["EURUSD"],["USDJPY"],["GBPUSD"],["AUDUSD"],["USDCAD"],["USDCHF"]],
+            symbols=["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD", "USDCHF"],
             volume=0.01,
             poll_secs=30,
             dry_run=True,   # ← change to False for live trading
