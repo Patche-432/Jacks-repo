@@ -4,7 +4,7 @@ ai_pro.py
 AI Pro — CHoCH + Daily Levels Strategy, AI-Enhanced Edition
 ===============================================================
 Merges the complete AI Pro signal engine (CHoCH + Continuation on 4
-environments, ATR-based SL/TP, RSI exit, partial-close/breakeven trail)
+environments, ATR-based SL/TP, partial-close/breakeven trail)
 with the full AI stack from algo-v2:
 
   ► LocalLLM         — Qwen2.5-1.5B-Instruct via HuggingFace Transformers
@@ -60,6 +60,9 @@ allowed_symbols:
   - XAUUSD
   - USDJPY
   - GBPJPY
+  - AUDUSD
+  - USDCAD
+  - USDCHF
 
 sessions:
   always: [0, 24]
@@ -114,12 +117,13 @@ import logging
 import math
 import os
 import re
+import socket
 import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -496,9 +500,6 @@ class AI_Pro:
         sl_atr_mult: float              = 1.5,
         tp_atr_mult: float              = 3.0,
         level_interaction_bars: int     = 10,
-        rsi_period: int                 = 14,
-        rsi_overbought: float           = 70.0,
-        rsi_oversold: float             = 30.0,
         partial_close_ratio: float      = 0.5,
         partial_close_rr: float         = 1.0,
         breakeven_buffer_pips: float    = 1.0,
@@ -513,9 +514,6 @@ class AI_Pro:
         self.sl_atr_mult              = sl_atr_mult
         self.tp_atr_mult              = tp_atr_mult
         self.level_interaction_bars   = level_interaction_bars
-        self.rsi_period               = rsi_period
-        self.rsi_overbought           = rsi_overbought
-        self.rsi_oversold             = rsi_oversold
         self.partial_close_ratio      = partial_close_ratio
         self.partial_close_rr         = partial_close_rr
         self.breakeven_buffer_pips    = breakeven_buffer_pips
@@ -526,6 +524,7 @@ class AI_Pro:
 
         self._partial_closed_tickets: set  = set()
         self._filling_mode_cache: dict     = {}
+        self._mt5_info_cache: dict         = {"connected": False, "error": "MT5 not initialized"}
 
         # AI components
         self._llm: Optional[LocalLLM]      = None
@@ -542,6 +541,9 @@ class AI_Pro:
         if self._llm is None:
             self._llm = LocalLLM()
         return self._llm
+
+    def mt5_snapshot(self) -> dict:
+        return dict(self._mt5_info_cache)
 
     # ------------------------------------------------------------------ #
     # Filling mode detection                                              #
@@ -590,10 +592,11 @@ class AI_Pro:
     def _ensure_mt5(self) -> bool:
         if not self._mt5_initialized:
             import MetaTrader5 as mt5
-            if mt5.initialize():
+            if _mt5_initialize():
                 self._mt5_initialized = True
+                self._mt5_info_cache = _read_mt5_runtime_info(mt5)
             else:
-                log.error("Failed to initialize MT5")
+                log.error("Failed to initialize MT5: %s", mt5.last_error())
         return self._mt5_initialized
 
     def _select_symbol(self, symbol: str) -> bool:
@@ -604,7 +607,7 @@ class AI_Pro:
         return True
 
     # ------------------------------------------------------------------ #
-    # ATR & RSI                                                           #
+    # ATR                                                                  #
     # ------------------------------------------------------------------ #
 
     def _calculate_atr(self, df: pd.DataFrame) -> float:
@@ -618,64 +621,6 @@ class AI_Pro:
         ], axis=1).max(axis=1)
         atr = tr.rolling(self.atr_period).mean().iloc[-1]
         return float(atr) if not np.isnan(atr) else 0.0001
-
-    def _calculate_rsi(self, df: pd.DataFrame) -> float:
-        closes = df["close"].copy()
-        if len(closes) < self.rsi_period + 1:
-            return 50.0
-        delta    = closes.diff()
-        gain     = delta.clip(lower=0)
-        loss     = (-delta).clip(lower=0)
-        avg_gain = gain.ewm(alpha=1 / self.rsi_period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1 / self.rsi_period, adjust=False).mean()
-        rs       = avg_gain / avg_loss.replace(0, np.nan)
-        rsi      = 100 - (100 / (1 + rs))
-        latest   = rsi.iloc[-1]
-        return float(latest) if not np.isnan(latest) else 50.0
-
-    # ------------------------------------------------------------------ #
-    # RSI Exit                                                            #
-    # ------------------------------------------------------------------ #
-
-    def check_rsi_exit(self, symbol: str,
-                        df: pd.DataFrame = None) -> list:
-        import MetaTrader5 as mt5
-        if not self._ensure_mt5():
-            return []
-        if df is None:
-            df = self._fetch_m15(symbol)
-        if df is None:
-            return []
-
-        rsi = self._calculate_rsi(df)
-        log_thought("rsi_exit", symbol, "scan",
-                    f"RSI={rsi:.2f}  OB={self.rsi_overbought}  OS={self.rsi_oversold}")
-
-        positions = mt5.positions_get(symbol=symbol)
-        if not positions:
-            return []
-
-        results = []
-        for pos in positions:
-            should_exit = False
-            if pos.type == mt5.ORDER_TYPE_BUY and rsi >= self.rsi_overbought:
-                should_exit = True
-                reason = f"RSI {rsi:.2f} >= OB {self.rsi_overbought}"
-            elif pos.type == mt5.ORDER_TYPE_SELL and rsi <= self.rsi_oversold:
-                should_exit = True
-                reason = f"RSI {rsi:.2f} <= OS {self.rsi_oversold}"
-            else:
-                reason = ""
-
-            if should_exit:
-                log_thought("rsi_exit", symbol, "exit",
-                            f"Closing #{pos.ticket}: {reason}",
-                            action="close")
-                result = self._close_position(pos)
-                result["rsi"] = rsi
-                result["exit_reason"] = reason
-                results.append(result)
-        return results
 
     def _close_position(self, position) -> dict:
         import MetaTrader5 as mt5
@@ -706,7 +651,7 @@ class AI_Pro:
             record_outcome(
                 symbol=symbol,
                 direction="BUY" if is_buy else "SELL",
-                source="rsi_exit",
+                source="strategy_exit",
                 entry=float(position.price_open),
                 exit_price=float(result.price),
                 volume=volume,
@@ -1334,7 +1279,6 @@ Respond ONLY with JSON:
         reason_txt   = signal.get("reason",      "")
         pdh          = signal.get("previous_day_high", 0)
         pdl          = signal.get("previous_day_low",  0)
-        rsi          = signal.get("rsi", 50)
         atr          = signal.get("atr", 0)
 
         prompt = f"""You are reviewing a AI_Pro trade signal.
@@ -1353,13 +1297,12 @@ LEVELS:
   Prev Day High:   {pdh:.5f}
   Prev Day Low:    {pdl:.5f}
   ATR:             {atr}
-  RSI:             {rsi}
   Last 10 closes:  {last_closes}
 
 RECENT TRADE HISTORY: {history}
 
 Should this AI Pro signal be taken?
-Consider: is price genuinely near the key level? Is RSI extreme or neutral?
+Consider: is price genuinely near the key level?
 Does the last-close momentum match the direction?
 
 Reply ONLY with JSON:
@@ -1415,7 +1358,6 @@ Reply ONLY with JSON:
             return self._neutral(symbol, "Could not fetch M15 data")
 
         atr           = self._calculate_atr(df)
-        rsi           = self._calculate_rsi(df)
         current_price = df.iloc[-1]["close"]
         zone          = atr * self.atr_tolerance_multiplier
 
@@ -1439,7 +1381,6 @@ Reply ONLY with JSON:
             "previous_day_high": daily_levels["high"],
             "previous_day_low":  daily_levels["low"],
             "atr":               round(atr, 6),
-            "rsi":               round(rsi, 2),
             "dynamic_zone_pips": round(zone / 0.0001, 1),
             "ai_approved":       None,
             "ai_reason":         None,
@@ -1555,12 +1496,32 @@ Reply ONLY with JSON:
                 signal["ai_reason"]     = "AI disabled"
                 signal["ai_confidence"] = 1.0
         else:
-            cr = choch_data.get("reason", "") if choch_data else ""
-            co = cont_data.get("reason",  "") if cont_data  else ""
-            signal["reason"] = (
-                f"No environment active. "
-                f"near_high={near_high}(choch={near_high_choch}) "
-                f"near_low={near_low}(choch={near_low_choch}) | {cr} | {co}"
+            env1_ready = bool(
+                choch_data and choch_data["choch_detected"]
+                and choch_data["type"] == "bullish"
+                and near_low_choch and failed_low_at_pdl
+                and self._momentum_aligned(df, "buy")
+            )
+            env2_ready = bool(
+                choch_data and choch_data["choch_detected"]
+                and choch_data["type"] == "bearish"
+                and near_high_choch and failed_high_at_pdh
+                and self._momentum_aligned(df, "sell")
+            )
+            env3_ready = bool(
+                cont_data and cont_data["continuation_detected"]
+                and cont_data["type"] == "bullish"
+                and broke_above_pdh and near_high
+                and self._momentum_aligned(df, "buy")
+            )
+            env4_ready = bool(
+                cont_data and cont_data["continuation_detected"]
+                and cont_data["type"] == "bearish"
+                and broke_below_pdl and near_low
+                and self._momentum_aligned(df, "sell")
+            )
+            signal["reason"] = self._environment_summary(
+                env1_ready, env2_ready, env3_ready, env4_ready
             )
 
         log_thought(
@@ -1581,9 +1542,23 @@ Reply ONLY with JSON:
             "signal_source": None, "reason": reason,
             "confidence": 0, "entry_price": None,
             "stop_loss": None, "take_profit": None,
-            "rsi": None, "atr": None,
+            "atr": None,
             "ai_approved": None, "ai_reason": None, "ai_confidence": None,
         }
+
+    @staticmethod
+    def _environment_summary(
+        env1: bool = False,
+        env2: bool = False,
+        env3: bool = False,
+        env4: bool = False,
+    ) -> str:
+        return " | ".join([
+            f"ENV1 {'active' if env1 else 'inactive'}",
+            f"ENV2 {'active' if env2 else 'inactive'}",
+            f"ENV3 {'active' if env3 else 'inactive'}",
+            f"ENV4 {'active' if env4 else 'inactive'}",
+        ])
 
     # ------------------------------------------------------------------ #
     # Trade execution                                                       #
@@ -1669,12 +1644,11 @@ Reply ONLY with JSON:
                      lot_size: float = 0.01) -> dict:
         """
         Full cycle:
-          1. RSI exit scan
-          2. Partial close + breakeven (AI Pro native)
-          3. AI risk manager (rule-based + Qwen)
-          4. AI Pro signal generation
-          5. AI signal review (Qwen gate)
-          6. Auto-execution if confidence >= 70 AND AI approved
+          1. Partial close + breakeven (AI Pro native)
+          2. AI risk manager (rule-based + Qwen)
+          3. AI Pro signal generation
+          4. AI signal review (Qwen gate)
+          5. Auto-execution if confidence >= 70 AND AI approved
         """
         log.info("=" * 65)
         log.info("AI Pro — %s", symbol)
@@ -1682,16 +1656,15 @@ Reply ONLY with JSON:
 
         df = self._fetch_m15(symbol)
 
-        # Step 1 — RSI exit
-        exit_results = self.check_rsi_exit(symbol, df)
+        exit_results = []
 
-        # Step 2 — AI Pro partial close / breakeven
+        # Step 1 — AI Pro partial close / breakeven
         partial_results = self.check_partial_close_and_breakeven(symbol)
 
-        # Step 3 — AI risk manager
+        # Step 2 — AI risk manager
         ai_risk_results = self.run_ai_risk_manager(symbol)
 
-        # Step 4+5 — Signal + AI review
+        # Step 3+4 — Signal + AI review
         signal = self.generate_trade_signal(symbol)
 
         log.info("Signal      : %s", signal["signal"])
@@ -1699,7 +1672,6 @@ Reply ONLY with JSON:
         log.info("Confidence  : %s%%", signal["confidence"])
         log.info("AI approved : %s", signal.get("ai_approved"))
         log.info("AI reason   : %s", signal.get("ai_reason"))
-        log.info("RSI         : %s", signal.get("rsi"))
         log.info("Reason      : %s", signal["reason"])
 
         trade_result = None
@@ -1742,6 +1714,7 @@ Reply ONLY with JSON:
             import MetaTrader5 as mt5
             mt5.shutdown()
             self._mt5_initialized = False
+            self._mt5_info_cache = {"connected": False, "error": "MT5 shutdown"}
 
 
 # ============================================================ #
@@ -1783,7 +1756,7 @@ class Bot:
         self,
         symbols:   list  = None,
         volume:    float = 0.01,
-        poll_secs: float = 30.0,
+        poll_secs: float = 300.0,
         dry_run:   bool  = False,
         auto_trade: bool = True,
         use_ai:    bool  = True,
@@ -1794,6 +1767,14 @@ class Bot:
         self.poll_secs  = float(poll_secs)
         self.dry_run    = bool(dry_run)
         self.auto_trade = bool(auto_trade)
+        self.use_ai     = bool(use_ai)
+        self.strategy_config = {
+            "atr_tolerance_multiplier": float(strategy_kwargs.get("atr_tolerance_multiplier", 1.5)),
+            "sl_atr_mult":              float(strategy_kwargs.get("sl_atr_mult", 1.5)),
+            "tp_atr_mult":              float(strategy_kwargs.get("tp_atr_mult", 3.0)),
+            "partial_close_rr":         float(strategy_kwargs.get("partial_close_rr", 1.0)),
+            "breakeven_buffer_pips":    float(strategy_kwargs.get("breakeven_buffer_pips", 1.0)),
+        }
 
         self._strategy  = AI_Pro(use_ai=use_ai, **strategy_kwargs)
         self._running   = False
@@ -1834,6 +1815,20 @@ class Bot:
         with self._positions_lock:
             return list(self._positions)
 
+    def config_snapshot(self) -> dict:
+        return {
+            "symbols":    list(self.symbols),
+            "volume":     self.volume,
+            "poll_secs":  self.poll_secs,
+            "dry_run":    self.dry_run,
+            "auto_trade": self.auto_trade,
+            "use_ai":     self.use_ai,
+            "strategy":   dict(self.strategy_config),
+        }
+
+    def mt5_snapshot(self) -> dict:
+        return self._strategy.mt5_snapshot()
+
     def _loop(self) -> None:
         while self._running:
             for sym in self.symbols:
@@ -1868,8 +1863,20 @@ class Bot:
         if rules:
             block = _check_hard_rules(rules, symbol, positions, tick, info, records)
             if block:
+                blocked_result = {
+                    "signal": self._strategy._neutral(
+                        symbol,
+                        self._strategy._environment_summary(),
+                    ),
+                    "trade_result": None,
+                    "exit_results": [],
+                    "partial_results": [],
+                    "ai_risk_results": [],
+                }
                 log_thought("preflight", symbol, "blocked", block, action="hold")
                 log.info("[%s] Blocked: %s", symbol, block)
+                with self._results_lock:
+                    self._results[symbol] = blocked_result
                 return
 
             max_pos = rules.max_open_positions
@@ -1931,6 +1938,322 @@ CORS(app)
 _bot_lock:   threading.Lock          = threading.Lock()
 _bot:        Optional[Bot]           = None
 _bot_thread: Optional[threading.Thread] = None
+_bot_last_error: Optional[str] = None
+_last_bot_config: dict = {
+    "symbols":    ["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD", "USDCHF"],
+    "volume":     0.01,
+    "poll_secs":  300.0,
+    "dry_run":    False,
+    "auto_trade": True,
+    "use_ai":     True,
+    "strategy": {
+        "atr_tolerance_multiplier": 1.5,
+        "sl_atr_mult":              1.5,
+        "tp_atr_mult":              3.0,
+        "partial_close_rr":         1.0,
+        "breakeven_buffer_pips":    1.0,
+    },
+}
+
+
+def _mt5_initialize() -> bool:
+    import MetaTrader5 as mt5
+    config = dict(MT5_CONFIG)
+
+    # Allow env vars to override the static config without editing the file.
+    env_path = os.getenv("MT5_PATH")
+    env_login = os.getenv("MT5_LOGIN")
+    env_password = os.getenv("MT5_PASSWORD")
+    env_server = os.getenv("MT5_SERVER")
+    if env_path:
+        config["path"] = env_path
+    if env_login:
+        try:
+            config["login"] = int(env_login)
+        except ValueError:
+            config["login"] = env_login
+    if env_password:
+        config["password"] = env_password
+    if env_server:
+        config["server"] = env_server
+
+    def _candidate_paths() -> list:
+        candidates = []
+        explicit = config.get("path")
+        if explicit:
+            candidates.append(str(explicit))
+        common_roots = [
+            Path("C:/Program Files/MetaTrader 5/terminal64.exe"),
+            Path("C:/Program Files/MetaTrader 5/terminal.exe"),
+            Path("C:/Program Files (x86)/MetaTrader 5/terminal64.exe"),
+            Path("C:/Program Files (x86)/MetaTrader 5/terminal.exe"),
+        ]
+        user_root = Path.home() / "AppData" / "Roaming" / "MetaQuotes" / "Terminal"
+        if user_root.exists():
+            for child in user_root.iterdir():
+                for exe_name in ("terminal64.exe", "terminal.exe"):
+                    exe_path = child / exe_name
+                    if exe_path.exists():
+                        candidates.append(str(exe_path))
+        candidates.extend(str(p) for p in common_roots if p.exists())
+
+        seen = set()
+        ordered = []
+        for item in candidates:
+            norm = str(item).lower()
+            if norm not in seen:
+                seen.add(norm)
+                ordered.append(str(item))
+        return ordered
+
+    attempts: list = []
+    base_kwargs = {k: v for k, v in config.items() if v is not None and k != "path"}
+
+    if mt5.initialize(**base_kwargs):
+        return True
+    attempts.append({"kwargs": dict(base_kwargs), "error": mt5.last_error()})
+    try:
+        mt5.shutdown()
+    except Exception:
+        pass
+
+    for path in _candidate_paths():
+        kwargs = dict(base_kwargs)
+        kwargs["path"] = path
+        if mt5.initialize(**kwargs):
+            return True
+        attempts.append({"kwargs": dict(kwargs), "error": mt5.last_error()})
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+
+    if attempts:
+        last = attempts[-1]
+        log.error("MT5 init failed after %d attempts; last kwargs=%s error=%s",
+                  len(attempts), last["kwargs"], last["error"])
+    return False
+
+
+def _read_mt5_runtime_info(mt5) -> dict:
+    terminal = mt5.terminal_info()
+    account = mt5.account_info()
+    symbols = list(mt5.symbols_get() or [])
+    visible_symbols = [str(s.name) for s in symbols if getattr(s, "visible", False)]
+    return {
+        "connected": True,
+        "terminal_name": getattr(terminal, "name", None) if terminal else None,
+        "terminal_company": getattr(terminal, "company", None) if terminal else None,
+        "terminal_path": getattr(terminal, "path", None) if terminal else None,
+        "login": getattr(account, "login", None) if account else None,
+        "server": getattr(account, "server", None) if account else None,
+        "account_name": getattr(account, "name", None) if account else None,
+        "currency": getattr(account, "currency", None) if account else None,
+        "trade_allowed": bool(getattr(account, "trade_allowed", False)) if account else False,
+        "visible_symbols": visible_symbols,
+        "symbols_total": len(symbols),
+    }
+
+
+def _mt5_snapshot(shutdown_when_done: bool = True) -> dict:
+    try:
+        import MetaTrader5 as mt5
+    except Exception as exc:
+        return {"connected": False, "error": f"MetaTrader5 import failed: {exc}"}
+
+    if not _mt5_initialize():
+        err = mt5.last_error()
+        return {"connected": False, "error": f"MT5 initialize failed: {err}"}
+
+    try:
+        return _read_mt5_runtime_info(mt5)
+    finally:
+        if shutdown_when_done:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+
+
+def _read_mt5_positions(mt5) -> list:
+    positions = []
+    for p in (mt5.positions_get() or []):
+        tick = mt5.symbol_info_tick(p.symbol)
+        is_long = p.type == mt5.POSITION_TYPE_BUY
+        positions.append({
+            "ticket":    int(p.ticket),
+            "symbol":    str(p.symbol),
+            "direction": "BUY" if is_long else "SELL",
+            "volume":    float(p.volume),
+            "entry":     round(float(p.price_open), 5),
+            "current":   round(float(tick.bid if is_long else tick.ask), 5) if tick else None,
+            "sl":        round(float(p.sl), 5) if p.sl else None,
+            "tp":        round(float(p.tp), 5) if p.tp else None,
+            "pnl":       round(float(p.profit), 4),
+            "open_time": int(p.time),
+        })
+    return positions
+
+
+def _mt5_positions_snapshot(shutdown_when_done: bool = True) -> list:
+    try:
+        import MetaTrader5 as mt5
+    except Exception:
+        return []
+
+    if not _mt5_initialize():
+        return []
+
+    try:
+        return _read_mt5_positions(mt5)
+    finally:
+        if shutdown_when_done:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+
+
+def _read_mt5_trade_history(mt5, days: int = 30, limit: int = 100) -> list:
+    utc_now = datetime.now(timezone.utc)
+    from_dt = utc_now - timedelta(days=max(1, int(days)))
+    deals = list(mt5.history_deals_get(from_dt, utc_now) or [])
+
+    try:
+        exit_entries = {mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY, mt5.DEAL_ENTRY_INOUT}
+        buy_type = mt5.DEAL_TYPE_BUY
+    except AttributeError:
+        exit_entries = {1, 3, 2}
+        buy_type = 0
+
+    grouped: dict = {}
+    for d in deals:
+        position_id = int(getattr(d, "position_id", 0) or 0)
+        if not position_id:
+            continue
+        bucket = grouped.setdefault(position_id, {
+            "position_id": position_id,
+            "symbol": str(getattr(d, "symbol", "")),
+            "entry_price": None,
+            "exit_price": None,
+            "exit_price_notional": 0.0,
+            "exit_volume": 0.0,
+            "direction": None,
+            "volume": 0.0,
+            "pnl": 0.0,
+            "ts": None,
+            "source": "",
+            "initial_sl": None,
+            "initial_tp": None,
+            "entry_deals": [],
+            "exit_deals": [],
+        })
+        if bucket["symbol"] == "" and getattr(d, "symbol", None):
+            bucket["symbol"] = str(d.symbol)
+        entry_flag = int(getattr(d, "entry", -1))
+        
+        # Collect all costs (commission, swap, fee) from all deals
+        deal_cost = (float(getattr(d, "commission", 0.0) or 0.0) +
+                     float(getattr(d, "swap", 0.0) or 0.0) +
+                     float(getattr(d, "fee", 0.0) or 0.0))
+        bucket["pnl"] += deal_cost
+        
+        if entry_flag in exit_entries:
+            bucket["exit_deals"].append(d)
+            exit_vol = abs(float(getattr(d, "volume", 0.0) or 0.0))
+            bucket["pnl"] += float(getattr(d, "profit", 0.0) or 0.0)
+            bucket["volume"] += exit_vol
+            bucket["exit_volume"] += exit_vol
+            bucket["exit_price_notional"] += exit_vol * float(getattr(d, "price", 0.0) or 0.0)
+            bucket["ts"] = datetime.fromtimestamp(int(getattr(d, "time", 0)), timezone.utc).isoformat()
+            bucket["source"] = str(getattr(d, "comment", "") or "")
+        else:
+            bucket["entry_deals"].append(d)
+            if bucket["entry_price"] is None:
+                bucket["entry_price"] = float(getattr(d, "price", 0.0) or 0.0)
+                bucket["direction"] = "BUY" if int(getattr(d, "type", -1)) == buy_type else "SELL"
+
+    trades = []
+    for bucket in grouped.values():
+        if not bucket["exit_deals"]:
+            continue
+        if bucket["exit_volume"] > 0:
+            bucket["exit_price"] = bucket["exit_price_notional"] / bucket["exit_volume"]
+
+        try:
+            orders = list(mt5.history_orders_get(position=bucket["position_id"]) or [])
+        except Exception:
+            orders = []
+        for order in orders:
+            sl = float(getattr(order, "sl", 0.0) or 0.0)
+            tp = float(getattr(order, "tp", 0.0) or 0.0)
+            if bucket["initial_sl"] is None and sl:
+                bucket["initial_sl"] = sl
+            if bucket["initial_tp"] is None and tp:
+                bucket["initial_tp"] = tp
+            if bucket["initial_sl"] is not None and bucket["initial_tp"] is not None:
+                break
+
+        realized_rr = None
+        entry_price = float(bucket["entry_price"] or 0.0)
+        exit_price = float(bucket["exit_price"] or 0.0)
+        initial_sl = float(bucket["initial_sl"] or 0.0) if bucket["initial_sl"] is not None else None
+        if entry_price and exit_price and initial_sl not in (None, 0.0):
+            risk = abs(entry_price - initial_sl)
+            reward = abs(exit_price - entry_price)
+            if risk > 0:
+                realized_rr = reward / risk
+
+        trades.append({
+            "ts": bucket["ts"],
+            "symbol": bucket["symbol"],
+            "direction": bucket["direction"] or "BUY",
+            "source": bucket["source"] or "mt5",
+            "entry": round(entry_price, 5),
+            "exit": round(exit_price, 5),
+            "volume": round(float(bucket["volume"]), 2),
+            "pnl": round(float(bucket["pnl"]), 4),
+            "position_id": bucket["position_id"],
+            "initial_sl": round(initial_sl, 5) if initial_sl not in (None, 0.0) else None,
+            "initial_tp": round(float(bucket["initial_tp"] or 0.0), 5) if bucket["initial_tp"] not in (None, 0.0) else None,
+            "rr": round(realized_rr, 2) if realized_rr is not None else None,
+            "outcome": "WIN" if float(bucket["pnl"]) > 0 else "LOSS" if float(bucket["pnl"]) < 0 else "BE",
+        })
+
+    trades.sort(key=lambda x: x["ts"] or "", reverse=True)
+    return trades[:limit]
+
+
+def _mt5_trade_history_snapshot(days: int = 30, limit: int = 100, shutdown_when_done: bool = True) -> list:
+    try:
+        import MetaTrader5 as mt5
+    except Exception:
+        return []
+
+    if not _mt5_initialize():
+        return []
+
+    try:
+        return _read_mt5_trade_history(mt5, days=days, limit=limit)
+    finally:
+        if shutdown_when_done:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+
+
+def _choose_http_port() -> int:
+    host = "0.0.0.0"
+    preferred_port = int(os.getenv("APP_PORT", "80"))
+    fallback_port = 5000
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, preferred_port))
+            return preferred_port
+        except OSError:
+            return fallback_port
 
 # ---- Embedded Dashboard HTML -------------------------------- #
 
@@ -2141,7 +2464,6 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .thought[data-source="ai_pro_signal"] { border-left-color: var(--accent); }
   .thought[data-source="ai_entry"]      { border-left-color: var(--ai); }
   .thought[data-source="ai_risk"]       { border-left-color: var(--warn); }
-  .thought[data-source="rsi_exit"]      { border-left-color: var(--sell); }
   .thought[data-source="partial_close"] { border-left-color: var(--buy); }
   .thought[data-source="execution"]     { border-left-color: var(--buy); }
   .thought[data-source="rule_risk"]     { border-left-color: var(--warn); }
@@ -2166,6 +2488,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     letter-spacing: 0.8px;
     text-transform: uppercase;
     color: var(--accent);
+  }
+
+  .thought-symbol {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    color: var(--text);
   }
 
   .thought[data-source="ai_entry"] .thought-source,
@@ -2202,7 +2531,46 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
   .empty { color: var(--muted); font-size: 12px; padding: 20px 0; }
 
+  .meta-box {
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+  }
+
+  .meta-row { color: var(--dim); }
+  .meta-row strong { color: var(--text); font-weight: 600; }
+
   /* History */
+  .history-summary {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .summary-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .summary-label {
+    font-size: 10px;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin-bottom: 6px;
+  }
+  .summary-value {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text);
+  }
   #history-list { display: flex; flex-direction: column; gap: 6px; }
   .hist-item {
     background: var(--surface);
@@ -2254,7 +2622,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <input id="cfg-volume" type="number" value="0.01" step="0.01" />
 
     <label>Poll Interval (s)</label>
-    <input id="cfg-poll" type="number" value="30" />
+    <input id="cfg-poll" type="number" value="300" />
 
     <div class="checkbox-row">
       <input type="checkbox" id="cfg-dry" />
@@ -2269,6 +2637,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <label style="margin:0">Auto Trade</label>
     </div>
 
+    <div id="mt5-meta" class="meta-box">
+      <div class="meta-row"><strong>MT5:</strong> checking...</div>
+    </div>
+
     <hr class="divider">
 
     <div class="panel-title">Strategy Params</div>
@@ -2281,12 +2653,6 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
     <label>TP ATR Mult</label>
     <input id="cfg-tp-mult" type="number" value="3.0" step="0.1" />
-
-    <label>RSI Overbought</label>
-    <input id="cfg-rsi-ob" type="number" value="70" />
-
-    <label>RSI Oversold</label>
-    <input id="cfg-rsi-os" type="number" value="30" />
 
     <label>Partial Close RR</label>
     <input id="cfg-pc-rr" type="number" value="1.0" step="0.1" />
@@ -2321,6 +2687,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
   <div class="panel" id="tab-history" style="display:none">
     <div class="panel-title">Trade History</div>
+    <div id="history-summary" class="history-summary"></div>
     <div id="history-list"><div class="empty">No trades recorded yet.</div></div>
   </div>
 </main>
@@ -2329,6 +2696,60 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 let since = null;
 let pollTimer = null;
 let activeTab = 'signals';
+let configSynced = false;
+
+function fmtNum(value, digits = 2) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : '';
+}
+
+function syncConfig(status) {
+  const cfg = status.config || {};
+  const strategy = cfg.strategy || {};
+  const live = !!status.running;
+
+  if (!configSynced || live) {
+    document.getElementById('cfg-symbols').value = (cfg.symbols || []).join(',');
+    document.getElementById('cfg-volume').value = fmtNum(cfg.volume ?? 0.01, 2);
+    document.getElementById('cfg-poll').value = String(cfg.poll_secs ?? 300);
+    document.getElementById('cfg-dry').checked = !!cfg.dry_run;
+    document.getElementById('cfg-ai').checked = !!cfg.use_ai;
+    document.getElementById('cfg-auto').checked = !!cfg.auto_trade;
+    document.getElementById('cfg-atr-mult').value = String(strategy.atr_tolerance_multiplier ?? 1.5);
+    document.getElementById('cfg-sl-mult').value = String(strategy.sl_atr_mult ?? 1.5);
+    document.getElementById('cfg-tp-mult').value = String(strategy.tp_atr_mult ?? 3.0);
+    document.getElementById('cfg-pc-rr').value = String(strategy.partial_close_rr ?? 1.0);
+    document.getElementById('cfg-be-buf').value = String(strategy.breakeven_buffer_pips ?? 1.0);
+    configSynced = true;
+  }
+
+  ['cfg-symbols','cfg-volume','cfg-poll','cfg-dry','cfg-ai','cfg-auto','cfg-atr-mult','cfg-sl-mult','cfg-tp-mult','cfg-pc-rr','cfg-be-buf']
+    .forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.disabled = live;
+    });
+}
+
+function updateMt5Meta(status) {
+  const mt5 = status.mt5 || {};
+  const botError = status.bot_error;
+  const el = document.getElementById('mt5-meta');
+  if (!el) return;
+
+  if (!mt5.connected) {
+    el.innerHTML = `<div class="meta-row"><strong>MT5:</strong> disconnected</div>
+      <div class="meta-row">${botError || mt5.error || 'No MT5 session available'}</div>`;
+    return;
+  }
+
+  const symbols = (mt5.visible_symbols || []).slice(0, 8).join(', ') || 'none';
+  el.innerHTML = `
+    <div class="meta-row"><strong>MT5:</strong> connected${mt5.server ? ' @ ' + mt5.server : ''}</div>
+    <div class="meta-row"><strong>Account:</strong> ${mt5.login || 'n/a'}${mt5.account_name ? ' · ' + mt5.account_name : ''}</div>
+    <div class="meta-row"><strong>Trade Allowed:</strong> ${mt5.trade_allowed ? 'yes' : 'no'}</div>
+    <div class="meta-row"><strong>Visible Symbols:</strong> ${symbols}</div>
+  `;
+}
 
 function showTab(tab) {
   ['signals','thoughts','positions','history'].forEach(t => {
@@ -2353,8 +2774,6 @@ async function startBot() {
       atr_tolerance_multiplier: parseFloat(document.getElementById('cfg-atr-mult').value),
       sl_atr_mult:              parseFloat(document.getElementById('cfg-sl-mult').value),
       tp_atr_mult:              parseFloat(document.getElementById('cfg-tp-mult').value),
-      rsi_overbought:           parseFloat(document.getElementById('cfg-rsi-ob').value),
-      rsi_oversold:             parseFloat(document.getElementById('cfg-rsi-os').value),
       partial_close_rr:         parseFloat(document.getElementById('cfg-pc-rr').value),
       breakeven_buffer_pips:    parseFloat(document.getElementById('cfg-be-buf').value),
     }
@@ -2379,6 +2798,7 @@ async function stopBot() {
   document.getElementById('start-btn').style.display = 'inline-block';
   document.getElementById('stop-btn').style.display = 'none';
   stopPolling();
+  await poll();
 }
 
 function startPolling() {
@@ -2415,6 +2835,8 @@ function updateStatus(status) {
   const dot  = document.getElementById('dot');
   const txt  = document.getElementById('status-text');
   const live = status.running;
+  syncConfig(status);
+  updateMt5Meta(status);
   dot.className = 'status-dot' + (live ? ' live' : '');
   txt.textContent = live ? 'LIVE' : 'idle';
   txt.style.color = live ? 'var(--buy)' : 'var(--dim)';
@@ -2489,6 +2911,7 @@ function appendThoughts(items) {
       <div class="thought-header">
         <div class="thought-meta">
           <span class="thought-source">${t.source}</span>
+          <span class="thought-symbol">${t.symbol || '—'}</span>
           <span class="thought-stage">${t.stage}</span>
           ${conf}
         </div>
@@ -2542,11 +2965,51 @@ function updatePositions(positions) {
 async function loadHistory() {
   const r = await fetch('/bot/history');
   const data = await r.json();
-  const trades = (data.trades || []).slice().reverse();
+  const trades = data.trades || [];
+  const accountBalance = data.account_balance;
   const el = document.getElementById('history-list');
+  const summaryEl = document.getElementById('history-summary');
   if (!trades.length) {
+    if (summaryEl) summaryEl.innerHTML = '';
     el.innerHTML = '<div class="empty">No trades recorded yet.</div>';
     return;
+  }
+  const wins = trades.filter(t => t.outcome === 'WIN').length;
+  const losses = trades.filter(t => t.outcome === 'LOSS').length;
+  const totalPnl = trades.reduce((sum, t) => sum + Number(t.pnl || 0), 0);
+  const rrValues = trades
+    .map(t => Number(t.rr))
+    .filter(v => Number.isFinite(v) && v > 0);
+  const avgRr = rrValues.length
+    ? (rrValues.reduce((sum, v) => sum + v, 0) / rrValues.length)
+    : null;
+  if (summaryEl) {
+    let accountCard = '';
+    if (accountBalance != null) {
+      accountCard = `
+      <div class="summary-card">
+        <div class="summary-label">Account Size</div>
+        <div class="summary-value">$${accountBalance.toFixed(2)}</div>
+      </div>`;
+    }
+    summaryEl.innerHTML = `${accountCard}
+      <div class="summary-card">
+        <div class="summary-label">Net P&L</div>
+        <div class="summary-value ${totalPnl > 0 ? 'pnl-pos' : totalPnl < 0 ? 'pnl-neg' : ''}">${totalPnl > 0 ? '+' : ''}${totalPnl.toFixed(2)}</div>
+      </div>
+      <div class="summary-card">
+        <div class="summary-label">Wins</div>
+        <div class="summary-value pnl-pos">${wins}</div>
+      </div>
+      <div class="summary-card">
+        <div class="summary-label">Losses</div>
+        <div class="summary-value pnl-neg">${losses}</div>
+      </div>
+      <div class="summary-card">
+        <div class="summary-label">Avg R:R</div>
+        <div class="summary-value">${avgRr != null ? avgRr.toFixed(2) + 'R' : '-'}</div>
+      </div>
+    `;
   }
   el.innerHTML = trades.map(t => {
     const pnlCls = t.pnl > 0 ? 'pnl-pos' : t.pnl < 0 ? 'pnl-neg' : '';
@@ -2567,6 +3030,9 @@ async function loadHistory() {
   try {
     const r = await fetch('/bot/status');
     const s = await r.json();
+    updateStatus(s);
+    if (activeTab === 'signals') updateSignals(s);
+    if (activeTab === 'positions') updatePositions(s.open_positions || []);
     if (s.running) {
       document.getElementById('start-btn').style.display = 'none';
       document.getElementById('stop-btn').style.display = 'inline-block';
@@ -2587,10 +3053,12 @@ def _get_bot():
 
 
 def _run_bot_thread(bot: Bot) -> None:
-    global _bot, _bot_thread
+    global _bot, _bot_thread, _bot_last_error
     try:
+        _bot_last_error = None
         bot.run()
     except Exception as exc:
+        _bot_last_error = str(exc)
         log.exception("Bot crashed: %s", exc)
     finally:
         with _bot_lock:
@@ -2612,6 +3080,42 @@ def health():
 def bot_status():
     bot, thread = _get_bot()
     running = bool(thread and thread.is_alive())
+    mt5 = bot.mt5_snapshot() if bot and running else _mt5_snapshot(shutdown_when_done=True)
+    open_positions = []
+    if running:
+        try:
+            import MetaTrader5 as mt5_module
+            open_positions = _read_mt5_positions(mt5_module)
+        except Exception:
+            open_positions = bot.open_positions() if bot else []
+    else:
+        open_positions = _mt5_positions_snapshot(shutdown_when_done=True)
+    latest_results = bot.latest_results() if bot else {}
+    all_decisions = {}
+    config = bot.config_snapshot() if bot else dict(_last_bot_config)
+    if (not bot) and mt5.get("connected") and mt5.get("visible_symbols") and not config.get("symbols"):
+        config["symbols"] = list(mt5["visible_symbols"][:6])
+    if bot:
+        for sym in bot.symbols:
+            result = latest_results.get(sym)
+            signal = (result or {}).get("signal") or {
+                "signal": "neutral",
+                "ai_approved": None,
+                "reason": "Waiting for first scan...",
+                "stop_loss": None,
+                "take_profit": None,
+                "confidence": 0,
+                "ai_reason": None,
+            }
+            all_decisions[sym] = {
+                "action":     signal["signal"],
+                "approve":    signal.get("ai_approved"),
+                "reason":     signal["reason"],
+                "sl":         signal.get("stop_loss"),
+                "tp":         signal.get("take_profit"),
+                "confidence": signal["confidence"] / 100,
+                "ai_reason":  signal.get("ai_reason"),
+            }
     return jsonify({
         "running": running,
         "bot": {
@@ -2621,19 +3125,11 @@ def bot_status():
             "dry_run":    bot.dry_run,
             "auto_trade": bot.auto_trade,
         } if bot else None,
-        "all_decisions":  {
-            sym: {
-                "action":     r["signal"]["signal"],
-                "approve":    r["signal"].get("ai_approved"),
-                "reason":     r["signal"]["reason"],
-                "sl":         r["signal"].get("stop_loss"),
-                "tp":         r["signal"].get("take_profit"),
-                "confidence": r["signal"]["confidence"] / 100,
-                "ai_reason":  r["signal"].get("ai_reason"),
-            }
-            for sym, r in (bot.latest_results().items() if bot else {})
-        },
-        "open_positions": bot.open_positions() if bot else [],
+        "config": config,
+        "mt5": mt5,
+        "bot_error": _bot_last_error,
+        "all_decisions":  all_decisions,
+        "open_positions": open_positions,
     })
 
 
@@ -2656,7 +3152,7 @@ def clear_thoughts_api():
 
 @app.route("/bot/start", methods=["POST"])
 def bot_start():
-    global _bot, _bot_thread
+    global _bot, _bot_thread, _last_bot_config, _bot_last_error
     bot, thread = _get_bot()
     if thread and thread.is_alive():
         return jsonify({"error": "Already running"}), 409
@@ -2675,7 +3171,7 @@ def bot_start():
 
     try:
         volume    = float(data.get("volume", 0.01))
-        poll_secs = float(data.get("poll_secs", 30.0))
+        poll_secs = float(data.get("poll_secs", 300.0))
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -2683,6 +3179,27 @@ def bot_start():
     auto_trade = bool(data.get("auto_trade", True))
     use_ai     = bool(data.get("use_ai",     True))
     strategy   = data.get("strategy", {}) or {}
+
+    _last_bot_config = {
+        "symbols":    list(symbols),
+        "volume":     volume,
+        "poll_secs":  poll_secs,
+        "dry_run":    dry_run,
+        "auto_trade": auto_trade,
+        "use_ai":     use_ai,
+        "strategy": {
+            "atr_tolerance_multiplier": float(strategy.get("atr_tolerance_multiplier", 1.5)),
+            "sl_atr_mult":              float(strategy.get("sl_atr_mult",              1.5)),
+            "tp_atr_mult":              float(strategy.get("tp_atr_mult",              3.0)),
+            "partial_close_rr":         float(strategy.get("partial_close_rr",         1.0)),
+            "breakeven_buffer_pips":    float(strategy.get("breakeven_buffer_pips",    1.0)),
+        },
+    }
+
+    mt5_check = _mt5_snapshot(shutdown_when_done=True)
+    if not mt5_check.get("connected"):
+        _bot_last_error = mt5_check.get("error") or "MT5 connection failed"
+        return jsonify({"error": _bot_last_error}), 400
 
     clear_thoughts()
 
@@ -2696,8 +3213,6 @@ def bot_start():
         atr_tolerance_multiplier = float(strategy.get("atr_tolerance_multiplier", 1.5)),
         sl_atr_mult              = float(strategy.get("sl_atr_mult",              1.5)),
         tp_atr_mult              = float(strategy.get("tp_atr_mult",              3.0)),
-        rsi_overbought           = float(strategy.get("rsi_overbought",           70.0)),
-        rsi_oversold             = float(strategy.get("rsi_oversold",             30.0)),
         partial_close_rr         = float(strategy.get("partial_close_rr",         1.0)),
         breakeven_buffer_pips    = float(strategy.get("breakeven_buffer_pips",    1.0)),
     )
@@ -2721,7 +3236,33 @@ def bot_stop():
 
 @app.route("/bot/history")
 def bot_history():
-    return jsonify({"trades": _load_memory()})
+    bot, thread = _get_bot()
+    running = bool(thread and thread.is_alive())
+    trades = []
+    account_balance = None
+    
+    if running:
+        try:
+            import MetaTrader5 as mt5
+            trades = _read_mt5_trade_history(mt5, days=30, limit=100)
+            acc_info = mt5.account_info()
+            if acc_info:
+                account_balance = round(float(acc_info.balance), 2)
+        except Exception:
+            trades = _load_memory()
+    else:
+        trades = _mt5_trade_history_snapshot(days=30, limit=100, shutdown_when_done=True)
+        try:
+            import MetaTrader5 as mt5
+            if _mt5_initialize():
+                acc_info = mt5.account_info()
+                if acc_info:
+                    account_balance = round(float(acc_info.balance), 2)
+                mt5.shutdown()
+        except Exception:
+            pass
+    
+    return jsonify({"trades": trades, "account_balance": account_balance})
 
 
 @app.route("/bot/signal/<symbol>")
@@ -2745,7 +3286,7 @@ if __name__ == "__main__":
         bot = Bot(
             symbols=["EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "USDCAD", "USDCHF"],
             volume=0.01,
-            poll_secs=30,
+            poll_secs=300,
             dry_run=True,   # ← change to False for live trading
             auto_trade=True,
             use_ai=True,
@@ -2753,8 +3294,14 @@ if __name__ == "__main__":
         bot.run()
     else:
         print("=" * 55)
-        print("  AI Pro Dashboard → http://localhost:5000")
+        chosen_port = _choose_http_port()
+        if chosen_port == 80:
+            print("  AI Pro Dashboard -> http://localhost")
+            print("  LAN: http://<your-ip>")
+        else:
+            print(f"  AI Pro Dashboard -> http://localhost:{chosen_port}")
+            print(f"  LAN: http://<your-ip>:{chosen_port}")
         print("  API:  /bot/start  /bot/stop  /bot/status")
         print("  Test: /bot/signal/EURUSD")
         print("=" * 55)
-        app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+        app.run(host="0.0.0.0", port=chosen_port, debug=False, threaded=True)
