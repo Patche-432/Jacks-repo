@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+core/.mt5_key
+core/mt5_credentials_config.json
