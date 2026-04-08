@@ -2728,7 +2728,11 @@ def bot_status():
 def bot_ai_thoughts():
     try:
         since = request.args.get("since")
-        limit = min(int(request.args.get("limit", 60)), 120)
+        limit_str = request.args.get("limit", "60")
+        try:
+            limit = min(int(limit_str), 120)
+        except (ValueError, TypeError):
+            limit = 60  # Default to 60 if parsing fails
         return jsonify({"ok": True,
                         "thoughts": get_thoughts(since_ts=since, limit=limit)})
     except Exception as exc:
