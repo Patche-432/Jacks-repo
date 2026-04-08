@@ -48,7 +48,7 @@ async function connectMt5(){
     path: document.getElementById('mt5-path').value||null,
   };
   try{
-    const r=await fetch('/mt5/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const r=await fetch('/api/mt5/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     const data=await r.json();
     if(data.ok){
       mt5Connected=true;
@@ -62,11 +62,28 @@ async function connectMt5(){
       setMt5ModalStatus('✗ '+( data.error||'Connection failed'),'err');
     }
   } catch(e){
-    setMt5ModalStatus('✗ Could not reach server — is ai_pro.py running?','err');
+    setMt5ModalStatus('✗ Could not reach server — is server.py running?','err');
   } finally{
     btn.disabled=false; btn.textContent='Connect';
   }
 }
+
+/* ── MT5 status polling ── */
+async function checkMt5Status(){
+  try{
+    const r=await fetch('/api/mt5/status');
+    const data=await r.json();
+    mt5Connected=!!data.connected;
+    updateMt5({mt5:data});
+    const cb=document.getElementById('connect-btn');
+    if(cb){
+      cb.style.background=mt5Connected?'var(--green)':'';
+      cb.textContent=mt5Connected?'MT5 ✓':'Connect MT5';
+    }
+  }catch(e){DEBUG.warn('MT5 status check failed',e);}
+}
+// Poll MT5 connection status every 2 seconds
+setInterval(checkMt5Status,2000);
 // ── STARTUP SEQUENCE (runs once DOM is ready) ──
 document.addEventListener('DOMContentLoaded', async () => {
 
@@ -78,43 +95,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 2. Fire-and-forget: warm up the AI in the background
   fetch('/ai/init', { method: 'POST' }).catch(() => {});
 
-  // 3. Check if MT5 credentials are already saved
+  // 3. Check current MT5 connection status
   try {
-    const credsRes = await fetch('/mt5/credentials');
-    const creds = await credsRes.json();
-
-    if (creds.saved) {
-      // Credentials exist → auto-connect silently (no modal)
-      DEBUG.log('🔌 Saved MT5 credentials found — auto-connecting…');
-      try {
-        const connRes = await fetch('/mt5/connect', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(creds.credentials)
-        });
-        const connData = await connRes.json();
-        if (connData.ok) {
-          mt5Connected = true;
-          DEBUG.log('✅ MT5 auto-connected');
-          if (connData.mt5) updateMt5({ mt5: connData.mt5 });
-          const cb = document.getElementById('connect-btn');
-          if (cb) { cb.style.background = 'var(--green)'; cb.textContent = 'MT5 ✓'; }
-        } else {
-          DEBUG.warn('⚠️ MT5 auto-connect failed — opening modal', connData.error);
-          openMt5Modal();
-        }
-      } catch (e) {
-        DEBUG.error('MT5 auto-connect error', e);
-        openMt5Modal();
-      }
-    } else {
-      // No credentials saved → prompt the user
-      DEBUG.log('📋 No MT5 credentials saved — showing modal');
-      openMt5Modal();
+    const statusRes = await fetch('/api/mt5/status');
+    const status = await statusRes.json();
+    if (status.connected) {
+      mt5Connected = true;
+      DEBUG.log('✅ MT5 already connected');
+      updateMt5({ mt5: status });
+      const cb = document.getElementById('connect-btn');
+      if (cb) { cb.style.background = 'var(--green)'; cb.textContent = 'MT5 ✓'; }
     }
   } catch (e) {
-    DEBUG.warn('Could not reach /mt5/credentials — skipping auto-connect', e);
-    // Don't force the modal open if the endpoint itself is missing
+    DEBUG.warn('Could not reach /api/mt5/status — server may not be running', e);
   }
 
   // 4. Initial status poll + start live polling if bot is already running
