@@ -8,10 +8,10 @@ Merges the complete FORTIS AI Pro signal engine (CHoCH + Continuation on 4
 environments, ATR-based SL/TP, partial-close/breakeven trail)
 with the full AI stack from algo-v2:
 
-  ► LocalLLM         — Qwen2.5-1.5B-Instruct via HuggingFace Transformers
+  ► LocalLLM         — DeepSeek-R1-Distill-Qwen-1.5B via HuggingFace Transformers
   ► Thought Logger   — thread-safe in-memory AI reasoning log (last 120)
-  ► AI Signal Review — Qwen validates every AI Pro signal before execution
-  ► AI Risk Manager  — Qwen reviews open positions every N ticks
+  ► AI Signal Review — DeepSeek validates every AI Pro signal before execution
+  ► AI Risk Manager  — DeepSeek reviews open positions every N ticks
                        (trail harder / tighten / close if momentum gone)
   ► Trade Memory     — JSON persistence (last 100 trades, win/loss stats)
   ► Flask Dashboard  — REST API + embedded UI at http://localhost:5000
@@ -25,7 +25,7 @@ ENV 4 │ Continuation SELL — broke below PDL, retesting it as resistance
 
 All environments still require momentum alignment + level interaction.
 CHoCH signals have priority (confidence 85) over Continuation (65-75).
-Auto-trade only fires when confidence >= 70 AND Qwen approves.
+Auto-trade only fires when confidence >= 70 AND DeepSeek approves.
 
 Usage:
     python ai_pro.py              # starts Flask on :5000, bot idle
@@ -174,7 +174,7 @@ log = logging.getLogger("ai_pro")
 _MEMORY_PATH = Path(__file__).resolve().parent / "ai_pro_trade_log.json"
 
 # ============================================================ #
-# SECTION 3 — LOCAL LLM (Qwen2.5-1.5B-Instruct)               #
+# SECTION 3 — LOCAL LLM (DeepSeek-R1-Distill-Qwen-1.5B)        #
 # ============================================================ #
 
 class LocalLLM:
@@ -189,7 +189,7 @@ class LocalLLM:
 
     def __init__(self, model_name: Optional[str] = None) -> None:
         self.model_name = model_name or os.getenv(
-            "AI_MODEL", "Qwen/Qwen2.5-1.5B-Instruct"
+            "AI_MODEL", "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
         )
 
     def _ensure_loaded(self) -> None:
@@ -548,13 +548,13 @@ class AI_Pro:
     AI Pro — CHoCH + Daily Levels Strategy, AI-Enhanced Edition.
 
     Signal engine from the CHoCH + Daily Levels core.
-    Each signal is reviewed by a local Qwen LLM before execution.
+    Each signal is reviewed by a local DeepSeek LLM before execution.
     Open positions are monitored by an AI risk manager every N ticks.
     All AI reasoning is persisted in the thought log (see /ai_thoughts).
     """
 
-    CONFIDENCE_THRESHOLD = 0.40   # Qwen min confidence to approve a trade
-    AI_REVIEW_TICKS      = 10     # Qwen reviews open positions every N ticks (reduced from 3 to hold winners longer)
+    CONFIDENCE_THRESHOLD = 0.40   # DeepSeek min confidence to approve a trade
+    AI_REVIEW_TICKS      = 10     # DeepSeek reviews open positions every N ticks (reduced from 3 to hold winners longer)
 
     def __init__(
         self,
@@ -878,7 +878,7 @@ class AI_Pro:
                                   point: float, digits: int,
                                   atr: float) -> Optional[dict]:
         """
-        Calls Qwen to review one open position.
+        Calls DeepSeek to review one open position.
         Returns an action dict or None if hold.
         """
         import MetaTrader5 as mt5
@@ -960,7 +960,7 @@ Respond ONLY with JSON:
 {{"action":"hold","new_sl":null,"reason":"short reason"}}"""
 
         log_thought("ai_risk", symbol, "review_start",
-                    f"Asking Qwen about #{ticket} {direction} "
+                    f"Asking DeepSeek about #{ticket} {direction} "
                     f"({profit_pts:+.0f}pts, peak {peak:.0f}pts)",
                     detail=f"entry={entry:.5f} price={cur_price:.5f} "
                            f"SL={cur_sl:.5f} TP={cur_tp:.5f}")
@@ -1019,7 +1019,7 @@ Respond ONLY with JSON:
     def run_ai_risk_manager(self, symbol: str) -> list:
         """
         Called each cycle BEFORE entry signal generation.
-        Runs rule-based checks (BE, trail) AND Qwen review every N ticks.
+        Runs rule-based checks (BE, trail) AND DeepSeek review every N ticks.
         """
         import MetaTrader5 as mt5
         if not self._ensure_mt5():
@@ -1474,13 +1474,13 @@ Respond ONLY with JSON:
         }
 
     # ------------------------------------------------------------------ #
-    # AI Signal Review (Qwen approves/rejects AI Pro signal)              #
+    # AI Signal Review (DeepSeek approves/rejects AI Pro signal)           #
     # ------------------------------------------------------------------ #
 
     def _ai_review_signal(self, symbol: str, signal: dict,
                            df: pd.DataFrame) -> dict:
         """
-        Sends the AI Pro signal to Qwen for approval.
+        Sends the AI Pro signal to DeepSeek for approval.
         Returns {"approve": bool, "reason": str, "confidence": float}.
         """
         records      = _load_memory()
