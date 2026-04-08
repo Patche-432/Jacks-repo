@@ -1,1 +1,60 @@
-from flask import Flask, jsonify, send_from_directory\nfrom core.mt5_connection import MT5Connection\n\napp = Flask(__name__)\n\n# Initialize MT5 connection\nmt5_connection = MT5Connection()\n\n@app.route('/')\ndef serve_dashboard():\n    return send_from_directory('', 'index.html')\n\n@app.route('/mt5/connect', methods=['POST'])\ndef connect_mt5():\n    # Logic to connect to MT5\n    result = mt5_connection.connect()\n    return jsonify({'status': 'connected' if result else 'failed'})\n\n@app.route('/mt5/disconnect', methods=['POST'])\ndef disconnect_mt5():\n    # Logic to disconnect from MT5\n    mt5_connection.disconnect()\n    return jsonify({'status': 'disconnected'})\n\n@app.route('/mt5/status', methods=['GET'])\ndef status_mt5():\n    # Logic to get MT5 connection status\n    status = mt5_connection.is_connected()\n    return jsonify({'status': 'connected' if status else 'disconnected'})\n\nif __name__ == '__main__':\n    app.run(debug=True)\n
+"""Flask server for MT5 dashboard"""
+
+from flask import Flask, jsonify, send_from_directory
+from flask_cors import CORS
+import logging
+from core.mt5_connection import MT5Connection
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+app = Flask(__name__, static_folder='.', static_url_path='')
+CORS(app)
+
+mt5_conn = None
+
+@app.route('/')
+def serve_dashboard():
+    """Serve the main dashboard"""
+    return send_from_directory('.', 'index.html')
+
+@app.route('/api/mt5/connect', methods=['POST'])
+def api_connect_mt5():
+    """Connect to MT5"""
+    global mt5_conn
+    try:
+        cfg = {}
+        mt5_conn = MT5Connection(cfg)
+        if mt5_conn.connect():
+            runtime = mt5_conn.runtime_info()
+            return jsonify({'connected': True, **runtime})
+        else:
+            return jsonify({'connected': False, 'error': 'Failed to connect'}), 400
+    except Exception as e:
+        log.error(f"MT5 connect error: {e}")
+        return jsonify({'connected': False, 'error': str(e)}), 500
+
+@app.route('/api/mt5/status', methods=['GET'])
+def api_mt5_status():
+    """Get MT5 connection status"""
+    global mt5_conn
+    if not mt5_conn or not mt5_conn.is_connected():
+        return jsonify({'connected': False})
+    try:
+        runtime = mt5_conn.runtime_info()
+        return jsonify(runtime)
+    except Exception as e:
+        log.error(f"Status error: {e}")
+        return jsonify({'connected': False}), 500
+
+@app.route('/api/mt5/disconnect', methods=['POST'])
+def api_disconnect_mt5():
+    """Disconnect from MT5"""
+    global mt5_conn
+    if mt5_conn:
+        mt5_conn.disconnect()
+        mt5_conn = None
+    return jsonify({'ok': True})
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000, debug=True)
