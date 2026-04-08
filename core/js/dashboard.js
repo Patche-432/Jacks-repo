@@ -240,3 +240,42 @@ function applyConfig() {
         poll: document.getElementById('cfg-poll').value,
     });
 }
+// Fetch AI thoughts every 2 seconds
+let lastThoughtTs = null;
+
+setInterval(() => {
+    fetch('/bot/ai_thoughts?limit=60')
+        .then(r => r.json())
+        .then(data => {
+            if (!data.ok) return;
+            const thoughts = data.thoughts || [];
+            displayThoughts(thoughts);
+        })
+        .catch(() => {});
+}, 2000);
+
+function displayThoughts(thoughts) {
+    const container = document.getElementById('thoughts');
+    const count = document.getElementById('thought-count');
+    
+    if (thoughts.length === 0) {
+        container.innerHTML = '<div class="empty-state">No AI thoughts yet</div>';
+        count.textContent = '0 entries';
+        return;
+    }
+    
+    count.textContent = thoughts.length + ' entries';
+    
+    container.innerHTML = thoughts.map(t => `
+        <div class="thought-entry" style="padding:10px; border-bottom:1px solid var(--line); font-size:11px;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                <strong style="color:var(--cyan)">${t.source}</strong>
+                <span style="color:var(--txt2);">${t.stage}</span>
+                <span style="color:var(--txt3);">${new Date(t.ts).toLocaleTimeString()}</span>
+            </div>
+            <div style="color:var(--txt); margin-bottom:4px;">${t.summary}</div>
+            ${t.detail ? `<div style="color:var(--txt2); font-size:10px; margin-bottom:2px;">📋 ${t.detail}</div>` : ''}
+            ${t.confidence !== null ? `<div style="color:var(--txt3);">Confidence: ${(t.confidence*100).toFixed(0)}%</div>` : ''}
+        </div>
+    `).join('');
+}

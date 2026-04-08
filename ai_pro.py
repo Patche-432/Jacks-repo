@@ -298,7 +298,12 @@ def get_thoughts(since_ts: Optional[str] = None, limit: int = 60) -> list:
     with _thoughts_lock:
         items = list(_thoughts)
     if since_ts:
-        items = [t for t in items if t["ts"] > since_ts]
+        try:
+            # Only include thoughts with timestamp >= since_ts
+            items = [t for t in items if str(t.get("ts", "")) >= since_ts]
+        except Exception:
+            # If comparison fails, return all items
+            pass
     return items[-limit:]
 
 

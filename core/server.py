@@ -1,5 +1,5 @@
 """Flask server for MT5 dashboard"""
-
+from datetime import datetime, timezone
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 import logging
@@ -111,6 +111,55 @@ def bot_status():
     else:
         bot_running = False
         return jsonify({'ok': True, 'running': False})
+from collections import deque
+import threading
+
+# AI Thoughts storage (same as ai_pro.py)
+_thoughts_lock = threading.Lock()
+_thoughts = deque(maxlen=120)
+
+def log_thought(source, symbol, stage, summary, detail=None, action=None, confidence=None):
+    try:
+        from datetime import datetime, timezone
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "source": source,
+            "symbol": symbol,
+            "stage": stage,
+            "summary": summary,
+            "detail": detail or "",
+            "action": action or "",
+            "confidence": round(confidence, 2) if confidence is not None else None,
+        }
+        with _thoughts_lock:
+            _thoughts.append(entry)
+    except Exception:
+        pass
+
+def get_thoughts(since_ts=None, limit=60):
+    with _thoughts_lock:
+        items = list(_thoughts)
+    if since_ts:
+        items = [t for t in items if t["ts"] > since_ts]
+    return items[-limit:]
+
+def clear_thoughts():
+    with _thoughts_lock:
+        _thoughts.clear()
+
+@app.route('/bot/ai_thoughts', methods=['GET'])
+def bot_ai_thoughts():
+    try:
+        since = request.args.get("since")
+        limit = min(int(request.args.get("limit", 60)), 120)
+        return jsonify({"ok": True, "thoughts": get_thoughts(since_ts=since, limit=limit)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "thoughts": []}), 500
+
+@app.route('/bot/thoughts/clear', methods=['POST'])
+def clear_thoughts_api():
+    clear_thoughts()
+    return jsonify({"ok": True})
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5000, debug=True)
