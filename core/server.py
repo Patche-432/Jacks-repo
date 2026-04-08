@@ -57,5 +57,60 @@ def api_disconnect_mt5():
         mt5_conn = None
     return jsonify({'ok': True})
 
+import subprocess
+
+bot_process = None
+bot_running = False
+
+@app.route('/bot/start', methods=['POST'])
+def bot_start():
+    """Start the AI Pro bot"""
+    global bot_process, bot_running
+    
+    if bot_running and bot_process and bot_process.poll() is None:
+        return jsonify({'ok': False, 'error': 'Bot already running'}), 400
+    
+    try:
+        ai_pro_path = os.path.join(root_path, 'ai_pro.py')
+        env = os.environ.copy()
+        env['PYTHONPATH'] = os.path.join(root_path, 'core') + os.pathsep + env.get('PYTHONPATH', '')
+        bot_process = subprocess.Popen(
+            ['python', ai_pro_path, '--run'], 
+            cwd=root_path,
+            env=env
+        )
+        bot_running = True
+        log.info("AI Pro bot started (PID: %d)", bot_process.pid)
+        return jsonify({'ok': True, 'running': True})
+    except Exception as e:
+        log.error(f"Failed to start bot: {e}")
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/bot/stop', methods=['POST'])
+def bot_stop():
+    """Stop the AI Pro bot"""
+    global bot_process, bot_running
+    
+    if bot_process and bot_process.poll() is None:
+        bot_process.terminate()
+        try:
+            bot_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            bot_process.kill()
+        log.info("AI Pro bot stopped")
+    
+    bot_running = False
+    return jsonify({'ok': True, 'running': False})
+
+@app.route('/bot/status', methods=['GET'])
+def bot_status():
+    """Get bot status"""
+    global bot_process, bot_running
+    if bot_process and bot_process.poll() is None:
+        return jsonify({'ok': True, 'running': True})
+    else:
+        bot_running = False
+        return jsonify({'ok': True, 'running': False})
+
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5000, debug=True)

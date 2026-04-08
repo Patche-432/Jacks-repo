@@ -63,3 +63,51 @@ setInterval(() => {
         .then(data => updateMt5Display(data))
         .catch(() => {});
 }, 2000);
+
+// Bot Control
+async function startBot() {
+    const btn = document.getElementById('start-btn');
+    btn.disabled = true;
+    btn.textContent = 'Starting…';
+    
+    try {
+        const r = await fetch('/bot/start', {method: 'POST'});
+        const data = await r.json();
+        if (data.ok && data.running) {
+            document.getElementById('dot').className = 'dot live';
+            document.getElementById('status-text').textContent = 'live';
+            document.getElementById('start-btn').style.display = 'none';
+            document.getElementById('stop-btn').style.display = 'inline-block';
+        } else {
+            alert('Error: ' + (data.error || 'Unknown'));
+        }
+    } catch (e) {
+        alert('Failed to start bot: ' + e.message);
+    }
+    btn.disabled = false;
+}
+
+async function stopBot() {
+    const btn = document.getElementById('stop-btn');
+    btn.disabled = true;
+    
+    try {
+        await fetch('/bot/stop', {method: 'POST'});
+        document.getElementById('dot').className = 'dot';
+        document.getElementById('status-text').textContent = 'idle';
+        document.getElementById('start-btn').style.display = 'inline-block';
+        document.getElementById('stop-btn').style.display = 'none';
+    } catch (e) {
+        alert('Failed to stop bot: ' + e.message);
+    }
+    btn.disabled = false;
+}
+
+// Other functions (placeholder)
+function showTab(tab) { console.log('Showing tab:', tab); }
+function toggleSym(el) { el.classList.toggle('active'); }
+function stepInput(id, delta, min) { }
+function setPoll(val, el) { }
+function updateRR() { }
+function clearThoughts() { }
+function applyConfig() { }
