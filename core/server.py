@@ -8,15 +8,16 @@ from mt5_connection import MT5Connection
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-app = Flask(__name__, static_folder='..', static_url_path='', root_path='/core')
+import os
+root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+app = Flask(__name__, static_folder=root_path, static_url_path='')
 CORS(app)
 
 mt5_conn = None
 
 @app.route('/')
 def serve_dashboard():
-    """Serve the main dashboard"""
-    return send_from_directory('.', 'index.html')
+    return send_from_directory(root_path, 'index.html')
 
 @app.route('/api/mt5/connect', methods=['POST'])
 def api_connect_mt5():
