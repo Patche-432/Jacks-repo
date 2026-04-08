@@ -51,41 +51,39 @@ MT5_CONFIG: dict = {
 }
 
 # ============================================================ #
-# CREDENTIALS FILE — auto-loaded at startup                    #
+# CREDENTIALS FILE — managed via core/mt5_config.py           #
 # ============================================================ #
 
-_CREDS_PATH = Path(__file__).resolve().parent / "mt5_credentials.json"
-
 def _load_saved_credentials() -> None:
-    """Load MT5 credentials from mt5_credentials.json into MT5_CONFIG."""
+    """Load MT5 credentials from core/mt5_credentials_config.json into MT5_CONFIG."""
     global MT5_CONFIG
-    if not _CREDS_PATH.exists():
-        return
+    # Import here so the module is available after Section 2 sets up Path etc.
     try:
-        import json as _json
-        creds = _json.loads(_CREDS_PATH.read_text(encoding="utf-8"))
-        if creds.get("login"):
-            MT5_CONFIG["login"]    = int(creds["login"])
-        if creds.get("password"):
-            MT5_CONFIG["password"] = creds["password"]
-        if creds.get("server"):
-            MT5_CONFIG["server"]   = creds["server"]
-        if creds.get("path"):
-            MT5_CONFIG["path"]     = creds["path"]
-        log.info("MT5 credentials loaded from mt5_credentials.json (login=%s)", MT5_CONFIG.get("login"))
+        from core.mt5_config import load_credentials
     except Exception as exc:
-        log.warning("Could not load mt5_credentials.json: %s", exc)
+        log.warning("Could not import core.mt5_config: %s", exc)
+        return
+    creds = load_credentials()
+    if not creds:
+        return
+    if creds.get("login"):
+        MT5_CONFIG["login"]    = int(creds["login"])
+    if creds.get("password"):
+        MT5_CONFIG["password"] = creds["password"]
+    if creds.get("server"):
+        MT5_CONFIG["server"]   = creds["server"]
+    if creds.get("path"):
+        MT5_CONFIG["path"]     = creds["path"]
+    log.info("MT5 credentials loaded from core/mt5_credentials_config.json (login=%s)",
+             MT5_CONFIG.get("login"))
 
 def _save_credentials(login, password, server, path) -> None:
-    """Persist MT5 credentials to disk so they survive restarts."""
+    """Persist MT5 credentials to disk (encrypted) via core/mt5_config.py."""
     try:
-        import json as _json
-        _CREDS_PATH.write_text(_json.dumps({
-            "login": login, "password": password,
-            "server": server, "path": path,
-        }, indent=2), encoding="utf-8")
+        from core.mt5_config import save_credentials
+        save_credentials(login, password or "", server or "", path or "")
     except Exception as exc:
-        log.warning("Could not save mt5_credentials.json: %s", exc)
+        log.warning("Could not save credentials via core.mt5_config: %s", exc)
 
 # ============================================================ #
 # SECTION 1 — TRADING RULES (embedded YAML)                    #
