@@ -1,0 +1,23 @@
+# ── Web server ────────────────────────────────────────────────────────────────
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# ── Trading terminal ──────────────────────────────────────────────────────────
+MetaTrader5>=5.0.45
+
+# ── Data / numerics ───────────────────────────────────────────────────────────
+numpy>=1.26.0
+pandas>=2.2.0
+
+# ── AI / LLM ─────────────────────────────────────────────────────────────────
+torch>=2.6.0
+transformers>=4.48.0
+
+# ── Config parsing ────────────────────────────────────────────────────────────
+PyYAML>=6.0.1
+
+# ── Security — password encryption (core/mt5_config.py) ─────────────────────
+cryptography>=46.0.5
+
+# ── Process detection — running MT5 terminal (core/mt5_config.py) ────────────
+psutil>=5.9.0
