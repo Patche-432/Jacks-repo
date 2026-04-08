@@ -3,12 +3,12 @@
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 import logging
-from core.mt5_connection import MT5Connection
+from mt5_connection import MT5Connection
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-app = Flask(__name__, static_folder='.', static_url_path='')
+app = Flask(__name__, static_folder='..', static_url_path='', root_path='/core')
 CORS(app)
 
 mt5_conn = None
