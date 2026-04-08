@@ -111,3 +111,132 @@ function setPoll(val, el) { }
 function updateRR() { }
 function clearThoughts() { }
 function applyConfig() { }
+
+function showTab(tab) {
+    // Hide all tabs
+    document.querySelectorAll('.tab-panel').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+    
+    // Show selected tab
+    const tabEl = document.getElementById('tab-' + tab);
+    if (tabEl) {
+        tabEl.classList.add('active');
+        event.target.classList.add('active');
+    }
+}
+
+function toggleSym(el) {
+    el.classList.toggle('active');
+    updateSymbols();
+}
+
+function updateSymbols() {
+    const active = Array.from(document.querySelectorAll('.sym-chip.active'))
+        .map(el => el.textContent)
+        .join(',');
+    document.getElementById('cfg-symbols').value = active;
+}
+
+function stepInput(id, delta, min) {
+    const el = document.getElementById(id);
+    const val = parseFloat(el.value) + delta;
+    el.value = Math.max(min, val);
+}
+
+function setPoll(val, el) {
+    document.querySelectorAll('.poll-preset').forEach(e => e.classList.remove('active'));
+    el.classList.add('active');
+    document.getElementById('cfg-poll').value = val;
+    const display = val >= 60 ? Math.round(val/60) + 'm' : val + 's';
+    document.getElementById('poll-display').textContent = display;
+}
+
+function updateRR() {
+    const atr = parseFloat(document.getElementById('cfg-atr-mult').value);
+    const sl = parseFloat(document.getElementById('cfg-sl-mult').value);
+    const tp = parseFloat(document.getElementById('cfg-tp-mult').value);
+    const ratio = (tp * atr) / (sl * atr);
+    document.getElementById('rr-label').textContent = '1 : ' + ratio.toFixed(1);
+    document.getElementById('rr-tp-bar').style.width = (ratio * 33) + '%';
+}
+
+function clearThoughts() {
+    document.getElementById('thoughts').innerHTML = '';
+    document.getElementById('thought-count').textContent = '0 entries';
+}
+
+function applyConfig() {
+    console.log('Config applied');
+}
+// Modal functions
+function openMt5Modal() {
+    document.getElementById('mt5-modal-overlay').style.display = 'flex';
+}
+
+function closeMt5Modal() {
+    document.getElementById('mt5-modal-overlay').style.display = 'none';
+}
+
+// Proper tab switching
+function showTab(tab) {
+    document.querySelectorAll('.tab-panel').forEach(el => {
+        el.classList.remove('active');
+    });
+    document.querySelectorAll('.tab-btn').forEach(el => {
+        el.classList.remove('active');
+    });
+    
+    const panel = document.getElementById('tab-' + tab);
+    if (panel) panel.classList.add('active');
+    
+    event.target.classList.add('active');
+}
+
+// Complete other functions
+function toggleSym(el) {
+    el.classList.toggle('active');
+    updateSymbols();
+}
+
+function updateSymbols() {
+    const active = Array.from(document.querySelectorAll('.sym-chip.active'))
+        .map(el => el.textContent)
+        .join(',');
+    document.getElementById('cfg-symbols').value = active;
+}
+
+function stepInput(id, delta, min) {
+    const el = document.getElementById(id);
+    let val = parseFloat(el.value) + delta;
+    el.value = Math.max(min, val).toFixed(2);
+}
+
+function setPoll(val, el) {
+    document.querySelectorAll('.poll-preset').forEach(e => e.classList.remove('active'));
+    el.classList.add('active');
+    document.getElementById('cfg-poll').value = val;
+    const display = val >= 60 ? Math.round(val/60) + 'm' : val + 's';
+    document.getElementById('poll-display').textContent = display;
+}
+
+function updateRR() {
+    const atr = parseFloat(document.getElementById('cfg-atr-mult').value);
+    const sl = parseFloat(document.getElementById('cfg-sl-mult').value);
+    const tp = parseFloat(document.getElementById('cfg-tp-mult').value);
+    const ratio = (tp * atr) / (sl * atr);
+    document.getElementById('rr-label').textContent = '1 : ' + ratio.toFixed(1);
+    document.getElementById('rr-tp-bar').style.width = (ratio * 33) + '%';
+}
+
+function clearThoughts() {
+    document.getElementById('thoughts').innerHTML = '';
+    document.getElementById('thought-count').textContent = '0 entries';
+}
+
+function applyConfig() {
+    console.log('Config applied:', {
+        symbols: document.getElementById('cfg-symbols').value,
+        volume: document.getElementById('cfg-volume').value,
+        poll: document.getElementById('cfg-poll').value,
+    });
+}
