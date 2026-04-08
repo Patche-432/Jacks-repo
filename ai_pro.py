@@ -51,6 +51,43 @@ MT5_CONFIG: dict = {
 }
 
 # ============================================================ #
+# CREDENTIALS FILE — auto-loaded at startup                    #
+# ============================================================ #
+
+_CREDS_PATH = Path(__file__).resolve().parent / "mt5_credentials.json"
+
+def _load_saved_credentials() -> None:
+    """Load MT5 credentials from mt5_credentials.json into MT5_CONFIG."""
+    global MT5_CONFIG
+    if not _CREDS_PATH.exists():
+        return
+    try:
+        import json as _json
+        creds = _json.loads(_CREDS_PATH.read_text(encoding="utf-8"))
+        if creds.get("login"):
+            MT5_CONFIG["login"]    = int(creds["login"])
+        if creds.get("password"):
+            MT5_CONFIG["password"] = creds["password"]
+        if creds.get("server"):
+            MT5_CONFIG["server"]   = creds["server"]
+        if creds.get("path"):
+            MT5_CONFIG["path"]     = creds["path"]
+        log.info("MT5 credentials loaded from mt5_credentials.json (login=%s)", MT5_CONFIG.get("login"))
+    except Exception as exc:
+        log.warning("Could not load mt5_credentials.json: %s", exc)
+
+def _save_credentials(login, password, server, path) -> None:
+    """Persist MT5 credentials to disk so they survive restarts."""
+    try:
+        import json as _json
+        _CREDS_PATH.write_text(_json.dumps({
+            "login": login, "password": password,
+            "server": server, "path": path,
+        }, indent=2), encoding="utf-8")
+    except Exception as exc:
+        log.warning("Could not save mt5_credentials.json: %s", exc)
+
+# ============================================================ #
 # SECTION 1 — TRADING RULES (embedded YAML)                    #
 # ============================================================ #
 
@@ -2290,11 +2327,27 @@ class Bot:
 # SECTION 11 — FLASK DASHBOARD                                 #
 # ============================================================ #
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_file
 from flask_cors import CORS
+import mimetypes
+from mt5_connection import MT5Connection, MT5ConnectionError
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Locate the core/ asset folder relative to this file ──────────────
+_HERE       = Path(__file__).resolve().parent
+_CORE_HTML  = _HERE / "core" / "html"  / "index.html"
+_CORE_CSS   = _HERE / "core" / "css"   / "dashboard.css"
+_CORE_JS    = _HERE / "core" / "js"    / "dashboard.js"
+
+# Pre-load the HTML at startup (fast inline serve; refreshes on process restart)
+def _load_dashboard_html() -> str:
+    if _CORE_HTML.exists():
+        return _CORE_HTML.read_text(encoding="utf-8")
+    return "<h1>dashboard not found — expected core/html/index.html</h1>"
+
+_DASHBOARD_HTML: str = _load_dashboard_html()
 
 _bot_lock:   threading.Lock          = threading.Lock()
 _bot:        Optional[Bot]           = None
@@ -2318,82 +2371,22 @@ _last_bot_config: dict = {
 
 
 def _mt5_initialize() -> bool:
-    import MetaTrader5 as mt5
-    config = dict(MT5_CONFIG)
+    """
+    Initialize MT5 using MT5Connection.
+    Uses the global MT5_CONFIG (populated from env vars + saved credentials).
+    Returns True on success.
+    """
+    import os
+    cfg = dict(MT5_CONFIG)
 
-    # Allow env vars to override the static config without editing the file.
-    env_path = os.getenv("MT5_PATH")
-    env_login = os.getenv("MT5_LOGIN")
-    env_password = os.getenv("MT5_PASSWORD")
-    env_server = os.getenv("MT5_SERVER")
-    if env_path:
-        config["path"] = env_path
-    if env_login:
-        try:
-            config["login"] = int(env_login)
-        except ValueError:
-            config["login"] = env_login
-    if env_password:
-        config["password"] = env_password
-    if env_server:
-        config["server"] = env_server
+    # Allow env vars to override without editing this file
+    if os.getenv("MT5_PATH"):     cfg["path"]     = os.environ["MT5_PATH"]
+    if os.getenv("MT5_LOGIN"):    cfg["login"]    = os.environ["MT5_LOGIN"]
+    if os.getenv("MT5_PASSWORD"): cfg["password"] = os.environ["MT5_PASSWORD"]
+    if os.getenv("MT5_SERVER"):   cfg["server"]   = os.environ["MT5_SERVER"]
 
-    def _candidate_paths() -> list:
-        candidates = []
-        explicit = config.get("path")
-        if explicit:
-            candidates.append(str(explicit))
-        common_roots = [
-            Path("C:/Program Files/MetaTrader 5/terminal64.exe"),
-            Path("C:/Program Files/MetaTrader 5/terminal.exe"),
-            Path("C:/Program Files (x86)/MetaTrader 5/terminal64.exe"),
-            Path("C:/Program Files (x86)/MetaTrader 5/terminal.exe"),
-        ]
-        user_root = Path.home() / "AppData" / "Roaming" / "MetaQuotes" / "Terminal"
-        if user_root.exists():
-            for child in user_root.iterdir():
-                for exe_name in ("terminal64.exe", "terminal.exe"):
-                    exe_path = child / exe_name
-                    if exe_path.exists():
-                        candidates.append(str(exe_path))
-        candidates.extend(str(p) for p in common_roots if p.exists())
-
-        seen = set()
-        ordered = []
-        for item in candidates:
-            norm = str(item).lower()
-            if norm not in seen:
-                seen.add(norm)
-                ordered.append(str(item))
-        return ordered
-
-    attempts: list = []
-    base_kwargs = {k: v for k, v in config.items() if v is not None and k != "path"}
-
-    if mt5.initialize(**base_kwargs):
-        return True
-    attempts.append({"kwargs": dict(base_kwargs), "error": mt5.last_error()})
-    try:
-        mt5.shutdown()
-    except Exception:
-        pass
-
-    for path in _candidate_paths():
-        kwargs = dict(base_kwargs)
-        kwargs["path"] = path
-        if mt5.initialize(**kwargs):
-            return True
-        attempts.append({"kwargs": dict(kwargs), "error": mt5.last_error()})
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
-
-    if attempts:
-        last = attempts[-1]
-        log.error("MT5 init failed after %d attempts; last kwargs=%s error=%s",
-                  len(attempts), last["kwargs"], last["error"])
-    return False
+    conn = MT5Connection(cfg)
+    return conn.connect()
 
 
 def _read_mt5_runtime_info(mt5) -> dict:
@@ -2417,23 +2410,32 @@ def _read_mt5_runtime_info(mt5) -> dict:
 
 
 def _mt5_snapshot(shutdown_when_done: bool = True) -> dict:
-    try:
-        import MetaTrader5 as mt5
-    except Exception as exc:
-        return {"connected": False, "error": f"MetaTrader5 import failed: {exc}"}
+    """
+    Connect, read terminal + account info, then disconnect.
+    Returns a serialisable dict; 'connected' is False on any failure.
+    """
+    import os
+    cfg = dict(MT5_CONFIG)
+    if os.getenv("MT5_PATH"):     cfg["path"]     = os.environ["MT5_PATH"]
+    if os.getenv("MT5_LOGIN"):    cfg["login"]    = os.environ["MT5_LOGIN"]
+    if os.getenv("MT5_PASSWORD"): cfg["password"] = os.environ["MT5_PASSWORD"]
+    if os.getenv("MT5_SERVER"):   cfg["server"]   = os.environ["MT5_SERVER"]
 
-    if not _mt5_initialize():
+    try:
+        conn = MT5Connection(cfg)
+    except Exception as exc:
+        return {"connected": False, "error": str(exc)}
+
+    if not conn.connect():
+        import MetaTrader5 as mt5
         err = mt5.last_error()
         return {"connected": False, "error": f"MT5 initialize failed: {err}"}
 
     try:
-        return _read_mt5_runtime_info(mt5)
+        return conn.runtime_info()
     finally:
         if shutdown_when_done:
-            try:
-                mt5.shutdown()
-            except Exception:
-                pass
+            conn.disconnect()
 
 
 def _read_mt5_positions(mt5) -> list:
@@ -2641,6 +2643,20 @@ def _run_bot_thread(bot: Bot) -> None:
 @app.route("/")
 def index():
     return Response(_DASHBOARD_HTML, mimetype="text/html")
+
+
+@app.route("/core/css/dashboard.css")
+def serve_css():
+    if _CORE_CSS.exists():
+        return send_file(_CORE_CSS, mimetype="text/css")
+    return Response("/* css not found */", mimetype="text/css", status=404)
+
+
+@app.route("/core/js/dashboard.js")
+def serve_js():
+    if _CORE_JS.exists():
+        return send_file(_CORE_JS, mimetype="application/javascript")
+    return Response("/* js not found */", mimetype="application/javascript", status=404)
 
 
 @app.route("/health")
@@ -2855,6 +2871,99 @@ def bot_history():
     return jsonify({"trades": trades, "account_balance": account_balance})
 
 
+@app.route("/mt5/connect", methods=["POST"])
+def mt5_connect():
+    """Accept credentials from the dashboard, update MT5_CONFIG, and test the connection."""
+    global MT5_CONFIG
+    data = request.get_json(silent=True) or {}
+
+    login    = data.get("login")
+    password = data.get("password", "")
+    server   = data.get("server", "")
+    path     = data.get("path") or None
+
+    if not login:
+        return jsonify({"ok": False, "error": "Account number (login) is required"}), 400
+    try:
+        login = int(login)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Login must be a numeric account number"}), 400
+
+    # Update the live config so future _mt5_initialize() calls pick it up
+    MT5_CONFIG["login"]    = login
+    MT5_CONFIG["password"] = password or None
+    MT5_CONFIG["server"]   = server   or None
+    MT5_CONFIG["path"]     = path
+
+    # Push to env vars as a fallback layer
+    os.environ["MT5_LOGIN"] = str(login)
+    if password: os.environ["MT5_PASSWORD"] = password
+    if server:   os.environ["MT5_SERVER"]   = server
+    if path:     os.environ["MT5_PATH"]      = path
+
+    # Persist to disk for auto-reconnect on next startup
+    _save_credentials(login, password or "", server or "", path or "")
+
+    # Use MT5Connection for the actual test
+    conn = MT5Connection(dict(MT5_CONFIG))
+    if conn.connect():
+        try:
+            info = conn.runtime_info()
+        finally:
+            conn.disconnect()
+        return jsonify({"ok": True, "mt5": info})
+    else:
+        import MetaTrader5 as mt5
+        err = mt5.last_error()
+        return jsonify({"ok": False, "error": f"MT5 connection failed: {err}"}), 400
+
+
+@app.route("/mt5/credentials", methods=["GET"])
+def mt5_credentials_get():
+    """Return saved credentials (login + server only — never expose password)."""
+    import json as _json
+    if not _CREDS_PATH.exists():
+        return jsonify({"ok": True, "saved": False})
+    try:
+        creds = _json.loads(_CREDS_PATH.read_text(encoding="utf-8"))
+        return jsonify({
+            "ok": True,
+            "saved": True,
+            "login":  creds.get("login"),
+            "server": creds.get("server"),
+            "path":   creds.get("path"),
+            "has_password": bool(creds.get("password")),
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/mt5/credentials", methods=["DELETE"])
+def mt5_credentials_delete():
+    """Remove saved credentials file."""
+    try:
+        if _CREDS_PATH.exists():
+            _CREDS_PATH.unlink()
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/ai/init", methods=["POST"])
+def ai_init():
+    """Warm-start the LocalLLM in a background thread so it's ready before the bot starts."""
+    def _warm():
+        try:
+            llm = LocalLLM()
+            llm.generate("ping", max_new_tokens=1)
+            log.info("LocalLLM warm-up complete.")
+        except Exception as exc:
+            log.warning("LocalLLM warm-up failed: %s", exc)
+    t = threading.Thread(target=_warm, daemon=True, name="llm-warmup")
+    t.start()
+    return jsonify({"ok": True, "message": "AI initialisation started in background"})
+
+
 @app.route("/bot/signal/<symbol>")
 def manual_signal(symbol: str):
     """Run a one-shot signal check without a running bot (for testing)."""
@@ -2883,6 +2992,23 @@ if __name__ == "__main__":
         )
         bot.run()
     else:
+        # Load any previously saved MT5 credentials before Flask starts
+        _load_saved_credentials()
+
+        # Attempt MT5 auto-connect in the background so it's ready when the page loads
+        def _auto_connect_mt5():
+            if MT5_CONFIG.get("login"):
+                log.info("Auto-connecting MT5 with saved credentials (login=%s) ...", MT5_CONFIG["login"])
+                result = _mt5_snapshot(shutdown_when_done=True)
+                if result.get("connected"):
+                    log.info("MT5 auto-connect OK — server=%s", result.get("server"))
+                else:
+                    log.warning("MT5 auto-connect failed: %s", result.get("error"))
+            else:
+                log.info("No saved MT5 credentials — waiting for manual connect via dashboard.")
+
+        threading.Thread(target=_auto_connect_mt5, daemon=True, name="mt5-autoconnect").start()
+
         print("=" * 55)
         chosen_port = _choose_http_port()
         if chosen_port in (5000, 5001):
