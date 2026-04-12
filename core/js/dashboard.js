@@ -48,6 +48,186 @@ function autoShowAiLogTab() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Comprehensive Market Scan Breakdown
+// ─────────────────────────────────────────────────────────────
+
+const marketScanCache = {};
+
+function fetchMarketScanBreakdown() {
+    const symbols = ['EURUSD', 'GBPUSD', 'EURJPY', 'GBPJPY'];
+    const container = document.getElementById('signal-cards');
+    
+    if (!container) return;
+    
+    // Show loading state
+    let allSignalsLoaded = true;
+    let signalCount = 0;
+    
+    symbols.forEach(symbol => {
+        fetch(`/bot/signal/${symbol}`)
+            .then(r => r.json())
+            .then(data => {
+                marketScanCache[symbol] = data;
+                signalCount++;
+                
+                // Update display once we have at least one signal
+                renderMarketScanBreakdown();
+                
+                // Update the pair card in portfolio watch
+                updatePairWatch(symbol, data);
+            })
+            .catch(err => {
+                console.error(`Failed to fetch signal for ${symbol}:`, err);
+                marketScanCache[symbol] = { error: 'Failed to fetch signal' };
+            });
+    });
+}
+
+function updatePairWatch(symbol, data) {
+    if (!data || data.error) return;
+    
+    const tradesEl = document.getElementById(`trades-${symbol}`);
+    const pnlEl = document.getElementById(`pnl-${symbol}`);
+    const statusEl = document.getElementById(`status-${symbol}`);
+    
+    if (!tradesEl || !pnlEl || !statusEl) return;
+    
+    // Update trade count and status
+    const bias = data.bias || '—';
+    const confidence = data.confidence || 0;
+    
+    if (statusEl.querySelector('.watch-state')) {
+        statusEl.querySelector('.watch-state').textContent = 
+            bias === 'LONG' ? 'bullish' : bias === 'SHORT' ? 'bearish' : 'neutral';
+        statusEl.querySelector('.watch-dot').className = 
+            `watch-dot ${bias === 'LONG' ? 'buy' : bias === 'SHORT' ? 'sell' : 'idle'}`;
+    }
+}
+
+function renderMarketScanBreakdown() {
+    const container = document.getElementById('signal-cards');
+    if (!container) return;
+    
+    const symbols = ['EURUSD', 'GBPUSD', 'EURJPY', 'GBPJPY'];
+    const allCached = symbols.every(s => marketScanCache[s]);
+    
+    if (!allCached) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <div class="icon">⟳</div>
+                <div class="msg">Scanning markets…</div>
+            </div>
+        `;
+        return;
+    }
+    
+    let html = `<div style="display:grid; gap:16px; padding:20px">`;
+    
+    symbols.forEach(symbol => {
+        const sig = marketScanCache[symbol];
+        if (!sig) return;
+        
+        const bias = sig.bias || '—';
+        const confidence = (sig.confidence || 0).toFixed(0);
+        const entry = sig.entry_price ? sig.entry_price.toFixed(5) : '—';
+        const sl = sig.sl_price ? sig.sl_price.toFixed(5) : '—';
+        const tp = sig.tp_price ? sig.tp_price.toFixed(5) : '—';
+        const rr = sig.rr || '—';
+        
+        const biasColor = bias === 'LONG' ? 'var(--green)' : bias === 'SHORT' ? 'var(--red)' : 'var(--txt2)';
+        const confidenceColor = confidence >= 70 ? 'var(--green)' : confidence >= 50 ? 'var(--amber)' : 'var(--red)';
+        
+        html += `
+            <div style="background:var(--bg0); border:1px solid var(--line); border-radius:8px; padding:16px; overflow:hidden">
+                <!-- Header -->
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding-bottom:12px; border-bottom:1px solid var(--line)">
+                    <div>
+                        <span style="font-size:13px; font-weight:600; color:var(--txt)">${symbol}</span>
+                        <span style="font-size:10px; color:var(--txt3); margin-left:8px; letter-spacing:0.08em">MARKET SCAN</span>
+                    </div>
+                    <div style="display:flex; gap:8px; align-items:center">
+                        <span style="font-size:11px; background:${biasColor}; color:#000; padding:4px 8px; border-radius:4px; font-weight:600">${bias}</span>
+                        <span style="font-size:11px; background:${confidenceColor}; color:#000; padding:4px 8px; border-radius:4px; font-weight:600">${confidence}% conf</span>
+                    </div>
+                </div>
+                
+                <!-- Grid Data -->
+                <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; font-size:11px; margin-bottom:12px">
+                    <div>
+                        <div style="color:var(--txt3); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:4px">Entry</div>
+                        <div style="font-family:var(--mono); color:var(--txt); font-size:12px; font-weight:500">${entry}</div>
+                    </div>
+                    <div>
+                        <div style="color:var(--txt3); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:4px">Stop Loss</div>
+                        <div style="font-family:var(--mono); color:var(--red); font-size:12px; font-weight:500">${sl}</div>
+                    </div>
+                    <div>
+                        <div style="color:var(--txt3); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:4px">Take Profit</div>
+                        <div style="font-family:var(--mono); color:var(--green); font-size:12px; font-weight:500">${tp}</div>
+                    </div>
+                </div>
+                
+                <!-- Risk/Reward -->
+                <div style="background:var(--bg1); border-left:3px solid var(--cyan); border-radius:4px; padding:10px; margin-bottom:12px">
+                    <div style="font-size:9px; color:var(--txt3); text-transform:uppercase; letter-spacing:0.08em; margin-bottom:4px">Risk : Reward</div>
+                    <div style="font-size:14px; font-weight:600; color:var(--cyan); font-family:var(--mono)">${rr}</div>
+                </div>
+                
+                <!-- Breakdown -->
+                <div style="display:grid; gap:8px; font-size:10px">
+                    ${renderSignalBreakdown(sig)}
+                </div>
+            </div>
+        `;
+    });
+    
+    html += `</div>`;
+    container.innerHTML = html;
+}
+
+function renderSignalBreakdown(sig) {
+    let html = '';
+    
+    if (sig.environment) {
+        html += `
+            <div style="background:var(--bg0); padding:8px; border-radius:4px; border-left:2px solid var(--cyan)">
+                <span style="color:var(--txt3)">Environment:</span>
+                <span style="color:var(--txt); margin-left:8px; font-weight:500">${sig.environment}</span>
+            </div>
+        `;
+    }
+    
+    if (sig.choch_status) {
+        html += `
+            <div style="background:var(--bg0); padding:8px; border-radius:4px; border-left:2px solid var(--amber)">
+                <span style="color:var(--txt3)">CHoCH Status:</span>
+                <span style="color:var(--txt); margin-left:8px; font-weight:500">${sig.choch_status}</span>
+            </div>
+        `;
+    }
+    
+    if (sig.atr) {
+        html += `
+            <div style="background:var(--bg0); padding:8px; border-radius:4px; border-left:2px solid var(--purple)">
+                <span style="color:var(--txt3)">ATR:</span>
+                <span style="color:var(--txt); margin-left:8px; font-family:var(--mono); font-weight:500">${parseFloat(sig.atr).toFixed(5)}</span>
+            </div>
+        `;
+    }
+    
+    if (sig.level_interaction) {
+        html += `
+            <div style="background:var(--bg0); padding:8px; border-radius:4px; border-left:2px solid var(--green)">
+                <span style="color:var(--txt3)">Level Interaction:</span>
+                <span style="color:var(--txt); margin-left:8px; font-weight:500">${sig.level_interaction}</span>
+            </div>
+        `;
+    }
+    
+    return html;
+}
+
 function connectMt5() {
     const btn = document.getElementById('connect-btn');
     
@@ -128,6 +308,8 @@ setInterval(() => {
                 .then(botData => {
                     if (botData.bot && botData.bot.running && data.connected) {
                         autoShowAiLogTab();
+                        // Fetch comprehensive market scan breakdown
+                        fetchMarketScanBreakdown();
                         // Update Start/Stop buttons
                         document.getElementById('start-btn').style.display = 'none';
                         document.getElementById('stop-btn').style.display = 'inline-block';
