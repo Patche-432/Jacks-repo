@@ -113,8 +113,7 @@ entry:
   allow_pyramiding:       false
 
 exit:
-  breakeven_trigger_points: 10
-  trailing_stop_points:      8
+  trailing_stop_fraction:  0.50
 
   partial_take_profit:
     enabled:          true
@@ -125,9 +124,9 @@ exit:
   max_trade_duration_minutes: 240
 
   conditions:
-    - "If price stalls before TP, AI may close early."
-    - "Never let a winning trade reverse past breakeven once BE is set."
-    - "CHoCH entries get wider trailing tolerance — structure-based moves need room."
+    - "Trail SL at 50% of current profit pips (locks in half gains, lets winners run)."
+    - "Partial close at 50% of halfway to TP (secure 25% of full TP profit early)."
+    - "Let price extend beyond TP if momentum continues; no breakeven hardlock."
 
 ai:
   extra_instructions: |
