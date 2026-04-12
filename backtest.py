@@ -53,6 +53,16 @@ logging.basicConfig(
 log = logging.getLogger("backtest")
 
 # ============================================================ #
+# UTILITY FUNCTIONS                                            #
+# ============================================================ #
+
+def get_pip_value(symbol: str) -> float:
+    """Return pip size: 0.0001 for most pairs, 0.01 for JPY pairs."""
+    if "JPY" in symbol:
+        return 0.01  # JPY pairs: 2 decimal places
+    return 0.0001   # Standard pairs: 4 decimal places
+
+# ============================================================ #
 # DATA STRUCTURE                                               #
 # ============================================================ #
 
@@ -92,21 +102,24 @@ class Trade:
     
     duration_minutes: int = 0
     
-    def calculate_exit(self, exit_price: float, exit_time: datetime, reason: str) -> None:
+    def calculate_exit(self, exit_price: float, exit_time: datetime, reason: str, lot_size: float = 1.0) -> None:
         """Calculate exit after hitting TP, SL, or timeout."""
         self.exit_price = exit_price
         self.exit_time = exit_time
         self.exit_reason = reason
         
-        if self.signal.signal == "BUY":
-            self.profit_pips = (exit_price - self.entry_price) / 0.0001
-            risk_pips = (self.entry_price - self.signal.stop_loss) / 0.0001
-        else:  # SELL
-            self.profit_pips = (self.entry_price - exit_price) / 0.0001
-            risk_pips = (self.signal.stop_loss - self.entry_price) / 0.0001
+        # Determine pip value based on symbol (JPY pairs use 0.01, others use 0.0001)
+        pip_value = get_pip_value(self.signal.symbol)
         
-        # Assume 1 lot = $10 per pip (adjust for your account)
-        self.profit = self.profit_pips * 10.0
+        if self.signal.signal == "BUY":
+            self.profit_pips = (exit_price - self.entry_price) / pip_value
+            risk_pips = (self.entry_price - self.signal.stop_loss) / pip_value
+        else:  # SELL
+            self.profit_pips = (self.entry_price - exit_price) / pip_value
+            risk_pips = (self.signal.stop_loss - self.entry_price) / pip_value
+        
+        # Calculate profit based on lot size: $10 per pip per 1.0 lot
+        self.profit = self.profit_pips * (10.0 * lot_size)
         
         self.duration_minutes = int((exit_time - self.entry_time).total_seconds() / 60)
         
@@ -148,11 +161,13 @@ class AI_ProBacktester:
         lookback_bars: int = 200,
         max_trade_duration_bars: int = 96,  # 24 hours on M15
         risk_per_trade_pips: float = 50.0,  # How many pips SL represents
+        lot_size: float = 1.0,  # Lot size (0.50, 1.0, etc.)
     ):
         self.symbols = symbols or ["EURUSD"]
         self.lookback_bars = lookback_bars
         self.max_trade_duration_bars = max_trade_duration_bars
         self.risk_per_trade_pips = risk_per_trade_pips
+        self.lot_size = lot_size
         
         # Import AI_Pro lazily to avoid MT5 requirement if just analyzing
         self._strategy = None
@@ -429,25 +444,25 @@ class AI_ProBacktester:
                 
                 # Check TP hit
                 if sig.signal == "BUY" and candle_high >= sig.take_profit:
-                    trade.calculate_exit(sig.take_profit, candle_time, "tp")
+                    trade.calculate_exit(sig.take_profit, candle_time, "tp", self.lot_size)
                     break
                 elif sig.signal == "SELL" and candle_low <= sig.take_profit:
-                    trade.calculate_exit(sig.take_profit, candle_time, "tp")
+                    trade.calculate_exit(sig.take_profit, candle_time, "tp", self.lot_size)
                     break
                 
                 # Check SL hit
                 if sig.signal == "BUY" and candle_low <= sig.stop_loss:
-                    trade.calculate_exit(sig.stop_loss, candle_time, "sl")
+                    trade.calculate_exit(sig.stop_loss, candle_time, "sl", self.lot_size)
                     break
                 elif sig.signal == "SELL" and candle_high >= sig.stop_loss:
-                    trade.calculate_exit(sig.stop_loss, candle_time, "sl")
+                    trade.calculate_exit(sig.stop_loss, candle_time, "sl", self.lot_size)
                     break
             
             # If no exit, close at timeout
             if trade.outcome == "open":
                 close_candle = df.iloc[max_exit_idx]
                 exit_price = close_candle.get("close", entry_price)
-                trade.calculate_exit(exit_price, close_candle["time"], "timeout")
+                trade.calculate_exit(exit_price, close_candle["time"], "timeout", self.lot_size)
             
             # Log large losses for investigation
             if trade.profit_pips <= -20:
@@ -464,6 +479,31 @@ class AI_ProBacktester:
         log.info("Simulated %d trades, closed %d", len(trades), 
                  len([t for t in trades if t.outcome != "open"]))
         return trades
+    
+    def analyze_early_exits(self, trades: List[Trade]) -> Dict:
+        """Analyze trades that exit quickly (early reversals)."""
+        early_exits = {}
+        
+        for threshold_minutes in [75, 150, 300]:  # 5, 10, 20 candles
+            threshold_candles = threshold_minutes // 15
+            early = []
+            
+            for t in trades:
+                if t.duration_minutes <= threshold_minutes and t.outcome == "LOSS":
+                    early.append(t)
+            
+            if early:
+                early_exits[f"within_{threshold_candles}_candles"] = {
+                    "count": len(early),
+                    "pct_of_losses": len(early) / sum(1 for t in trades if t.outcome == "LOSS"),
+                    "avg_loss_pips": sum(t.profit_pips for t in early) / len(early),
+                    "exit_reasons": dict(
+                        (reason, sum(1 for t in early if t.exit_reason == reason))
+                        for reason in ["sl", "timeout"]
+                    ),
+                }
+        
+        return early_exits
     
     def analyze_results(self, trades: List[Trade]) -> Dict:
         """Compute statistics and correlations."""
@@ -482,6 +522,8 @@ class AI_ProBacktester:
         loss_pips = sum(t.profit_pips for t in trades if t.outcome == "LOSS")
         avg_win = win_pips / wins if wins > 0 else 0
         avg_loss = loss_pips / losses if losses > 0 else 0
+        
+        early_exits = self.analyze_early_exits(trades)
         
         # Correlation: component scores vs outcome
         correlations = {}
@@ -511,6 +553,22 @@ class AI_ProBacktester:
                     "avg_rr": sum(t.rr_achieved for t in q_trades) / len(q_trades),
                 }
         
+        # Calculate average trade duration
+        durations = [t.duration_minutes for t in trades if t.duration_minutes > 0]
+        avg_duration = np.mean(durations) if durations else 0
+        
+        # Breakdown by exit reason
+        by_exit_reason = {}
+        for reason in ["sl", "tp", "timeout"]:
+            r_trades = [t for t in trades if t.exit_reason == reason]
+            if r_trades:
+                r_wins = sum(1 for t in r_trades if t.outcome == "WIN")
+                by_exit_reason[reason] = {
+                    "count": len(r_trades),
+                    "win_rate": r_wins / len(r_trades),
+                    "avg_pnl": sum(t.profit for t in r_trades) / len(r_trades),
+                }
+        
         return {
             "total_trades": len(trades),
             "wins": wins,
@@ -522,8 +580,11 @@ class AI_ProBacktester:
             "avg_loss_pips": round(avg_loss, 1),
             "profit_factor": round(abs(win_pips / loss_pips), 2) if loss_pips != 0 else 0,
             "avg_rr_achieved": round(np.mean([t.rr_achieved for t in trades if t.rr_achieved > 0]), 2),
+            "avg_duration_minutes": round(avg_duration, 1),
             "component_correlations": correlations,
             "by_quality": by_quality,
+            "by_exit_reason": by_exit_reason,
+            "early_exits": early_exits,
         }
     
     def run(self, symbol: str, days: int = 30) -> Dict:
@@ -582,6 +643,7 @@ class AI_ProBacktester:
         print(f"Avg Win/Loss: +{results['avg_win_pips']:.0f}p / {results['avg_loss_pips']:.0f}p")
         print(f"Profit Factor: {results['profit_factor']:.2f}x")
         print(f"Avg R:R Achieved: {results['avg_rr_achieved']:.2f}")
+        print(f"Avg Trade Duration: {results.get('avg_duration_minutes', 0):.0f} minutes")
         
         if results.get("component_correlations"):
             print("\nComponent Score Correlations with Wins:")
@@ -598,6 +660,27 @@ class AI_ProBacktester:
                           f"{data['win_rate']:.0%} WR, "
                           f"${data['avg_pnl']:+.1f} avg, "
                           f"{data['avg_rr']:.2f} RR")
+        
+        if results.get("by_exit_reason"):
+            print("\nPerformance by Exit Reason:")
+            for reason in ["tp", "sl", "timeout"]:
+                if reason in results["by_exit_reason"]:
+                    data = results["by_exit_reason"][reason]
+                    reason_name = {"tp": "Take Profit", "sl": "Stop Loss", "timeout": "Timeout"}.get(reason, reason)
+                    print(f"  {reason_name:12} ({data['count']:3} trades): "
+                          f"{data['win_rate']:.0%} WR, "
+                          f"${data['avg_pnl']:+.1f} avg")
+        
+        if results.get("early_exits"):
+            print("\n🚩 Early Exit Analysis (Quick Reversals):")
+            for threshold, data in results["early_exits"].items():
+                candles = threshold.split("_")[1]
+                print(f"  Losses within {candles} candles: {data['count']} trades "
+                      f"({data['pct_of_losses']:.0%} of all losses), "
+                      f"avg {data['avg_loss_pips']:.0f} pips")
+                if data["exit_reasons"].get("sl"):
+                    print(f"    └─ {data['exit_reasons']['sl']} via SL, "
+                          f"{data['exit_reasons'].get('timeout', 0)} via timeout")
         
         print("=" * 70 + "\n")
     
@@ -644,6 +727,7 @@ def main():
     )
     parser.add_argument("--symbol", default="EURUSD", help="Symbol to backtest")
     parser.add_argument("--days", type=int, default=7, help="Days of history")
+    parser.add_argument("--lot-size", type=float, default=1.0, help="Lot size per trade (e.g., 0.50)")
     parser.add_argument("--export", action="store_true", help="Export trade log")
     parser.add_argument("--plot", action="store_true", help="Plot results (requires matplotlib)")
     
@@ -656,7 +740,7 @@ def main():
         print("!"*70 + "\n")
         return
     
-    backtest = AI_ProBacktester()
+    backtest = AI_ProBacktester(lot_size=args.lot_size)
     results = backtest.run(args.symbol, days=args.days)
     
     if "error" in results:

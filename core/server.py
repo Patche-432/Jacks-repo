@@ -75,7 +75,7 @@ def bot_start():
         env = os.environ.copy()
         env['PYTHONPATH'] = os.path.join(root_path, 'core') + os.pathsep + env.get('PYTHONPATH', '')
         bot_process = subprocess.Popen(
-            ['python', ai_pro_path, '--run'], 
+            ['python', ai_pro_path, '--run', '--lot-size', '0.50'], 
             cwd=root_path,
             env=env
         )

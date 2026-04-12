@@ -91,12 +91,10 @@ def _save_credentials(login, password, server, path) -> None:
 
 _RULES_YAML = """
 allowed_symbols:
-  - EURUSD
-  - AUDUSD
   - GBPJPY
+  - EURJPY
   - GBPUSD
-  - USDCAD
-  - USDJPY
+  - EURUSD
 
 sessions:
   always: [0, 24]
@@ -647,6 +645,22 @@ class AI_Pro:
 
         self._filling_mode_cache[symbol] = mt5.ORDER_FILLING_FOK
         return mt5.ORDER_FILLING_FOK
+
+    # ------------------------------------------------------------------ #
+    # Pair-specific SL multiplier                                         #
+    # ------------------------------------------------------------------ #
+
+    def get_sl_multiplier(self, symbol: str) -> float:
+        """Return pair-specific SL multiplier (ATR multiplier).
+        
+        Pairs with higher volatility need wider SL:
+        - EURUSD, GBPUSD, GBPJPY: 2.5×ATR (work well, lower volatility)
+        - USDCAD, USDJPY: 3.5×ATR (higher volatility, tighter SL causes early exits)
+        - AUDUSD: 2.5×ATR (default, standard volatility)
+        """
+        if symbol in ("USDCAD", "USDJPY"):
+            return 3.5  # Higher volatility pairs need wider stops
+        return 2.5     # Default for other pairs
 
     # ------------------------------------------------------------------ #
     # MT5 helpers                                                         #
@@ -1665,12 +1679,14 @@ Reply ONLY with JSON:
         }
 
         def buy_levels():
-            sl = round(current_price - atr * self.sl_atr_mult, 5)
+            sl_mult = self.get_sl_multiplier(symbol)
+            sl = round(current_price - atr * sl_mult, 5)
             tp = round(current_price + atr * self.tp_atr_mult, 5)
             return sl, tp
 
         def sell_levels():
-            sl = round(current_price + atr * self.sl_atr_mult, 5)
+            sl_mult = self.get_sl_multiplier(symbol)
+            sl = round(current_price + atr * sl_mult, 5)
             tp = round(current_price - atr * self.tp_atr_mult, 5)
             return sl, tp
 
