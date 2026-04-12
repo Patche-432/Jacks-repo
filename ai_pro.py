@@ -2011,6 +2011,7 @@ class Bot:
         poll_secs: float = 300.0,
         auto_trade: bool = True,
         use_ai:    bool  = True,
+        conn      = None,
         **strategy_kwargs,
     ) -> None:
         self.symbols    = [s.strip().upper() for s in (symbols or ["EURUSD"])]
@@ -2018,6 +2019,7 @@ class Bot:
         self.poll_secs  = float(poll_secs)
         self.auto_trade = bool(auto_trade)
         self.use_ai     = bool(use_ai)
+        self._conn      = conn  # MT5Connection object for health checks
         self.strategy_config = {
             "atr_tolerance_multiplier": float(strategy_kwargs.get("atr_tolerance_multiplier", 1.5)),
             "sl_atr_mult":              float(strategy_kwargs.get("sl_atr_mult", 2.5)),
@@ -2126,13 +2128,14 @@ class Bot:
 
     def _loop(self) -> None:
         while self._running:
-            # Perform periodic connection health check
-            if not self._strategy._conn.check_connection():
-                log.warning("Connection health check failed, attempting reconnection...")
-                if not self._strategy._conn.reconnect():
-                    log.error("Reconnection failed, pausing bot")
-                    self._running = False
-                    break
+            # Perform periodic connection health check if connection object available
+            if self._conn is not None:
+                if not self._conn.check_connection():
+                    log.warning("Connection health check failed, attempting reconnection...")
+                    if not self._conn.reconnect():
+                        log.error("Reconnection failed, pausing bot")
+                        self._running = False
+                        break
             
             for sym in self.symbols:
                 if not self._running:
