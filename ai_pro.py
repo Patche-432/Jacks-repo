@@ -92,11 +92,11 @@ def _save_credentials(login, password, server, path) -> None:
 _RULES_YAML = """
 allowed_symbols:
   - EURUSD
-  - GBPUSD
-  - USDJPY
-  - GBPJPY
   - AUDUSD
+  - GBPJPY
+  - GBPUSD
   - USDCAD
+  - USDJPY
 
 sessions:
   always: [0, 24]
