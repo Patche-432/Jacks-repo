@@ -1,9 +1,9 @@
 """Flask server for MT5 dashboard"""
 from datetime import datetime, timezone
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
 import logging
-from mt5_connection import MT5Connection
+from core.mt5_connection import MT5Connection
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
