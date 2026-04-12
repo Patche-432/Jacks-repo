@@ -69,11 +69,30 @@ def api_connect_mt5():
 
 @app.route('/api/mt5/status', methods=['GET'])
 def api_mt5_status():
-    """Get MT5 connection status (synced state)"""
+    """Get MT5 connection status (synced state, flattened for dashboard)"""
     global mt5_conn
     # Refresh status from connection
     _sync_mt5_status()
-    return jsonify(mt5_status)
+    
+    # Flatten response for dashboard display
+    if not mt5_status["mt5_connected"]:
+        return jsonify({"connected": False, "error": mt5_status.get("error", "Not connected")})
+    
+    account = mt5_status.get("account")
+    if not account:
+        return jsonify({"connected": False, "error": "Account data unavailable"})
+    
+    return jsonify({
+        "connected": True,
+        "server": account.get("server"),
+        "login": account.get("login"),
+        "account_name": account.get("name"),
+        "currency": account.get("currency"),
+        "balance": account.get("balance"),
+        "equity": account.get("equity"),
+        "trade_allowed": account.get("trade_allowed"),
+        "error": None,
+    })
 
 @app.route('/api/config', methods=['GET'])
 def api_config():
