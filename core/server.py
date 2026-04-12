@@ -57,6 +57,22 @@ def api_disconnect_mt5():
         mt5_conn = None
     return jsonify({'ok': True})
 
+@app.route('/api/mt5/test-trade', methods=['POST'])
+def api_test_trade():
+    """Place a test trade (0.01 lot BUY on EURUSD)"""
+    global mt5_conn
+    if not mt5_conn or not mt5_conn.is_connected():
+        return jsonify({'ok': False, 'error': 'Not connected to MT5'}), 400
+    try:
+        result = mt5_conn.place_test_trade(symbol='EURUSD', volume=0.01)
+        if result['ok']:
+            return jsonify(result)
+        else:
+            return jsonify(result), 400
+    except Exception as e:
+        log.error(f"Test trade error: {e}")
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
 import subprocess
 
 bot_process = None
@@ -106,11 +122,20 @@ def bot_stop():
 def bot_status():
     """Get bot status"""
     global bot_process, bot_running
-    if bot_process and bot_process.poll() is None:
-        return jsonify({'ok': True, 'running': True})
-    else:
+    running = bot_process and bot_process.poll() is None
+    if not running:
         bot_running = False
-        return jsonify({'ok': True, 'running': False})
+    
+    # Return comprehensive status for dashboard snapshot
+    return jsonify({
+        'ok': True,
+        'running': running,
+        'market_bias': 'Bullish',  # This would come from ai_pro.py in real implementation
+        'confidence': 0.75,  # This would come from ai_pro.py in real implementation
+        'last_signal': 'GBPJPY BUY',  # This would come from ai_pro.py in real implementation
+        'open_trades': [],  # This would be populated from MT5 positions
+        'session_summary': 'Portfolio: GBPJPY, EURJPY, GBPUSD, EURUSD | Lot: 0.50 | Status: Running' if running else 'Ready to start'
+    })
 from collections import deque
 import threading
 

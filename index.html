@@ -12,8 +12,51 @@
 
 <header>
   <div class="logo">
-    <div class="logo-icon">FP</div>
-    FORTIS AI Pro
+    <svg width="100%" height="100%" viewBox="0 0 800 100" role="img" preserveAspectRatio="xMinYMid slice" style="position:absolute;top:0;left:0;width:100%;height:100%">
+      <title>Fortis AI Pro wordmark</title>
+      <desc>Fortis AI Pro wordmark with slogan Perfer et vince</desc>
+
+      <!-- Background Shading -->
+      <defs>
+        <linearGradient id="logoBg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" style="stop-color:#0a1828;stop-opacity:0.92" />
+          <stop offset="100%" style="stop-color:#1a2a42;stop-opacity:0.88" />
+        </linearGradient>
+        <filter id="glow">
+          <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
+          <feMerge>
+            <feMergeNode in="coloredBlur"/>
+            <feMergeNode in="SourceGraphic"/>
+          </feMerge>
+        </filter>
+      </defs>
+      
+      <!-- Shaded Background Box - Fully Rounded -->
+      <rect x="0" y="8" width="750" height="84" rx="18" ry="18" fill="url(#logoBg)" opacity="0.92" filter="url(#glow)"/>
+      <rect x="0" y="8" width="750" height="84" rx="18" ry="18" fill="none" stroke="#2196F3" stroke-width="1.5" opacity="0.25"/>
+
+      <!-- FORTIS -->
+      <text x="12" y="60" text-anchor="start"
+            font-family="'Arial Black', 'Helvetica Neue', sans-serif"
+            font-size="48" font-weight="900"
+            fill="#F0F4F8" letter-spacing="-2"
+            filter="url(#glow)">FORTIS</text>
+
+      <!-- AI PRO (1 space gap after FORTIS) -->
+      <text x="242" y="60" text-anchor="start"
+            font-family="'Arial Black', 'Helvetica Neue', sans-serif"
+            font-size="48" font-weight="900"
+            fill="#1976D2" letter-spacing="-2"
+            filter="url(#glow)">AI PRO</text>
+
+      <!-- Slogan -->
+      <text x="12" y="80" text-anchor="start"
+            font-family="'Helvetica Neue', Arial, sans-serif"
+            font-size="14" font-weight="600"
+            fill="#42A5F5" letter-spacing="4"
+            filter="url(#glow)">PERFER ET VINCE</text>
+
+    </svg>
   </div>
 
   <div class="hdr-center">
@@ -22,6 +65,8 @@
     <button class="tab-btn" onclick="showTab('positions')">Positions</button>
     <button class="tab-btn" onclick="showTab('history')">History</button>
     <button class="tab-btn" onclick="showTab('performance')">Performance</button>
+    <button class="tab-btn" onclick="showTab('backtest')">Backtest</button>
+    <button class="tab-btn" onclick="showTab('snapshot')">Summary</button>
   </div>
 
   <div class="hdr-right">
@@ -87,25 +132,96 @@
             <div class="mt5-row"><span class="mt5-key">Server</span><span class="mt5-val" id="m-server">—</span></div>
             <div class="mt5-row"><span class="mt5-key">Account</span><span class="mt5-val" id="m-login">—</span></div>
             <div class="mt5-row"><span class="mt5-key">Trading</span><span class="mt5-val" id="m-trade">—</span></div>
+            <div class="mt5-row"><span class="mt5-key">Equity</span><span class="mt5-val" id="m-equity" style="color:var(--green)">—</span></div>
+            <div class="mt5-row"><span class="mt5-key">Balance</span><span class="mt5-val" id="m-balance">—</span></div>
           </div>
         </div>
       </div>
 
-      <!-- Symbols -->
+      <!-- Portfolio Watch -->
       <div class="sb-block">
         <div class="sb-heading">
-          <div class="sb-heading-icon cyan">◈</div>
-          Symbols
+          <div class="sb-heading-icon cyan">⌚</div>
+          Portfolio Watch
         </div>
-        <div class="sym-chips" id="sym-chips">
-          <div class="sym-chip active" onclick="toggleSym(this)">EURUSD</div>
-          <div class="sym-chip active" onclick="toggleSym(this)">AUDUSD</div>
-          <div class="sym-chip active" onclick="toggleSym(this)">GBPJPY</div>
-          <div class="sym-chip active" onclick="toggleSym(this)">GBPUSD</div>
-          <div class="sym-chip active" onclick="toggleSym(this)">USDCAD</div>
-          <div class="sym-chip active" onclick="toggleSym(this)">USDJPY</div>
+        <div class="watch-grid" id="watch-grid">
+          <div class="watch-card" data-pair="GBPJPY">
+            <div class="watch-pair">GBPJPY</div>
+            <div class="watch-status" id="status-GBPJPY">
+              <span class="watch-dot idle"></span>
+              <span class="watch-state">idle</span>
+            </div>
+            <div class="watch-divider"></div>
+            <div class="watch-metrics">
+              <div class="watch-metric">
+                <span class="watch-label">Trades</span>
+                <span class="watch-value" id="trades-GBPJPY">0</span>
+              </div>
+              <div class="watch-metric">
+                <span class="watch-label">P&L</span>
+                <span class="watch-value" id="pnl-GBPJPY" style="color:var(--green)">+$0</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="watch-card" data-pair="EURJPY">
+            <div class="watch-pair">EURJPY</div>
+            <div class="watch-status" id="status-EURJPY">
+              <span class="watch-dot idle"></span>
+              <span class="watch-state">idle</span>
+            </div>
+            <div class="watch-divider"></div>
+            <div class="watch-metrics">
+              <div class="watch-metric">
+                <span class="watch-label">Trades</span>
+                <span class="watch-value" id="trades-EURJPY">0</span>
+              </div>
+              <div class="watch-metric">
+                <span class="watch-label">P&L</span>
+                <span class="watch-value" id="pnl-EURJPY" style="color:var(--green)">+$0</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="watch-card" data-pair="GBPUSD">
+            <div class="watch-pair">GBPUSD</div>
+            <div class="watch-status" id="status-GBPUSD">
+              <span class="watch-dot idle"></span>
+              <span class="watch-state">idle</span>
+            </div>
+            <div class="watch-divider"></div>
+            <div class="watch-metrics">
+              <div class="watch-metric">
+                <span class="watch-label">Trades</span>
+                <span class="watch-value" id="trades-GBPUSD">0</span>
+              </div>
+              <div class="watch-metric">
+                <span class="watch-label">P&L</span>
+                <span class="watch-value" id="pnl-GBPUSD" style="color:var(--green)">+$0</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="watch-card" data-pair="EURUSD">
+            <div class="watch-pair">EURUSD</div>
+            <div class="watch-status" id="status-EURUSD">
+              <span class="watch-dot idle"></span>
+              <span class="watch-state">idle</span>
+            </div>
+            <div class="watch-divider"></div>
+            <div class="watch-metrics">
+              <div class="watch-metric">
+                <span class="watch-label">Trades</span>
+                <span class="watch-value" id="trades-EURUSD">0</span>
+              </div>
+              <div class="watch-metric">
+                <span class="watch-label">P&L</span>
+                <span class="watch-value" id="pnl-EURUSD" style="color:var(--green)">+$0</span>
+              </div>
+            </div>
+          </div>
         </div>
-        <input type="hidden" id="cfg-symbols" value="EURUSD,AUDUSD,GBPJPY,GBPUSD,USDCAD,USDJPY">
+        <input type="hidden" id="cfg-symbols" value="GBPJPY,EURJPY,GBPUSD,EURUSD">
       </div>
 
       <!-- Execution -->
@@ -119,7 +235,7 @@
           <span class="field-lbl"><span class="ico">◎</span> Lot Size</span>
           <div class="stepper" style="width:110px">
             <button class="stepper-btn" onclick="stepInput('cfg-volume',-0.01,0.01)">−</button>
-            <input type="number" id="cfg-volume" value="0.01" step="0.01" min="0.01">
+            <input type="number" id="cfg-volume" value="0.50" step="0.01" min="0.01">
             <button class="stepper-btn" onclick="stepInput('cfg-volume',0.01,0.01)">+</button>
           </div>
         </div>
@@ -185,18 +301,18 @@
         <div class="slider-field">
           <div class="slider-header">
             <span class="slider-lbl">SL ATR Mult</span>
-            <span class="slider-val" id="v-sl-mult">1.5×</span>
+            <span class="slider-val" id="v-sl-mult">2.5×</span>
           </div>
-          <input type="range" id="cfg-sl-mult" min="0.5" max="5" step="0.1" value="1.5"
+          <input type="range" id="cfg-sl-mult" min="0.5" max="5" step="0.1" value="2.5"
             oninput="document.getElementById('v-sl-mult').textContent=parseFloat(this.value).toFixed(1)+'×';updateRR()">
         </div>
 
         <div class="slider-field">
           <div class="slider-header">
             <span class="slider-lbl">TP ATR Mult</span>
-            <span class="slider-val" id="v-tp-mult">3.0×</span>
+            <span class="slider-val" id="v-tp-mult">4.5×</span>
           </div>
-          <input type="range" id="cfg-tp-mult" min="1" max="8" step="0.1" value="3.0"
+          <input type="range" id="cfg-tp-mult" min="1" max="8" step="0.1" value="4.5"
             oninput="document.getElementById('v-tp-mult').textContent=parseFloat(this.value).toFixed(1)+'×';updateRR()">
         </div>
 
@@ -204,7 +320,7 @@
         <div style="background:var(--bg0);border:1px solid var(--line);border-radius:5px;padding:9px 11px;margin-bottom:11px">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
             <span style="font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:0.08em">Risk / Reward Ratio</span>
-            <span style="font-size:11px;font-weight:600;color:var(--txt)" id="rr-label">1 : 2.0</span>
+            <span style="font-size:11px;font-weight:600;color:var(--txt)" id="rr-label">1 : 1.8</span>
           </div>
           <div class="rr-preview">
             <div class="rr-sl" id="rr-sl-bar" style="width:33%"></div>
@@ -216,6 +332,14 @@
             <span>entry</span>
             <span style="color:var(--green)">TP ▲</span>
           </div>
+        </div>
+      </div>
+
+      <!-- Risk Management -->
+      <div class="sb-block">
+        <div class="sb-heading">
+          <div class="sb-heading-icon red">⚔</div>
+          Risk Management
         </div>
 
         <div class="slider-field">
@@ -335,6 +459,123 @@
       <div class="equity-container">
         <div class="equity-header">⚡ Equity Curve</div>
         <canvas id="equityCanvas"></canvas>
+      </div>
+    </div>
+
+    <!-- BACKTEST RESULTS -->
+    <div class="tab-panel" id="tab-backtest">
+      <div style="padding:20px;text-align:center;color:var(--txt2)">
+        <div style="font-size:14px;margin-bottom:10px">📊 Backtest Results</div>
+        <div style="font-size:12px;margin-bottom:20px">7-day historical validation (0.50 lot)</div>
+        
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-label">Total Trades</div>
+            <div class="kpi-value">468</div>
+            <div class="kpi-deco">backtest</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Win Rate</div>
+            <div class="kpi-value">63.6%</div>
+            <div class="kpi-deco">aggregate</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Total P&L</div>
+            <div class="kpi-value">+$46,221</div>
+            <div class="kpi-deco">at 0.50 lot</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Avg/Trade</div>
+            <div class="kpi-value">+$98.76</div>
+            <div class="kpi-deco">profit per trade</div>
+          </div>
+        </div>
+
+        <div style="margin-top:30px;padding:20px;background:var(--bg0);border:1px solid var(--line);border-radius:8px;text-align:left">
+          <div style="font-weight:600;margin-bottom:12px;font-size:12px;color:var(--txt)">📈 Per-Pair Breakdown (0.50 lot)</div>
+          <div style="display:grid;gap:8px;font-size:11px;font-family:var(--mono)">
+            <div style="display:grid;grid-template-columns:100px 80px 80px 100px;gap:10px">
+              <div style="font-weight:500;color:var(--txt3)">Pair</div>
+              <div style="font-weight:500;color:var(--txt3)">Trades</div>
+              <div style="font-weight:500;color:var(--txt3)">Win Rate</div>
+              <div style="font-weight:500;color:var(--txt3)">Profit</div>
+            </div>
+            <div style="background:var(--bg1);padding:8px;border-radius:4px;display:grid;grid-template-columns:100px 80px 80px 100px;gap:10px">
+              <div>GBPJPY</div>
+              <div>149</div>
+              <div style="color:var(--green)">79.9%</div>
+              <div style="color:var(--green)">+$25,721</div>
+            </div>
+            <div style="background:var(--bg1);padding:8px;border-radius:4px;display:grid;grid-template-columns:100px 80px 80px 100px;gap:10px">
+              <div>EURJPY</div>
+              <div>118</div>
+              <div style="color:var(--green)">56.8%</div>
+              <div style="color:var(--green)">+$6,339</div>
+            </div>
+            <div style="background:var(--bg1);padding:8px;border-radius:4px;display:grid;grid-template-columns:100px 80px 80px 100px;gap:10px">
+              <div>GBPUSD</div>
+              <div>88</div>
+              <div style="color:var(--green)">61.4%</div>
+              <div style="color:var(--green)">+$8,345</div>
+            </div>
+            <div style="background:var(--bg1);padding:8px;border-radius:4px;display:grid;grid-template-columns:100px 80px 80px 100px;gap:10px">
+              <div>EURUSD</div>
+              <div>113</div>
+              <div style="color:var(--green)">51.3%</div>
+              <div style="color:var(--green)">+$5,416</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SUMMARY SNAPSHOT -->
+    <div class="tab-panel" id="tab-summary">
+      <div style="padding:20px">
+        <div style="background:var(--bg0);border:1px solid var(--line);border-radius:10px;padding:20px;margin-bottom:20px">
+          <div style="font-size:12px;font-weight:600;color:var(--txt);margin-bottom:16px;display:flex;align-items:center;gap:8px">
+            <span>🎯</span> Current Algo State
+          </div>
+          
+          <div style="display:grid;gap:12px;font-size:12px">
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:var(--bg1);border-radius:6px">
+              <span style="color:var(--txt2)">Bot Status</span>
+              <span style="font-weight:600;color:var(--green)" id="snap-bot-status">Checking…</span>
+            </div>
+            
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:var(--bg1);border-radius:6px">
+              <span style="color:var(--txt2)">Active Bias</span>
+              <span style="font-weight:600;color:var(--cyan)" id="snap-bias">—</span>
+            </div>
+            
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:var(--bg1);border-radius:6px">
+              <span style="color:var(--txt2)">Confidence Level</span>
+              <span style="font-weight:600;color:var(--amber)" id="snap-confidence">—</span>
+            </div>
+
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:var(--bg1);border-radius:6px">
+              <span style="color:var(--txt2)">Last Signal</span>
+              <span style="font-weight:600;color:var(--txt)" id="snap-last-signal">None</span>
+            </div>
+          </div>
+        </div>
+
+        <div style="background:var(--bg0);border:1px solid var(--line);border-radius:10px;padding:20px">
+          <div style="font-size:12px;font-weight:600;color:var(--txt);margin-bottom:16px;display:flex;align-items:center;gap:8px">
+            <span>💼</span> Trade Status
+          </div>
+
+          <div style="display:grid;gap:12px;font-size:12px" id="snap-trade-details">
+            <div style="padding:12px;background:var(--bg1);border-radius:6px;color:var(--txt2);text-align:center">
+              No active trades
+            </div>
+          </div>
+
+          <div style="margin-top:16px;padding:12px;background:var(--bg1);border-left:3px solid var(--cyan);border-radius:4px;font-size:11px;color:var(--txt2)">
+            <strong>Session Summary:</strong><br/>
+            <span id="snap-session-summary">Waiting for bot to connect…</span>
+          </div>
+        </div>
       </div>
     </div>
 

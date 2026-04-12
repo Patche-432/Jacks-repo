@@ -1,6 +1,85 @@
-let mt5Connected = false;
+// Auto-connect to MT5 on page load
+window.addEventListener('load', () => {
+    autoConnectMt5();
+});
+
+function autoConnectMt5() {
+    // Silently attempt connection on load
+    fetch('/api/mt5/connect', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({})
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.connected) {
+            updateMt5Display(data);
+            const btn = document.getElementById('connect-btn');
+            btn.style.background = 'var(--green)';
+            btn.textContent = 'MT5 ✓';
+        }
+    })
+    .catch(() => {});
+}
 
 function connectMt5() {
+    // Check if this is the header button or modal button
+    const headerBtn = document.getElementById('connect-btn');
+    const modalBtn = document.getElementById('mt5-modal-btn');
+    
+    // If header button is clicked, attempt direct connection first
+    if (event && event.target === headerBtn) {
+        attemptDirectConnection();
+        return;
+    }
+    
+    // Modal connect button clicked - attempt connection with credentials
+    const btn = modalBtn;
+    if (!btn) return;
+    btn.disabled = true;
+    btn.textContent = 'Connecting…';
+    
+    fetch('/api/mt5/connect', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({})
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.connected) {
+            mt5Connected = true;
+            updateMt5Display(data);
+            const connectBtn = document.getElementById('connect-btn');
+            connectBtn.style.background = 'var(--green)';
+            connectBtn.textContent = 'MT5 ✓';
+            closeMt5Modal();
+            
+            // Place test trade after successful connection
+            placeTestTrade();
+        } else {
+            const statusEl = document.getElementById('mt5-modal-status');
+            statusEl.style.display = 'block';
+            statusEl.style.background = 'rgba(255, 107, 107, 0.1)';
+            statusEl.style.color = 'var(--red)';
+            statusEl.textContent = 'Error: ' + (data.error || 'Connection failed');
+            console.error('MT5 error:', data.error);
+        }
+    })
+    .catch(error => {
+        const statusEl = document.getElementById('mt5-modal-status');
+        statusEl.style.display = 'block';
+        statusEl.style.background = 'rgba(255, 107, 107, 0.1)';
+        statusEl.style.color = 'var(--red)';
+        statusEl.textContent = 'Error: ' + error.message;
+        console.error('Connection error:', error);
+    })
+    .finally(() => {
+        btn.disabled = false;
+        btn.textContent = 'Connect';
+    });
+}
+
+function attemptDirectConnection() {
     const btn = document.getElementById('connect-btn');
     btn.disabled = true;
     btn.textContent = 'Connecting…';
@@ -17,17 +96,40 @@ function connectMt5() {
             updateMt5Display(data);
             btn.style.background = 'var(--green)';
             btn.textContent = 'MT5 ✓';
+            
+            // Place test trade after successful connection
+            placeTestTrade();
         } else {
+            // Connection failed, show modal for credentials
+            document.getElementById('mt5-modal-overlay').style.display = 'flex';
+            btn.disabled = false;
             btn.textContent = 'Connect MT5';
-            console.error('MT5 error:', data.error);
         }
     })
     .catch(error => {
-        console.error('Connection error:', error);
-        btn.textContent = 'Connect MT5';
-    })
-    .finally(() => {
+        // Connection failed, show modal for credentials
+        document.getElementById('mt5-modal-overlay').style.display = 'flex';
         btn.disabled = false;
+        btn.textContent = 'Connect MT5';
+    });
+}
+
+function placeTestTrade() {
+    fetch('/api/mt5/test-trade', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({})
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.ok) {
+            console.log('✓ Test trade placed:', data.ticket, '@', data.price);
+        } else {
+            console.warning('Test trade failed:', data.error);
+        }
+    })
+    .catch(error => {
+        console.error('Test trade error:', error);
     });
 }
 
@@ -55,6 +157,17 @@ function updateMt5Display(data) {
     const trEl = document.getElementById('m-trade');
     trEl.textContent = data.trade_allowed ? 'Allowed' : 'Disabled';
     trEl.style.color = data.trade_allowed ? 'var(--green)' : 'var(--red)';
+    
+    // Equity and Balance
+    const equityEl = document.getElementById('m-equity');
+    if (equityEl && data.equity !== undefined) {
+        equityEl.textContent = '$' + data.equity.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    }
+    
+    const balanceEl = document.getElementById('m-balance');
+    if (balanceEl && data.balance !== undefined) {
+        balanceEl.textContent = '$' + data.balance.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    }
 }
 
 setInterval(() => {
@@ -279,3 +392,111 @@ function displayThoughts(thoughts) {
         </div>
     `).join('');
 }
+
+// Portfolio Watch updater - displays real-time pair performance
+function updatePortfolioWatch(data) {
+    const pairs = ['GBPJPY', 'EURJPY', 'GBPUSD', 'EURUSD'];
+    
+    // Build pair stats from open trades
+    const pairStats = {};
+    pairs.forEach(pair => {
+        pairStats[pair] = { trades: 0, pnl: 0, hasTrade: false };
+    });
+    
+    if (data.open_trades && data.open_trades.length > 0) {
+        data.open_trades.forEach(trade => {
+            if (pairStats[trade.symbol]) {
+                pairStats[trade.symbol].trades++;
+                pairStats[trade.symbol].pnl += trade.profit || 0;
+                pairStats[trade.symbol].hasTrade = true;
+            }
+        });
+    }
+    
+    // Update each watch card
+    pairs.forEach(pair => {
+        const stats = pairStats[pair];
+        
+        // Status indicator
+        const statusEl = document.getElementById(`status-${pair}`);
+        if (statusEl) {
+            const dot = statusEl.querySelector('.watch-dot');
+            const state = statusEl.querySelector('.watch-state');
+            
+            if (stats.hasTrade) {
+                dot.className = 'watch-dot trading';
+                state.textContent = 'Trading';
+            } else {
+                dot.className = 'watch-dot idle';
+                state.textContent = 'Idle';
+            }
+        }
+        
+        // Trades count
+        const tradesEl = document.getElementById(`trades-${pair}`);
+        if (tradesEl) {
+            tradesEl.textContent = stats.trades;
+        }
+        
+        // P&L with color
+        const pnlEl = document.getElementById(`pnl-${pair}`);
+        if (pnlEl) {
+            const pnlStr = stats.pnl >= 0 ? `+$${stats.pnl.toFixed(0)}` : `-$${Math.abs(stats.pnl).toFixed(0)}`;
+            pnlEl.textContent = pnlStr;
+            pnlEl.style.color = stats.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        }
+    });
+}
+
+// Update Summary Snapshot every 3 seconds
+setInterval(() => {
+    fetch('/bot/status')
+        .then(r => r.json())
+        .then(data => {
+            // Bot status
+            const botStatus = data.running ? 'Running ✓' : 'Idle';
+            const botStatusColor = data.running ? 'var(--green)' : 'var(--txt2)';
+            document.getElementById('snap-bot-status').textContent = botStatus;
+            document.getElementById('snap-bot-status').style.color = botStatusColor;
+            
+            // Market bias
+            const bias = data.market_bias || '—';
+            document.getElementById('snap-bias').textContent = bias;
+            
+            // Confidence
+            const conf = data.confidence !== undefined ? (data.confidence * 100).toFixed(0) + '%' : '—';
+            document.getElementById('snap-confidence').textContent = conf;
+            
+            // Last signal
+            const lastSig = data.last_signal || 'None';
+            document.getElementById('snap-last-signal').textContent = lastSig;
+            
+            // Trade details
+            const tradeDetails = document.getElementById('snap-trade-details');
+            if (data.open_trades && data.open_trades.length > 0) {
+                tradeDetails.innerHTML = data.open_trades.map(t => `
+                    <div style="padding:10px;background:var(--bg1);border-radius:6px">
+                        <div style="font-weight:600;color:var(--cyan);margin-bottom:4px">${t.symbol} ${t.direction}</div>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:10px">
+                            <div>Entry: <span style="color:var(--txt)">${t.entry_price}</span></div>
+                            <div>SL: <span style="color:var(--red)">${t.stop_loss}</span></div>
+                            <div>TP: <span style="color:var(--green)">${t.take_profit}</span></div>
+                            <div>Profit: <span style="color:${t.profit > 0 ? 'var(--green)' : 'var(--red)'}">${t.profit > 0 ? '+' : ''}${t.profit.toLocaleString()}</span></div>
+                        </div>
+                    </div>
+                `).join('');
+            } else {
+                tradeDetails.innerHTML = '<div style="padding:12px;background:var(--bg1);border-radius:6px;color:var(--txt2);text-align:center">No active trades</div>';
+            }
+            
+            // Session summary
+            const summary = data.session_summary || 'Waiting for bot to connect…';
+            document.getElementById('snap-session-summary').textContent = summary;
+            
+            // Update Portfolio Watch visualization
+            updatePortfolioWatch(data);
+        })
+        .catch(() => {
+            // Silently fail if endpoint not available yet
+        });
+}, 3000);

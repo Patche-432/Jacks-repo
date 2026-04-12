@@ -201,10 +201,64 @@ class MT5Connection:
             "server":           getattr(account,  "server",  None) if account else None,
             "account_name":     getattr(account,  "name",    None) if account else None,
             "currency":         getattr(account,  "currency",None) if account else None,
+            "balance":          round(getattr(account, "balance", 0), 2) if account else 0,
+            "equity":           round(getattr(account, "equity", 0), 2) if account else 0,
             "trade_allowed":    bool(getattr(account, "trade_allowed", False)) if account else False,
             "visible_symbols":  visible,
             "symbols_total":    len(symbols),
         }
+
+    def place_test_trade(self, symbol: str = "EURUSD", volume: float = 0.01) -> dict:
+        """
+        Place a test market BUY trade at current price.
+        Returns dict with ticket, price, status info.
+        """
+        self._require_connected()
+        import MetaTrader5 as mt5
+
+        try:
+            # Get symbol info
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None:
+                return {"ok": False, "error": f"Symbol {symbol} not found"}
+
+            # Get current price
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                return {"ok": False, "error": f"Cannot get price for {symbol}"}
+
+            # Prepare order
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": volume,
+                "type": mt5.ORDER_TYPE_BUY,
+                "price": tick.ask,
+                "deviation": 20,
+                "magic": 234000,
+                "comment": "Test trade 0.01",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            # Send order
+            result = mt5.order_send(request)
+
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                code, msg = mt5.last_error()
+                return {"ok": False, "error": f"Order failed [{result.retcode}]: {msg}"}
+
+            return {
+                "ok": True,
+                "ticket": result.order,
+                "symbol": symbol,
+                "volume": volume,
+                "price": tick.ask,
+                "comment": "Test trade placed"
+            }
+        except Exception as exc:
+            log.error(f"Test trade error: {exc}")
+            return {"ok": False, "error": str(exc)}
 
     # ── Context manager ───────────────────────────────────────────────────────
 
