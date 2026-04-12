@@ -223,6 +223,31 @@ class AI_ProBacktester:
             log.error("Data fetch error [%s]: %s", symbol, e)
             return None
     
+    def _fetch_daily(self, symbol: str, bars: int = 90) -> pd.DataFrame:
+        """Fetch daily historical data for the backtest period."""
+        if self._mt5 is None:
+            log.warning("MT5 not available; cannot fetch daily data")
+            return pd.DataFrame()
+        
+        try:
+            rates = self._mt5.copy_rates_from_pos(
+                symbol, self._mt5.TIMEFRAME_D1, 0, bars
+            )
+            if rates is None or len(rates) < 1:
+                log.warning("Not enough daily data for %s", symbol)
+                return pd.DataFrame()
+            
+            df = pd.DataFrame(rates)
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+            df = df.sort_values("time").reset_index(drop=True)
+            
+            log.info("Fetched %d daily candles for %s", len(df), symbol)
+            return df
+        
+        except Exception as e:
+            log.error("Daily data fetch error [%s]: %s", symbol, e)
+            return pd.DataFrame()
+    
     def generate_signals(self, symbol: str, df: pd.DataFrame) -> List[Signal]:
         """Generate signals for each candle in history."""
         self._ensure_mt5()
@@ -231,6 +256,12 @@ class AI_ProBacktester:
             log.error("Strategy not initialized")
             return []
         
+        # Fetch daily data once before the loop
+        df_daily = self._fetch_daily(symbol, bars=90)
+        if df_daily.empty:
+            log.warning("No daily data available; continuing without daily level mocking")
+            df_daily = None
+        
         signals = []
         
         # Simulate walking through history
@@ -238,14 +269,42 @@ class AI_ProBacktester:
             try:
                 # Create a slice of data up to this candle
                 df_slice = df.iloc[:i+1].copy()
+                bar_time = df_slice.iloc[-1]["time"]
+                bar_date = bar_time.date()
                 
-                # Temporarily override the strategy's fetch method
+                # Get historically correct daily levels
+                correct_levels = None
+                if df_daily is not None and len(df_daily) > 0:
+                    prev_days = df_daily[df_daily["time"].dt.date < bar_date]
+                    
+                    if len(prev_days) > 0:
+                        prev_day = prev_days.iloc[-1]
+                        correct_levels = {
+                            "date":  prev_day["time"].date(),
+                            "high":  float(prev_day["high"]),
+                            "low":   float(prev_day["low"]),
+                            "range": float(prev_day["high"]) - float(prev_day["low"]),
+                        }
+                
+                # Temporarily override the strategy's fetch methods
                 original_fetch = self._strategy._fetch_m15
+                original_levels = self._strategy.get_previous_day_levels
                 
                 def mock_fetch(sym):
                     return df_slice
                 
+                def mock_levels(sym):
+                    if correct_levels:
+                        return correct_levels
+                    return {"date": bar_date, "high": 0.0, "low": 0.0, "range": 0.0}
+                
                 self._strategy._fetch_m15 = mock_fetch
+                self._strategy.get_previous_day_levels = mock_levels
+                
+                # Also set these directly as a safety net
+                if correct_levels:
+                    self._strategy.previous_day_high = correct_levels["high"]
+                    self._strategy.previous_day_low = correct_levels["low"]
                 
                 try:
                     # Generate signal at this point
@@ -269,8 +328,9 @@ class AI_ProBacktester:
                         )
                         signals.append(sig)
                 finally:
-                    # Restore original method
+                    # Restore original methods
                     self._strategy._fetch_m15 = original_fetch
+                    self._strategy.get_previous_day_levels = original_levels
             
             except Exception as e:
                 log.error("Signal gen error at bar %d: %s", i, str(e)[:200])
