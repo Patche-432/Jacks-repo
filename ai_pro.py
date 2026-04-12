@@ -97,7 +97,6 @@ allowed_symbols:
   - GBPJPY
   - AUDUSD
   - USDCAD
-  - USDCHF
 
 sessions:
   always: [0, 24]
@@ -561,8 +560,8 @@ class AI_Pro:
         atr_tolerance_multiplier: float = 1.5,
         lookback_candles: int           = 50,
         atr_period: int                 = 14,
-        sl_atr_mult: float              = 1.5,
-        tp_atr_mult: float              = 3.0,
+        sl_atr_mult: float              = 2.5,
+        tp_atr_mult: float              = 4.5,
         level_interaction_bars: int     = 10,
         partial_close_ratio: float      = 0.5,
         partial_close_rr: float         = 1.0,
@@ -906,14 +905,12 @@ class AI_Pro:
         last_closes = []
         hh_ll_status = {"trend_intact": True, "reason": "N/A"}
         structure_status = {"structure_broken": False, "reason": "N/A"}
-        momentum_str = 0.5
         
         if df is not None:
             last_closes = [round(float(c), 5)
                            for c in df["close"].tail(5).tolist()]
             hh_ll_status = self._detect_hh_ll_trend(df, "buy" if is_buy else "sell")
             structure_status = self._detect_structure_break(df, entry, "buy" if is_buy else "sell", atr)
-            momentum_str = self._momentum_strength(df)
             fresh_struct = self._detect_fresh_structure(df, "buy" if is_buy else "sell")
         else:
             fresh_struct = {"fresh_structure": False, "structure_type": None}
@@ -938,7 +935,6 @@ POSITION:
 TREND ANALYSIS:
   Trend intact (HH/LL):     {hh_ll_status["trend_intact"]} ({hh_ll_status["reason"]})
   Structure broken:         {structure_status["structure_broken"]} ({structure_status["reason"]})
-  Momentum strength:        {momentum_str:.1%}
   FRESH STRUCTURE:          {fresh_struct["fresh_structure"]} (Type: {fresh_struct["structure_type"]})
 
 YOUR JOB: Decide what to do with the STOP LOSS to maximise profit.
@@ -947,7 +943,7 @@ Rules:
 - For BUY:  new_sl MUST be below current price {cur_price:.5f}
 - For SELL: new_sl MUST be above current price {cur_price:.5f}
 - new_sl must be BETTER than current SL {cur_sl:.5f}
-- HOLD is the default. ONLY recommend "close" if BOTH structure is broken AND momentum strength < 30%.
+- HOLD is the default. ONLY recommend "close" if structure is broken.
 - **FRESH STRUCTURE = MOVE**: When FRESH_STRUCTURE is True (HH/HL/LL/LH formed), recommend "trail" immediately
 - If fresh structure detected AND profit > 3pts: "trail" to lock gains
 - If profit < 5 pts AND no fresh structure yet: "hold"
@@ -1598,6 +1594,33 @@ Reply ONLY with JSON:
                     "confidence": 0.6, "entry_method": "market", "limit_price": None}
 
     # ------------------------------------------------------------------ #
+    # HTF bias detection                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _get_daily_trend_bias(self, symbol: str) -> str:
+        """Determine daily timeframe trend direction."""
+        try:
+            import MetaTrader5 as mt5
+            # Get last daily candle
+            daily_data = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 2)
+            if daily_data is None or len(daily_data) < 1:
+                return "neutral"
+            
+            last_daily = daily_data[-1]
+            daily_close = last_daily["close"]
+            daily_open  = last_daily["open"]
+            
+            # Simple trend: close above open = bullish, below = bearish
+            if daily_close > daily_open:
+                return "bullish"
+            elif daily_close < daily_open:
+                return "bearish"
+            else:
+                return "neutral"
+        except Exception:
+            return "neutral"
+
+    # ------------------------------------------------------------------ #
     # Main signal generator                                                #
     # ------------------------------------------------------------------ #
 
@@ -1610,6 +1633,7 @@ Reply ONLY with JSON:
         if df is None:
             return self._neutral(symbol, "Could not fetch M15 data")
 
+        daily_trend = self._get_daily_trend_bias(symbol)
         atr           = self._calculate_atr(df)
         current_price = df.iloc[-1]["close"]
         zone          = atr * self.atr_tolerance_multiplier
@@ -1662,7 +1686,7 @@ Reply ONLY with JSON:
         if (choch_data and choch_data["choch_detected"]
                 and choch_data["type"] == "bullish"
                 and near_low_choch and failed_low_at_pdl
-                and self._momentum_aligned(df, "buy")):
+                and daily_trend != "bearish"):
             sl, tp = buy_levels()
             triggered.append((1, {
                 "signal": "BUY", "signal_source": "CHoCH-BUY@PDL",
@@ -1683,7 +1707,7 @@ Reply ONLY with JSON:
         if (choch_data and choch_data["choch_detected"]
                 and choch_data["type"] == "bearish"
                 and near_high_choch and failed_high_at_pdh
-                and self._momentum_aligned(df, "sell")):
+                and daily_trend != "bullish"):
             sl, tp = sell_levels()
             triggered.append((1, {
                 "signal": "SELL", "signal_source": "CHoCH-SELL@PDH",
@@ -1701,7 +1725,7 @@ Reply ONLY with JSON:
         if (cont_data and cont_data["continuation_detected"]
                 and cont_data["type"] == "bullish"
                 and broke_above_pdh and near_high
-                and self._momentum_aligned(df, "buy")):
+                and daily_trend != "bearish"):
             strength   = cont_data.get("trend_strength", 1)
             confidence = 65 + strength * 10
             sl, tp     = buy_levels()
@@ -1721,7 +1745,7 @@ Reply ONLY with JSON:
         if (cont_data and cont_data["continuation_detected"]
                 and cont_data["type"] == "bearish"
                 and broke_below_pdl and near_low
-                and self._momentum_aligned(df, "sell")):
+                and daily_trend != "bullish"):
             strength   = cont_data.get("trend_strength", 1)
             confidence = 65 + strength * 10
             sl, tp     = sell_levels()
@@ -1757,29 +1781,31 @@ Reply ONLY with JSON:
                 choch_data and choch_data["choch_detected"]
                 and choch_data["type"] == "bullish"
                 and near_low_choch and failed_low_at_pdl
-                and self._momentum_aligned(df, "buy")
             )
             env2_ready = bool(
                 choch_data and choch_data["choch_detected"]
                 and choch_data["type"] == "bearish"
                 and near_high_choch and failed_high_at_pdh
-                and self._momentum_aligned(df, "sell")
             )
             env3_ready = bool(
                 cont_data and cont_data["continuation_detected"]
                 and cont_data["type"] == "bullish"
                 and broke_above_pdh and near_high
-                and self._momentum_aligned(df, "buy")
             )
             env4_ready = bool(
                 cont_data and cont_data["continuation_detected"]
                 and cont_data["type"] == "bearish"
                 and broke_below_pdl and near_low
-                and self._momentum_aligned(df, "sell")
             )
             signal["reason"] = self._environment_summary(
                 env1_ready, env2_ready, env3_ready, env4_ready
             )
+
+        # Filter: Only return signals with sufficient confidence
+        # This reduces noise and focuses on high-quality setups
+        MIN_CONFIDENCE_THRESHOLD = 75  # Require at least 75% confidence
+        if signal["signal"] != "neutral" and signal["confidence"] < MIN_CONFIDENCE_THRESHOLD:
+            return self._neutral(symbol, f"Low confidence ({signal['confidence']}% < {MIN_CONFIDENCE_THRESHOLD}%)")
 
         log_thought(
             "ai_pro_signal", symbol, "signal",
@@ -2124,8 +2150,8 @@ class Bot:
         self.use_ai     = bool(use_ai)
         self.strategy_config = {
             "atr_tolerance_multiplier": float(strategy_kwargs.get("atr_tolerance_multiplier", 1.5)),
-            "sl_atr_mult":              float(strategy_kwargs.get("sl_atr_mult", 1.5)),
-            "tp_atr_mult":              float(strategy_kwargs.get("tp_atr_mult", 3.0)),
+            "sl_atr_mult":              float(strategy_kwargs.get("sl_atr_mult", 2.5)),
+            "tp_atr_mult":              float(strategy_kwargs.get("tp_atr_mult", 4.5)),
             "partial_close_rr":         float(strategy_kwargs.get("partial_close_rr", 1.0)),
             "breakeven_buffer_pips":    float(strategy_kwargs.get("breakeven_buffer_pips", 1.0)),
         }
@@ -2333,7 +2359,7 @@ class Bot:
 from flask import Flask, request, jsonify, Response, send_file
 from flask_cors import CORS
 import mimetypes
-from mt5_connection import MT5Connection, MT5ConnectionError
+from core.mt5_connection import MT5Connection, MT5ConnectionError
 
 app = Flask(__name__)
 CORS(app)
