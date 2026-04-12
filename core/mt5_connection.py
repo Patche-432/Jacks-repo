@@ -208,9 +208,9 @@ class MT5Connection:
             "symbols_total":    len(symbols),
         }
 
-    def place_test_trade(self, symbol: str = "EURUSD", volume: float = 0.01) -> dict:
+    def place_test_trade(self, symbol: str = "EURUSD", volume: float = 0.001) -> dict:
         """
-        Place a test market BUY trade at current price.
+        Place a taste test market BUY trade at current price.
         Returns dict with ticket, price, status info.
         """
         self._require_connected()
@@ -236,7 +236,7 @@ class MT5Connection:
                 "price": tick.ask,
                 "deviation": 20,
                 "magic": 234000,
-                "comment": "Test trade 0.01",
+                "comment": "Taste test trade 0.001",
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
@@ -244,18 +244,18 @@ class MT5Connection:
             # Send order
             result = mt5.order_send(request)
 
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                return {
+                    "ok": True,
+                    "ticket": result.order,
+                    "symbol": symbol,
+                    "volume": volume,
+                    "price": tick.ask,
+                    "comment": "Test trade placed successfully"
+                }
+            else:
                 code, msg = mt5.last_error()
                 return {"ok": False, "error": f"Order failed [{result.retcode}]: {msg}"}
-
-            return {
-                "ok": True,
-                "ticket": result.order,
-                "symbol": symbol,
-                "volume": volume,
-                "price": tick.ask,
-                "comment": "Test trade placed"
-            }
         except Exception as exc:
             log.error(f"Test trade error: {exc}")
             return {"ok": False, "error": str(exc)}

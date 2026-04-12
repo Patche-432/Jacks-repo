@@ -23,7 +23,7 @@ ENV 2 │ CHoCH SELL at PDH — failed Higher High anchored at Previous Day High
 ENV 3 │ Continuation BUY  — broke above PDH, retesting it as support
 ENV 4 │ Continuation SELL — broke below PDL, retesting it as resistance
 
-All environments still require momentum alignment + level interaction.
+All environments require level interaction for confirmation.
 CHoCH signals have priority (confidence 85) over Continuation (65-75).
 Auto-trade only fires when confidence >= 70 AND DeepSeek approves.
 
@@ -102,10 +102,7 @@ sessions:
 risk:
   max_risk_per_trade_pct:  1.0
   max_open_positions:      1
-  min_rr_ratio:            1.5
   max_spread_points:       30
-  daily_loss_limit_usd:   -200.0
-  daily_profit_target_usd: 500.0
 
 entry:
   min_confluence_signals: 1
@@ -121,8 +118,6 @@ exit:
     close_fraction:   0.50
     sl_plus_points:    5
 
-  max_trade_duration_minutes: 240
-
   conditions:
     - "Trail SL at 50% of current profit pips (locks in half gains, lets winners run)."
     - "Partial close at 50% of halfway to TP (secure 25% of full TP profit early)."
@@ -132,7 +127,7 @@ ai:
   extra_instructions: |
     AI_Pro AI risk notes:
     1. CHoCH setups (ENV1/ENV2) have structural backing — trail generously.
-    2. Continuation setups (ENV3/ENV4) are momentum-dependent — tighten faster.
+    2. Continuation setups (ENV3/ENV4) — tighten faster on structure breaks.
     3. Move SL to BE once 10pts in profit.
     4. Trail 8pts behind price while in profit.
     5. Close 50% at halfway to TP, lock SL above entry after partial.
@@ -168,6 +163,7 @@ logging.basicConfig(
 log = logging.getLogger("ai_pro")
 
 _MEMORY_PATH = Path(__file__).resolve().parent / "ai_pro_trade_log.json"
+_CREDS_PATH  = Path(__file__).resolve().parent / "mt5_credentials.json"
 
 # ============================================================ #
 # SECTION 3 — LOCAL LLM (DeepSeek-R1-Distill-Qwen-1.5B)        #
@@ -328,10 +324,7 @@ class TradingRules:
         risk: dict = raw.get("risk") or {}
         self.max_risk_per_trade_pct: float         = float(risk.get("max_risk_per_trade_pct", 1.0))
         self.max_open_positions: int               = int(risk.get("max_open_positions", 1))
-        self.min_rr_ratio: float                   = float(risk.get("min_rr_ratio", 1.5))
         self.max_spread_points: int                = int(risk.get("max_spread_points", 30))
-        self.daily_loss_limit_usd: Optional[float] = _to_float(risk.get("daily_loss_limit_usd"))
-        self.daily_profit_target_usd: Optional[float] = _to_float(risk.get("daily_profit_target_usd"))
 
         entry: dict = raw.get("entry") or {}
         self.min_confluence_signals: int = int(entry.get("min_confluence_signals", 1))
@@ -341,7 +334,6 @@ class TradingRules:
         exit_: dict = raw.get("exit") or {}
         self.breakeven_trigger_points: Optional[int]   = _to_int(exit_.get("breakeven_trigger_points"))
         self.trailing_stop_points: Optional[int]       = _to_int(exit_.get("trailing_stop_points"))
-        self.max_trade_duration_minutes: Optional[int] = _to_int(exit_.get("max_trade_duration_minutes"))
         self.exit_conditions: list = list(exit_.get("conditions") or [])
 
         partial: dict = exit_.get("partial_take_profit") or {}
@@ -913,15 +905,12 @@ class AI_Pro:
         )
         peak = self._ai_peak_profit[ticket]
 
-        # Fetch last 5 M15 closes for context
+        # Fetch M15 data for structure analysis
         df = self._fetch_m15(symbol)
-        last_closes = []
         hh_ll_status = {"trend_intact": True, "reason": "N/A"}
         structure_status = {"structure_broken": False, "reason": "N/A"}
         
         if df is not None:
-            last_closes = [round(float(c), 5)
-                           for c in df["close"].tail(5).tolist()]
             hh_ll_status = self._detect_hh_ll_trend(df, "buy" if is_buy else "sell")
             structure_status = self._detect_structure_break(df, entry, "buy" if is_buy else "sell", atr)
             fresh_struct = self._detect_fresh_structure(df, "buy" if is_buy else "sell")
@@ -931,7 +920,7 @@ class AI_Pro:
         prompt = f"""You are an AI risk manager for AI_Pro forex strategy.
 
 PRIMARY OBJECTIVE: Find and HOLD winning setups for maximum profit. Only tighten or close if
-momentum is genuinely broken or the setup shows structural failure.
+the setup shows structural failure.
 
 POSITION:
   Symbol:        {symbol}
@@ -943,7 +932,6 @@ POSITION:
   Profit (pts):  {profit_pts:.1f}
   Peak profit:   {peak:.1f} pts
   ATR (M15):     {atr:.5f}
-  Last 5 closes: {last_closes}
 
 TREND ANALYSIS:
   Trend intact (HH/LL):     {hh_ll_status["trend_intact"]} ({hh_ll_status["reason"]})
@@ -1066,18 +1054,6 @@ Respond ONLY with JSON:
             profit_pts = ((price - entry) / point if is_buy
                           else (entry - price) / point)
 
-            # -- Rule-based: max duration
-            if rules and rules.max_trade_duration_minutes:
-                open_time = float(getattr(pos, "time", time.time()))
-                elapsed   = (time.time() - open_time) / 60.0
-                if elapsed >= rules.max_trade_duration_minutes:
-                    log_thought("rule_risk", symbol, "max_duration",
-                                f"#{ticket} max duration hit ({elapsed:.0f}m)",
-                                action="close")
-                    r = self._close_position(pos)
-                    results.append(r)
-                    continue
-
             # -- Rule-based: breakeven
             if ticket not in self._ai_breakeven_done and rules:
                 be_pts = int(getattr(rules, "breakeven_trigger_points", 0) or 0)
@@ -1169,7 +1145,7 @@ Respond ONLY with JSON:
         return swing_highs, swing_lows
 
     # ------------------------------------------------------------------ #
-    # Level interaction & momentum                                         #
+    # Level interaction                                                     #
     # ------------------------------------------------------------------ #
 
     def _level_interacted(self, df: pd.DataFrame, level: float,
@@ -1180,14 +1156,6 @@ Respond ONLY with JSON:
         touched = ((recent["low"]  <= level + zone) &
                    (recent["high"] >= level - zone))
         return bool(touched.any())
-
-    def _momentum_aligned(self, df: pd.DataFrame, direction: str) -> bool:
-        closes = df["close"].tail(4).values
-        if len(closes) < 4:
-            return True
-        if direction == "buy":
-            return closes[-1] > min(closes[-4], closes[-3])
-        return closes[-1] < max(closes[-4], closes[-3])
 
     def _detect_hh_ll_trend(self, df: pd.DataFrame, direction: str) -> dict:
         """
@@ -1257,22 +1225,6 @@ Respond ONLY with JSON:
             "structure_broken": structure_broken,
             "reason": reason
         }
-
-    def _momentum_strength(self, df: pd.DataFrame) -> float:
-        """
-        Calculates momentum strength 0-1 based on rate of change and volume pattern.
-        """
-        if len(df) < 3:
-            return 0.5
-        
-        closes = df["close"].tail(5).values
-        roc = (closes[-1] - closes[0]) / closes[0] if closes[0] != 0 else 0
-        abs_roc = abs(roc)
-        
-        # Normalize to 0-1 range (5% movement = 1.0)
-        strength = min(abs_roc / 0.05, 1.0)
-        
-        return float(strength)
 
     def _detect_fresh_structure(self, df: pd.DataFrame, direction: str) -> dict:
         """
@@ -1494,8 +1446,6 @@ Respond ONLY with JSON:
         """
         records      = _load_memory()
         history      = _memory_summary(records)
-        last_closes  = [round(float(c), 5)
-                        for c in df["close"].tail(10).tolist()]
         env          = signal.get("signal_source", "unknown")
         direction    = signal["signal"]
         entry        = signal.get("entry_price", 0)
@@ -1523,23 +1473,14 @@ LEVELS:
   Prev Day High:   {pdh:.5f}
   Prev Day Low:    {pdl:.5f}
   ATR:             {atr}
-  Last 10 closes:  {last_closes}
 
 RECENT TRADE HISTORY: {history}
 
-DECISION 1: Should this AI Pro signal be taken?
+DECISION: Should this AI Pro signal be taken?
 Consider: is price genuinely near the key level?
-Does the last-close momentum match the direction?
-
-DECISION 2: If approved, what's the OPTIMAL ENTRY?
-- "market": Enter immediately at current price (price already at level, momentum strong)
-- "limit": Set limit order at better price (price far from level, wait for interaction)
-- "limit_pdh_pdl": Set limit order exactly at PDH/PDL for perfect entry
-Choose based on: distance from level, momentum strength, ATR, environment type.
-Set limit_price to exact level or price you want to enter at.
 
 Reply ONLY with JSON:
-{{"approve":true,"reason":"brief reason","confidence":0.0,"entry_method":"market","limit_price":null}}"""
+{{"approve":true,"reason":"brief reason","confidence":0.0}}"""
 
         log_thought("ai_entry", symbol, "review_start",
                     f"Sending {direction} [{env}] to Qwen for review",
@@ -1552,25 +1493,12 @@ Reply ONLY with JSON:
                             "Qwen parse failed — defaulting approve",
                             action=direction.lower())
                 return {"approve": True, "reason": "Parse failed — default approve",
-                        "confidence": 0.6, "entry_method": "market", "limit_price": None}
+                        "confidence": 0.6}
             strategy_conf = _normalize_confidence(confidence, default=0.0)
             llm_verdict   = _coerce_bool(parsed.get("approve", True), default=True)
             ai_reason     = str(parsed.get("reason", "")).strip() or "No reason provided"
             ai_conf       = _normalize_confidence(parsed.get("confidence", 0.6), default=0.6)
-            entry_method  = str(parsed.get("entry_method", "market")).lower()
-            limit_price   = parsed.get("limit_price")
             approve       = llm_verdict
-
-            # Validate entry_method
-            if entry_method not in ("market", "limit", "limit_pdh_pdl"):
-                entry_method = "market"
-            
-            # Validate limit_price if not market
-            if entry_method != "market" and limit_price is not None:
-                try:
-                    limit_price = float(limit_price)
-                except (TypeError, ValueError):
-                    limit_price = None
 
             if llm_verdict:
                 if ai_conf < self.CONFIDENCE_THRESHOLD:
@@ -1592,19 +1520,18 @@ Reply ONLY with JSON:
             log_thought(
                 "ai_entry", symbol, "verdict",
                 f"Qwen {'APPROVED' if approve else 'REJECTED'}: {ai_reason[:80]}",
-                detail=f"{direction} [{env}] conf={ai_conf:.2f} entry={entry_method} @{limit_price}",
+                detail=f"{direction} [{env}] conf={ai_conf:.2f}",
                 action=direction.lower() if approve else "hold",
                 confidence=ai_conf,
             )
             return {"approve": approve, "reason": ai_reason,
-                    "confidence": ai_conf, "entry_method": entry_method,
-                    "limit_price": limit_price}
+                    "confidence": ai_conf}
 
         except Exception as exc:
             log_thought("ai_entry", symbol, "error",
                         f"Qwen error: {exc} — default approve")
             return {"approve": True, "reason": f"Qwen error — default approve",
-                    "confidence": 0.6, "entry_method": "market", "limit_price": None}
+                    "confidence": 0.6}
 
     # ------------------------------------------------------------------ #
     # HTF bias detection                                                   #
@@ -1783,14 +1710,10 @@ Reply ONLY with JSON:
                 signal["ai_approved"]   = review["approve"]
                 signal["ai_reason"]     = review["reason"]
                 signal["ai_confidence"] = review["confidence"]
-                signal["ai_entry_method"] = review.get("entry_method", "market")
-                signal["ai_limit_price"]   = review.get("limit_price")
             else:
                 signal["ai_approved"]   = True
                 signal["ai_reason"]     = "AI disabled"
                 signal["ai_confidence"] = 1.0
-                signal["ai_entry_method"] = "market"
-                signal["ai_limit_price"]   = None
         else:
             env1_ready = bool(
                 choch_data and choch_data["choch_detected"]
@@ -1905,65 +1828,7 @@ Reply ONLY with JSON:
         direction_short = signal['signal'][:3]
         comment_str = f"AP_{source_short[:10]}_{direction_short}"[:31]
         
-        # Determine entry method (market vs limit)
-        entry_method = signal.get("ai_entry_method", "market").lower()
-        limit_price = signal.get("ai_limit_price")
-        
-        # If limit order and limit_price provided, use pending limit order
-        if entry_method in ("limit", "limit_pdh_pdl") and limit_price is not None:
-            try:
-                limit_price = round(float(limit_price), digits)
-                pending_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
-                request = {
-                    "action":       mt5.TRADE_ACTION_PENDING,
-                    "symbol":       symbol,
-                    "volume":       float(lot_size),
-                    "type":         pending_type,
-                    "price":        limit_price,
-                    "sl":           sl,
-                    "tp":           tp,
-                    "deviation":    20,
-                    "magic":        234000,
-                    "comment":      comment_str,
-                    "type_time":    mt5.ORDER_TIME_GTC,
-                    "type_filling": filling,
-                }
-                result = mt5.order_send(request)
-                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    log_thought(
-                        "execution", symbol, "pending_placed",
-                        f"Limit order #{result.order} {signal['signal']} "
-                        f"@ {limit_price:.5f}  SL={sl:.5f}  TP={tp:.5f}",
-                        action=signal["signal"].lower(),
-                        confidence=signal.get("ai_confidence"),
-                    )
-                    return {
-                        "success":       True,
-                        "message":       f"Limit order placed at {limit_price:.5f}",
-                        "order_ticket":  result.order,
-                        "entry_method":  "limit",
-                        "limit_price":   limit_price,
-                        "signal":        signal["signal"],
-                        "signal_source": signal.get("signal_source"),
-                        "stop_loss":     sl,
-                        "take_profit":   tp,
-                    }
-                comment = result.comment if result else "N/A"
-                retcode = result.retcode if result else "N/A"
-                last_error = mt5.last_error()
-                log_thought("execution", symbol, "pending_failed",
-                            f"Limit order FAILED: {comment} (retcode {retcode})",
-                            action="hold")
-                return {
-                    "success": False,
-                    "message": f"Limit order failed: {comment}",
-                    "retcode": retcode,
-                }
-            except (ValueError, TypeError):
-                # Fall through to market order if limit_price invalid
-                pass
-        
-        # Market order (default)
+        # Market order (spot entry only)
         request = {
             "action":       mt5.TRADE_ACTION_DEAL,
             "symbol":       symbol,
@@ -1991,7 +1856,6 @@ Reply ONLY with JSON:
                 "success":       True,
                 "message":       "Trade executed",
                 "order_ticket":  result.order,
-                "entry_method":  "market",
                 "volume":        result.volume,
                 "price":         result.price,
                 "signal":        signal["signal"],
@@ -2132,13 +1996,6 @@ def _check_hard_rules(rules, symbol: str, positions,
             spread = (tick.ask - tick.bid) / point
             if spread > rules.max_spread_points:
                 return f"Spread {spread:.1f}pts > max {rules.max_spread_points}"
-    today_pnl = _todays_pnl(records)
-    if (rules.daily_loss_limit_usd is not None
-            and today_pnl <= rules.daily_loss_limit_usd):
-        return f"Daily loss limit hit (${today_pnl:.2f})"
-    if (rules.daily_profit_target_usd is not None
-            and today_pnl >= rules.daily_profit_target_usd):
-        return f"Daily profit target hit (${today_pnl:.2f})"
     return None
 
 
@@ -2152,7 +2009,6 @@ class Bot:
         symbols:   list  = None,
         volume:    float = 0.01,
         poll_secs: float = 300.0,
-        dry_run:   bool  = False,
         auto_trade: bool = True,
         use_ai:    bool  = True,
         **strategy_kwargs,
@@ -2160,7 +2016,6 @@ class Bot:
         self.symbols    = [s.strip().upper() for s in (symbols or ["EURUSD"])]
         self.volume     = float(volume)
         self.poll_secs  = float(poll_secs)
-        self.dry_run    = bool(dry_run)
         self.auto_trade = bool(auto_trade)
         self.use_ai     = bool(use_ai)
         self.strategy_config = {
@@ -2181,8 +2036,8 @@ class Bot:
         self._positions_lock = threading.Lock()
 
     def run(self) -> None:
-        log.info("Bot starting — symbols=%s  poll=%ss  dry_run=%s",
-                 self.symbols, self.poll_secs, self.dry_run)
+        log.info("Bot starting — symbols=%s  poll=%ss  auto_trade=%s  use_ai=%s",
+                 self.symbols, self.poll_secs, self.auto_trade, self.use_ai)
         if not self._strategy._ensure_mt5():
             raise RuntimeError("MT5 failed to initialize")
         self._running = True
@@ -2215,7 +2070,6 @@ class Bot:
             "symbols":    list(self.symbols),
             "volume":     self.volume,
             "poll_secs":  self.poll_secs,
-            "dry_run":    self.dry_run,
             "auto_trade": self.auto_trade,
             "use_ai":     self.use_ai,
             "strategy":   dict(self.strategy_config),
@@ -2228,8 +2082,7 @@ class Bot:
                 self.volume = float(updates["volume"])
             if "poll_secs" in updates:
                 self.poll_secs = float(updates["poll_secs"])
-            if "dry_run" in updates:
-                self.dry_run = bool(updates["dry_run"])
+
             if "auto_trade" in updates:
                 self.auto_trade = bool(updates["auto_trade"])
             if "use_ai" in updates:
@@ -2322,7 +2175,7 @@ class Bot:
                 return
 
             max_pos = rules.max_open_positions
-            if len(positions) >= max_pos and not self.dry_run:
+            if len(positions) >= max_pos:
                 log.info("[%s] At max positions (%d)", symbol, max_pos)
                 # Still run risk manager even when at max positions
                 self._strategy.run_ai_risk_manager(symbol)
@@ -2330,17 +2183,9 @@ class Bot:
 
         result = self._strategy.run_strategy(
             symbol=symbol,
-            auto_trade=self.auto_trade and not self.dry_run,
+            auto_trade=self.auto_trade,
             lot_size=self.volume,
         )
-
-        if self.dry_run and result["signal"]["signal"] != "neutral":
-            sig = result["signal"]
-            log.warning("[DRY RUN] %s %s [%s] conf=%d%% AI=%s",
-                        symbol, sig["signal"],
-                        sig.get("signal_source", "?"),
-                        sig["confidence"],
-                        sig.get("ai_approved"))
 
         with self._results_lock:
             self._results[symbol] = result
@@ -2401,7 +2246,7 @@ _last_bot_config: dict = {
     "symbols":    ["EURUSD", "GBPUSD", "USDJPY", "GBPJPY", "AUDUSD", "USDCAD", "USDCHF"],
     "volume":     0.01,
     "poll_secs":  300.0,
-    "dry_run":    False,
+
     "auto_trade": True,
     "use_ai":     True,
     "strategy": {
@@ -2754,7 +2599,7 @@ def bot_status():
             "symbols":    bot.symbols,
             "volume":     bot.volume,
             "poll_secs":  bot.poll_secs,
-            "dry_run":    bot.dry_run,
+
             "auto_trade": bot.auto_trade,
         } if bot else None,
         "config": config,
@@ -2811,7 +2656,7 @@ def bot_start():
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
 
-    dry_run    = bool(data.get("dry_run",    False))
+
     auto_trade = bool(data.get("auto_trade", True))
     use_ai     = bool(data.get("use_ai",     True))
     strategy   = data.get("strategy", {}) or {}
@@ -2820,7 +2665,7 @@ def bot_start():
         "symbols":    list(symbols),
         "volume":     volume,
         "poll_secs":  poll_secs,
-        "dry_run":    dry_run,
+
         "auto_trade": auto_trade,
         "use_ai":     use_ai,
         "strategy": {
@@ -2843,7 +2688,7 @@ def bot_start():
         symbols=symbols,
         volume=volume,
         poll_secs=poll_secs,
-        dry_run=dry_run,
+
         auto_trade=auto_trade,
         use_ai=use_ai,
         atr_tolerance_multiplier = float(strategy.get("atr_tolerance_multiplier", 1.5)),
@@ -2858,7 +2703,7 @@ def bot_start():
         _bot        = new_bot
         _bot_thread = t
     t.start()
-    return jsonify({"ok": True, "symbols": symbols, "dry_run": dry_run,
+    return jsonify({"ok": True, "symbols": symbols,
                     "use_ai": use_ai})
 
 
@@ -3029,12 +2874,11 @@ def manual_signal(symbol: str):
 
 if __name__ == "__main__":
     if "--run" in sys.argv:
-        # Headless bot mode — no Flask
+        # Headless bot mode — no Flask (always live trading)
         bot = Bot(
             symbols=["EURUSD", "GBPUSD", "USDJPY", "GBPJPY", "AUDUSD", "USDCAD", "USDCHF"],
             volume=0.01,
             poll_secs=300,
-            dry_run=True,   # ← change to False for live trading
             auto_trade=True,
             use_ai=True,
         )
@@ -3056,6 +2900,33 @@ if __name__ == "__main__":
                 log.info("No saved MT5 credentials — waiting for manual connect via dashboard.")
 
         threading.Thread(target=_auto_connect_mt5, daemon=True, name="mt5-autoconnect").start()
+
+        # Test trade on startup to confirm everything is working
+        def _test_trade_on_startup():
+            import time
+            time.sleep(2)  # Wait for Flask to be ready
+            log.info(">>> Running startup test trade (0.001 lot EURUSD BUY)...")
+            try:
+                # Reload credentials before test (in case they were just saved)
+                _load_saved_credentials()
+                
+                conn = MT5Connection(dict(MT5_CONFIG))
+                if conn.connect():
+                    try:
+                        result = conn.place_test_trade(symbol="EURUSD", volume=0.001)
+                        if result.get("ok"):
+                            log.info("===== SUCCESS: Test trade placed! Ticket=%s =====", result.get("ticket"))
+                            return
+                        else:
+                            log.warning("Test trade failed: %s", result.get("error"))
+                    finally:
+                        conn.disconnect()
+                else:
+                    log.warning("Could not connect to MT5 for test trade. Enter credentials via dashboard.")
+            except Exception as exc:
+                log.warning("Test trade not executed (waiting for MT5 connection): %s", exc)
+
+        threading.Thread(target=_test_trade_on_startup, daemon=True, name="test-trade").start()
 
         print("=" * 55)
         chosen_port = _choose_http_port()

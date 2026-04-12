@@ -1,4 +1,8 @@
 """Flask server for MT5 dashboard"""
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from datetime import datetime, timezone
 from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
@@ -90,12 +94,12 @@ def api_disconnect_mt5():
 
 @app.route('/api/mt5/test-trade', methods=['POST'])
 def api_test_trade():
-    """Place a test trade (0.01 lot BUY on EURUSD)"""
+    """Place a taste test trade (0.001 lot BUY on EURUSD)"""
     global mt5_conn
     if not mt5_conn or not mt5_conn.is_connected():
         return jsonify({'ok': False, 'error': 'Not connected to MT5'}), 400
     try:
-        result = mt5_conn.place_test_trade(symbol='EURUSD', volume=0.01)
+        result = mt5_conn.place_test_trade(symbol='EURUSD', volume=0.001)
         if result['ok']:
             return jsonify(result)
         else:
