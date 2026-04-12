@@ -2928,6 +2928,41 @@ if __name__ == "__main__":
 
         threading.Thread(target=_test_trade_on_startup, daemon=True, name="test-trade").start()
 
+        # Auto-start bot after MT5 connects
+        def _auto_start_bot():
+            import time
+            max_wait = 15
+            elapsed = 0
+            while elapsed < max_wait:
+                time.sleep(1)
+                elapsed += 1
+                mt5_status = _mt5_snapshot(shutdown_when_done=True)
+                if mt5_status.get("connected") and mt5_status.get("trade_allowed"):
+                    log.info("MT5 connected ✓ — auto-starting bot polling...")
+                    auto_bot = Bot(
+                        symbols=["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
+                        volume=0.50,
+                        poll_secs=300,
+                        auto_trade=True,
+                        use_ai=True,
+                        atr_tolerance_multiplier=1.5,
+                        sl_atr_mult=2.5,
+                        tp_atr_mult=4.5,
+                        partial_close_rr=1.0,
+                        breakeven_buffer_pips=1.0,
+                    )
+                    t = threading.Thread(target=_run_bot_thread, args=(auto_bot,), daemon=True)
+                    with _bot_lock:
+                        global _bot, _bot_thread
+                        _bot = auto_bot
+                        _bot_thread = t
+                    t.start()
+                    log.info("===== BOT AUTO-STARTED — Scanning: EURUSD, GBPUSD, EURJPY, GBPJPY =====")
+                    return
+            log.info("Auto-start timeout — bot waiting for MT5 connection via dashboard")
+
+        threading.Thread(target=_auto_start_bot, daemon=True, name="bot-autostart").start()
+
         print("=" * 55)
         chosen_port = _choose_http_port()
         if chosen_port in (5000, 5001):
@@ -2938,5 +2973,7 @@ if __name__ == "__main__":
             print(f"  LAN: http://<your-ip>:{chosen_port}")
         print("  API:  /bot/start  /bot/stop  /bot/status")
         print("  Test: /bot/signal/EURUSD")
+        print("=" * 55)
+        print("  ▶ AUTO-START: Connecting MT5, Running Test Trade, Starting Bot...")
         print("=" * 55)
         app.run(host="0.0.0.0", port=chosen_port, debug=False, threaded=True)
