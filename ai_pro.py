@@ -2226,7 +2226,7 @@ CORS(app)
 
 # ── Locate the core/ asset folder relative to this file ──────────────
 _HERE       = Path(__file__).resolve().parent
-_CORE_HTML  = _HERE / "core" / "html"  / "index.html"
+_CORE_HTML  = _HERE / "index.html"
 _CORE_CSS   = _HERE / "core" / "css"   / "dashboard.css"
 _CORE_JS    = _HERE / "core" / "js"    / "dashboard.js"
 
@@ -2234,7 +2234,7 @@ _CORE_JS    = _HERE / "core" / "js"    / "dashboard.js"
 def _load_dashboard_html() -> str:
     if _CORE_HTML.exists():
         return _CORE_HTML.read_text(encoding="utf-8")
-    return "<h1>dashboard not found — expected core/html/index.html</h1>"
+    return "<h1>dashboard not found — expected index.html</h1>"
 
 _DASHBOARD_HTML: str = _load_dashboard_html()
 

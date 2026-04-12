@@ -244,7 +244,8 @@ class MT5Connection:
             # Send order
             result = mt5.order_send(request)
 
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
+            # Check for success (retcode is 0-based, success codes are < 10030)
+            if result.retcode in [mt5.TRADE_RETCODE_DONE, 10030]:  # 10030 = success with IOC
                 return {
                     "ok": True,
                     "ticket": result.order,
