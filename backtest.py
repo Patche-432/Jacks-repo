@@ -248,6 +248,31 @@ class AI_ProBacktester:
             log.error("Daily data fetch error [%s]: %s", symbol, e)
             return pd.DataFrame()
     
+    def _fetch_weekly(self, symbol: str, bars: int = 52) -> pd.DataFrame:
+        """Fetch weekly historical data for the backtest period."""
+        if self._mt5 is None:
+            log.warning("MT5 not available; cannot fetch weekly data")
+            return pd.DataFrame()
+        
+        try:
+            rates = self._mt5.copy_rates_from_pos(
+                symbol, self._mt5.TIMEFRAME_W1, 0, bars
+            )
+            if rates is None or len(rates) < 1:
+                log.warning("Not enough weekly data for %s", symbol)
+                return pd.DataFrame()
+            
+            df = pd.DataFrame(rates)
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+            df = df.sort_values("time").reset_index(drop=True)
+            
+            log.info("Fetched %d weekly candles for %s", len(df), symbol)
+            return df
+        
+        except Exception as e:
+            log.error("Weekly data fetch error [%s]: %s", symbol, e)
+            return pd.DataFrame()
+    
     def generate_signals(self, symbol: str, df: pd.DataFrame) -> List[Signal]:
         """Generate signals for each candle in history."""
         self._ensure_mt5()
@@ -256,11 +281,16 @@ class AI_ProBacktester:
             log.error("Strategy not initialized")
             return []
         
-        # Fetch daily data once before the loop
+        # Fetch daily and weekly data once before the loop
         df_daily = self._fetch_daily(symbol, bars=90)
         if df_daily.empty:
             log.warning("No daily data available; continuing without daily level mocking")
             df_daily = None
+        
+        df_weekly = self._fetch_weekly(symbol, bars=52)
+        if df_weekly.empty:
+            log.warning("No weekly data available; continuing without weekly level mocking")
+            df_weekly = None
         
         signals = []
         
@@ -286,6 +316,20 @@ class AI_ProBacktester:
                             "range": float(prev_day["high"]) - float(prev_day["low"]),
                         }
                 
+                # Get historically correct weekly levels
+                correct_weekly = None
+                if df_weekly is not None and len(df_weekly) > 0:
+                    prev_weeks = df_weekly[df_weekly["time"].dt.date < bar_date]
+                    
+                    if len(prev_weeks) > 0:
+                        prev_week = prev_weeks.iloc[-1]
+                        correct_weekly = {
+                            "date":  prev_week["time"].date(),
+                            "high":  float(prev_week["high"]),
+                            "low":   float(prev_week["low"]),
+                            "range": float(prev_week["high"]) - float(prev_week["low"]),
+                        }
+                
                 # Temporarily override the strategy's fetch methods
                 original_fetch = self._strategy._fetch_m15
                 original_levels = self._strategy.get_previous_day_levels
@@ -305,6 +349,11 @@ class AI_ProBacktester:
                 if correct_levels:
                     self._strategy.previous_day_high = correct_levels["high"]
                     self._strategy.previous_day_low = correct_levels["low"]
+                
+                # Set weekly levels as attributes if available
+                if correct_weekly:
+                    self._strategy.previous_week_high = correct_weekly["high"]
+                    self._strategy.previous_week_low = correct_weekly["low"]
                 
                 try:
                     # Generate signal at this point
