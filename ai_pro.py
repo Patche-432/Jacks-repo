@@ -1483,14 +1483,14 @@ Reply ONLY with JSON:
 {{"approve":true,"reason":"brief reason","confidence":0.0}}"""
 
         log_thought("ai_entry", symbol, "review_start",
-                    f"Sending {direction} [{env}] to Qwen for review",
+                    f"Sending {direction} [{env}] to DeepSeek-R1 for review",
                     detail=reason_txt[:120], action=direction.lower())
         try:
             raw    = self._get_llm().generate(prompt, max_new_tokens=120)
             parsed = _extract_json(raw)
             if not isinstance(parsed, dict):
                 log_thought("ai_entry", symbol, "parse_fail",
-                            "Qwen parse failed — defaulting approve",
+                            "DeepSeek-R1 parse failed — defaulting approve",
                             action=direction.lower())
                 return {"approve": True, "reason": "Parse failed — default approve",
                         "confidence": 0.6}
@@ -1519,7 +1519,7 @@ Reply ONLY with JSON:
 
             log_thought(
                 "ai_entry", symbol, "verdict",
-                f"Qwen {'APPROVED' if approve else 'REJECTED'}: {ai_reason[:80]}",
+                f"DeepSeek-R1 {'APPROVED' if approve else 'REJECTED'}: {ai_reason[:80]}",
                 detail=f"{direction} [{env}] conf={ai_conf:.2f}",
                 action=direction.lower() if approve else "hold",
                 confidence=ai_conf,
@@ -1529,8 +1529,8 @@ Reply ONLY with JSON:
 
         except Exception as exc:
             log_thought("ai_entry", symbol, "error",
-                        f"Qwen error: {exc} — default approve")
-            return {"approve": True, "reason": f"Qwen error — default approve",
+                        f"DeepSeek-R1 error: {exc} — default approve")
+            return {"approve": True, "reason": f"DeepSeek-R1 error — default approve",
                     "confidence": 0.6}
 
     # ------------------------------------------------------------------ #
@@ -2126,6 +2126,14 @@ class Bot:
 
     def _loop(self) -> None:
         while self._running:
+            # Perform periodic connection health check
+            if not self._strategy._conn.check_connection():
+                log.warning("Connection health check failed, attempting reconnection...")
+                if not self._strategy._conn.reconnect():
+                    log.error("Reconnection failed, pausing bot")
+                    self._running = False
+                    break
+            
             for sym in self.symbols:
                 if not self._running:
                     break
@@ -2840,6 +2848,57 @@ def mt5_credentials_delete():
         return jsonify({"ok": True})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/mt5/status")
+def mt5_status_api():
+    """Return MT5 account status: connection, server, account, trading, equity, balance."""
+    try:
+        import MetaTrader5 as mt5_module
+        if not mt5_module.initialize():
+            return jsonify({
+                "connected": False,
+                "server": None,
+                "login": None,
+                "account_name": None,
+                "trade_allowed": False,
+                "equity": None,
+                "balance": None,
+                "error": "MT5 not initialized"
+            })
+        
+        acct = mt5_module.account_info()
+        if not acct:
+            mt5_module.shutdown()
+            return jsonify({
+                "connected": False,
+                "server": None,
+                "login": None,
+                "account_name": None,
+                "trade_allowed": False,
+                "equity": None,
+                "balance": None,
+                "error": "No account info"
+            })
+        
+        result = {
+            "connected": True,
+            "server": acct.server,
+            "login": acct.login,
+            "account_name": getattr(acct, 'name', None),
+            "trade_allowed": acct.trade_allowed,
+            "equity": float(acct.equity) if acct.equity else None,
+            "balance": float(acct.balance) if acct.balance else None,
+        }
+        
+        mt5_module.shutdown()
+        return jsonify(result)
+    except Exception as exc:
+        log.error("MT5 status API error: %s", exc)
+        return jsonify({
+            "connected": False,
+            "error": str(exc)
+        })
 
 
 @app.route("/ai/init", methods=["POST"])

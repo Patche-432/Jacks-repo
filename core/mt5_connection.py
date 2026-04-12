@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -90,6 +91,8 @@ class MT5Connection:
         self._cfg = cfg
         self._connected = False
         self._stop_event = threading.Event()
+        self._last_heartbeat = 0
+        self._heartbeat_interval = 30  # Check connection health every 30 seconds
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -114,7 +117,14 @@ class MT5Connection:
             try:
                 if mt5.initialize(**kw):
                     self._connected = True
+                    self._last_heartbeat = time.time()  # Initialize heartbeat timestamp
                     self._log_account(mt5)
+                    # Verify account info to confirm successful connection
+                    account = mt5.account_info()
+                    if account is None:
+                        log.warning("MT5 authenticated but account_info() failed")
+                        self.disconnect()
+                        continue
                     return True
                 code, msg = mt5.last_error()
                 log.debug("mt5.initialize() [%d] %s  kwargs=%s", code, msg, kw)
@@ -143,6 +153,7 @@ class MT5Connection:
             log.error("Error during mt5.shutdown(): %s", exc)
         finally:
             self._connected = False
+            self._last_heartbeat = 0  # Reset heartbeat on disconnect
 
     def stop(self) -> None:
         """Signal any waiting poll loop to exit (thread-safe)."""
@@ -150,6 +161,80 @@ class MT5Connection:
 
     def is_connected(self) -> bool:
         return self._connected
+
+    def check_connection(self) -> bool:
+        """
+        Check if connection is still alive and update heartbeat.
+        Detects stale connections with periodic health checks.
+        Returns True if connected, False otherwise.
+        """
+        if not self._connected:
+            return False
+        
+        current_time = time.time()
+        
+        # Skip heartbeat check if recently verified
+        if current_time - self._last_heartbeat < self._heartbeat_interval:
+            return True
+        
+        try:
+            # Test connection with account info
+            import MetaTrader5 as mt5
+            account = mt5.account_info()
+            if account is None:
+                code, msg = mt5.last_error()
+                log.warning("Connection health check failed [%d] %s", code, msg)
+                self._connected = False
+                return False
+            
+            # Connection is healthy, update heartbeat
+            self._last_heartbeat = current_time
+            return True
+            
+        except Exception as exc:
+            log.error("Connection health check raised: %s", exc)
+            self._connected = False
+            return False
+
+    def reconnect(self, max_attempts: int = 3) -> bool:
+        """
+        Attempt to reconnect to MT5 after a connection loss.
+        Uses exponential backoff between attempts.
+        
+        Args:
+            max_attempts: Maximum number of reconnection attempts (default 3)
+        
+        Returns:
+            True if reconnected, False if all attempts failed
+        """
+        log.info("Attempting to reconnect to MT5 (max %d attempts)...", max_attempts)
+        
+        for attempt in range(1, max_attempts + 1):
+            log.info("  Reconnect attempt %d/%d", attempt, max_attempts)
+            
+            # Check if connection was restored naturally
+            if self.check_connection():
+                log.info("Connection restored successfully")
+                return True
+            
+            # Clean shutdown before retry
+            self.disconnect()
+            
+            # Exponential backoff: 2s, 6s, 18s
+            wait_time = 2 * (3 ** (attempt - 1))
+            log.info("  Waiting %d seconds before next attempt...", wait_time)
+            time.sleep(wait_time)
+            
+            # Try to reconnect
+            try:
+                if self.connect():
+                    log.info("Reconnected successfully on attempt %d", attempt)
+                    return True
+            except Exception as exc:
+                log.error("Reconnection attempt %d failed: %s", attempt, exc)
+        
+        log.error("All reconnection attempts failed ({} total)", max_attempts)
+        return False
 
     # ── Data helpers ──────────────────────────────────────────────────────────
 
@@ -207,6 +292,39 @@ class MT5Connection:
             "visible_symbols":  visible,
             "symbols_total":    len(symbols),
         }
+
+    def status(self) -> dict:
+        """
+        Return simplified connection status for dashboard sync.
+        Used by server.py and web.py to update UI state.
+        
+        Returns:
+            dict with keys: connected, account, error
+        """
+        if not self._connected:
+            return {"connected": False, "account": None, "error": "Not connected"}
+        
+        try:
+            account = self.account_info()
+            if account is None:
+                return {"connected": False, "account": None, "error": "account_info() returned None"}
+            
+            return {
+                "connected": True,
+                "account": {
+                    "login": getattr(account, "login", None),
+                    "server": getattr(account, "server", None),
+                    "name": getattr(account, "name", None),
+                    "currency": getattr(account, "currency", None),
+                    "balance": round(getattr(account, "balance", 0), 2),
+                    "equity": round(getattr(account, "equity", 0), 2),
+                    "trade_allowed": bool(getattr(account, "trade_allowed", False)),
+                },
+                "error": None,
+            }
+        except Exception as exc:
+            log.error("status() raised: %s", exc)
+            return {"connected": False, "account": None, "error": str(exc)}
 
     def place_test_trade(self, symbol: str = "EURUSD", volume: float = 0.001) -> dict:
         """

@@ -17,7 +17,32 @@ root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app = Flask(__name__, static_folder=root_path, static_url_path='')
 CORS(app)
 
+# ── Global MT5 connection and status ────────────────────────────────────────
+
 mt5_conn = None
+mt5_status = {
+    "mt5_connected": False,
+    "account": None,
+    "error": None,
+}
+
+
+def _sync_mt5_status() -> None:
+    """Pull the latest MT5 connection state into the global mt5_status dict."""
+    global mt5_conn, mt5_status
+    if mt5_conn is None:
+        mt5_status = {"mt5_connected": False, "account": None, "error": "No connection object"}
+        return
+    
+    try:
+        conn_status = mt5_conn.status()
+        mt5_status["mt5_connected"] = conn_status["connected"]
+        mt5_status["account"] = conn_status["account"]
+        mt5_status["error"] = conn_status["error"]
+    except Exception as exc:
+        log.error("Failed to sync MT5 status: %s", exc)
+        mt5_status["mt5_connected"] = False
+        mt5_status["error"] = str(exc)
 
 @app.route('/')
 def serve_dashboard():
@@ -31,26 +56,24 @@ def api_connect_mt5():
         cfg = {}
         mt5_conn = MT5Connection(cfg)
         if mt5_conn.connect():
+            _sync_mt5_status()
             runtime = mt5_conn.runtime_info()
             return jsonify({'connected': True, **runtime})
         else:
+            _sync_mt5_status()
             return jsonify({'connected': False, 'error': 'Failed to connect'}), 400
     except Exception as e:
         log.error(f"MT5 connect error: {e}")
+        _sync_mt5_status()
         return jsonify({'connected': False, 'error': str(e)}), 500
 
 @app.route('/api/mt5/status', methods=['GET'])
 def api_mt5_status():
-    """Get MT5 connection status"""
+    """Get MT5 connection status (synced state)"""
     global mt5_conn
-    if not mt5_conn or not mt5_conn.is_connected():
-        return jsonify({'connected': False})
-    try:
-        runtime = mt5_conn.runtime_info()
-        return jsonify(runtime)
-    except Exception as e:
-        log.error(f"Status error: {e}")
-        return jsonify({'connected': False}), 500
+    # Refresh status from connection
+    _sync_mt5_status()
+    return jsonify(mt5_status)
 
 @app.route('/api/config', methods=['GET'])
 def api_config():
@@ -90,6 +113,7 @@ def api_disconnect_mt5():
     if mt5_conn:
         mt5_conn.disconnect()
         mt5_conn = None
+    _sync_mt5_status()
     return jsonify({'ok': True})
 
 @app.route('/api/mt5/test-trade', methods=['POST'])
