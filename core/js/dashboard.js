@@ -1,117 +1,63 @@
-// Auto-connect to MT5 on page load
+// Auto-check MT5 connection on page load (silent, no modal)
 window.addEventListener('load', () => {
-    autoConnectMt5();
+    autoCheckMt5();
 });
 
-function autoConnectMt5() {
-    // Silently attempt connection on load
-    fetch('/api/mt5/connect', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({})
-    })
+function autoCheckMt5() {
+    // Just check status, don't attempt connection via endpoint
+    // Let the backend auto-connect in the background
+    pollMt5Status();
+}
+
+function pollMt5Status() {
+    fetch('/bot/status')
     .then(response => response.json())
     .then(data => {
-        if (data.connected) {
-            updateMt5Display(data);
+        if (data.mt5 && data.mt5.connected) {
+            updateMt5Display(data.mt5);
+            
+            // Hide Connect button when MT5 is already connected
             const btn = document.getElementById('connect-btn');
+            btn.style.display = 'none';
             btn.style.background = 'var(--green)';
             btn.textContent = 'MT5 ✓';
+            
+            // Close modal if it was open
+            document.getElementById('mt5-modal-overlay').style.display = 'none';
+            
+            // Auto-show AI Log tab if bot is actively scanning
+            if (data.bot && data.bot.running) {
+                autoShowAiLogTab();
+            }
+        } else {
+            // Show Connect button when MT5 is not connected
+            const btn = document.getElementById('connect-btn');
+            btn.style.display = 'inline-block';
+            btn.style.background = '';
+            btn.textContent = 'Connect MT5';
         }
     })
     .catch(() => {});
 }
 
+function autoShowAiLogTab() {
+    // Auto-show AI Log tab when bot is actively running
+    const aiLogTab = document.querySelector('.tab-btn:nth-child(2)'); // "AI Log" is 2nd tab
+    if (aiLogTab && !aiLogTab.classList.contains('active')) {
+        aiLogTab.click(); // Trigger the click to show tab
+    }
+}
+
 function connectMt5() {
-    // Check if this is the header button or modal button
-    const headerBtn = document.getElementById('connect-btn');
-    const modalBtn = document.getElementById('mt5-modal-btn');
+    const btn = document.getElementById('connect-btn');
     
-    // If header button is clicked, attempt direct connection first
-    if (event && event.target === headerBtn) {
-        attemptDirectConnection();
+    // If already connected, don't show modal
+    if (btn.style.display === 'none' || btn.textContent === 'MT5 ✓') {
         return;
     }
     
-    // Modal connect button clicked - attempt connection with credentials
-    const btn = modalBtn;
-    if (!btn) return;
-    btn.disabled = true;
-    btn.textContent = 'Connecting…';
-    
-    fetch('/api/mt5/connect', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({})
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.connected) {
-            mt5Connected = true;
-            updateMt5Display(data);
-            const connectBtn = document.getElementById('connect-btn');
-            connectBtn.style.background = 'var(--green)';
-            connectBtn.textContent = 'MT5 ✓';
-            closeMt5Modal();
-            
-            // Place test trade after successful connection
-            placeTestTrade();
-        } else {
-            const statusEl = document.getElementById('mt5-modal-status');
-            statusEl.style.display = 'block';
-            statusEl.style.background = 'rgba(255, 107, 107, 0.1)';
-            statusEl.style.color = 'var(--red)';
-            statusEl.textContent = 'Error: ' + (data.error || 'Connection failed');
-            console.error('MT5 error:', data.error);
-        }
-    })
-    .catch(error => {
-        const statusEl = document.getElementById('mt5-modal-status');
-        statusEl.style.display = 'block';
-        statusEl.style.background = 'rgba(255, 107, 107, 0.1)';
-        statusEl.style.color = 'var(--red)';
-        statusEl.textContent = 'Error: ' + error.message;
-        console.error('Connection error:', error);
-    })
-    .finally(() => {
-        btn.disabled = false;
-        btn.textContent = 'Connect';
-    });
-}
-
-function attemptDirectConnection() {
-    const btn = document.getElementById('connect-btn');
-    btn.disabled = true;
-    btn.textContent = 'Connecting…';
-    
-    fetch('/api/mt5/connect', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({})
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.connected) {
-            mt5Connected = true;
-            updateMt5Display(data);
-            btn.style.background = 'var(--green)';
-            btn.textContent = 'MT5 ✓';
-            
-            // Place test trade after successful connection
-            placeTestTrade();
-        } else {
-            // Connection failed, show modal for credentials
-            document.getElementById('mt5-modal-overlay').style.display = 'flex';
-            btn.disabled = false;
-            btn.textContent = 'Connect MT5';
-        }
-    })
-    .catch(error => {
-        // Connection failed, show modal for credentials
-        document.getElementById('mt5-modal-overlay').style.display = 'flex';
-        btn.disabled = false;
-        btn.textContent = 'Connect MT5';
-    });
+    // Show manual connection modal only when user explicitly clicks button
+    document.getElementById('mt5-modal-overlay').style.display = 'flex';
 }
 
 function placeTestTrade() {
@@ -173,7 +119,30 @@ function updateMt5Display(data) {
 setInterval(() => {
     fetch('/api/mt5/status')
         .then(r => r.json())
-        .then(data => updateMt5Display(data))
+        .then(data => {
+            updateMt5Display(data);
+            
+            // Auto-show AI Log tab if bot is scanning
+            fetch('/bot/status')
+                .then(b => b.json())
+                .then(botData => {
+                    if (botData.bot && botData.bot.running && data.connected) {
+                        autoShowAiLogTab();
+                        // Update Start/Stop buttons
+                        document.getElementById('start-btn').style.display = 'none';
+                        document.getElementById('stop-btn').style.display = 'inline-block';
+                        document.getElementById('dot').className = 'dot live';
+                        document.getElementById('status-text').textContent = 'live';
+                    } else {
+                        // Bot not running
+                        document.getElementById('start-btn').style.display = 'inline-block';
+                        document.getElementById('stop-btn').style.display = 'none';
+                        document.getElementById('dot').className = 'dot';
+                        document.getElementById('status-text').textContent = 'idle';
+                    }
+                })
+                .catch(() => {});
+        })
         .catch(() => {});
 }, 2000);
 
@@ -186,15 +155,33 @@ async function startBot() {
     try {
         const r = await fetch('/bot/start', {method: 'POST'});
         const data = await r.json();
-        if (data.ok && data.running) {
+        
+        // Status 409 means bot already running
+        if (r.status === 409) {
+            console.log('Bot already running');
             document.getElementById('dot').className = 'dot live';
             document.getElementById('status-text').textContent = 'live';
             document.getElementById('start-btn').style.display = 'none';
             document.getElementById('stop-btn').style.display = 'inline-block';
-        } else {
-            alert('Error: ' + (data.error || 'Unknown'));
+            btn.disabled = false;
+            return;
+        }
+        
+        if (!r.ok || data.error) {
+            console.error('Bot start error:', data.error || r.statusText);
+            alert('Error: ' + (data.error || 'Failed to start bot'));
+            btn.disabled = false;
+            return;
+        }
+        
+        if (data.running) {
+            document.getElementById('dot').className = 'dot live';
+            document.getElementById('status-text').textContent = 'live';
+            document.getElementById('start-btn').style.display = 'none';
+            document.getElementById('stop-btn').style.display = 'inline-block';
         }
     } catch (e) {
+        console.error('Start bot exception:', e);
         alert('Failed to start bot: ' + e.message);
     }
     btn.disabled = false;
@@ -203,14 +190,25 @@ async function startBot() {
 async function stopBot() {
     const btn = document.getElementById('stop-btn');
     btn.disabled = true;
+    btn.textContent = 'Stopping…';
     
     try {
-        await fetch('/bot/stop', {method: 'POST'});
+        const r = await fetch('/bot/stop', {method: 'POST'});
+        const data = await r.json();
+        
+        if (!r.ok && r.status !== 409) {
+            console.error('Bot stop error:', data.error || r.statusText);
+            alert('Error: ' + (data.error || 'Failed to stop bot'));
+            btn.disabled = false;
+            return;
+        }
+        
         document.getElementById('dot').className = 'dot';
         document.getElementById('status-text').textContent = 'idle';
         document.getElementById('start-btn').style.display = 'inline-block';
         document.getElementById('stop-btn').style.display = 'none';
     } catch (e) {
+        console.error('Stop bot exception:', e);
         alert('Failed to stop bot: ' + e.message);
     }
     btn.disabled = false;
