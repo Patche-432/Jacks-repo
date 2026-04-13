@@ -5,7 +5,7 @@ Backtest all trading pairs and generate results table
 import sys
 sys.path.insert(0, '.')
 
-from backtest import AI_ProBacktester
+from odl.backtest import AI_ProBacktester
 import pandas as pd
 
 # Trading pairs from configuration

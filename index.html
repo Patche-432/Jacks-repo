@@ -89,24 +89,16 @@
       <button onclick="closeMt5Modal()" style="background:none;border:none;color:var(--txt2);font-size:18px;cursor:pointer;line-height:1">&times;</button>
     </div>
     <div style="display:flex;flex-direction:column;gap:12px">
-      <div>
-        <label style="font-size:10px;color:var(--txt3);text-transform:uppercase;letter-spacing:0.08em;display:block;margin-bottom:4px">Account Number</label>
-        <input id="mt5-login" type="number" placeholder="e.g. 123456" style="width:100%;box-sizing:border-box;background:var(--bg0);border:1px solid var(--line);border-radius:5px;padding:8px 10px;color:var(--txt);font-size:12px;font-family:var(--mono)">
-      </div>
-      <div>
-        <label style="font-size:10px;color:var(--txt3);text-transform:uppercase;letter-spacing:0.08em;display:block;margin-bottom:4px">Password</label>
-        <input id="mt5-password" type="password" placeholder="Broker password" style="width:100%;box-sizing:border-box;background:var(--bg0);border:1px solid var(--line);border-radius:5px;padding:8px 10px;color:var(--txt);font-size:12px;font-family:var(--mono)">
-      </div>
-      <div>
-        <label style="font-size:10px;color:var(--txt3);text-transform:uppercase;letter-spacing:0.08em;display:block;margin-bottom:4px">Broker Server</label>
-        <input id="mt5-server" type="text" placeholder="e.g. ICMarkets-Live" style="width:100%;box-sizing:border-box;background:var(--bg0);border:1px solid var(--line);border-radius:5px;padding:8px 10px;color:var(--txt);font-size:12px;font-family:var(--mono)">
+      <div style="font-size:11px; line-height:1.35; color:var(--txt2)">
+        This connects to the MetaTrader 5 desktop terminal on this PC and reads the account that is already logged in.
+        <div style="margin-top:6px; color:var(--txt3)">Open MT5 and log in first, then click Auto Connect.</div>
       </div>
       <div>
         <label style="font-size:10px;color:var(--txt3);text-transform:uppercase;letter-spacing:0.08em;display:block;margin-bottom:4px">Terminal Path <span style="color:var(--txt3);font-weight:400">(optional)</span></label>
         <input id="mt5-path" type="text" placeholder="C:/Program Files/MetaTrader 5/terminal64.exe" style="width:100%;box-sizing:border-box;background:var(--bg0);border:1px solid var(--line);border-radius:5px;padding:8px 10px;color:var(--txt);font-size:12px;font-family:var(--mono)">
       </div>
       <div id="mt5-modal-status" style="display:none;font-size:11px;padding:8px 10px;border-radius:5px;font-family:var(--mono)"></div>
-      <button id="mt5-modal-btn" onclick="connectMt5()" style="margin-top:4px;padding:10px;background:var(--cyan);color:#000;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;letter-spacing:0.04em">Connect</button>
+      <button id="mt5-modal-btn" onclick="connectMt5()" style="margin-top:4px;padding:10px;background:var(--cyan);color:#000;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;letter-spacing:0.04em">Auto Connect</button>
     </div>
   </div>
 </div>

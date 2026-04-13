@@ -2522,8 +2522,10 @@ def _mt5_trade_history_snapshot(days: int = 30, limit: int = 100, shutdown_when_
 
 def _choose_http_port() -> int:
     host = "0.0.0.0"
-    preferred_port = int(os.getenv("APP_PORT", "5000"))  # Changed default from 80 to 5000
-    fallback_port = 5001
+    # core/server.py owns :5000 for the main dashboard.
+    # Keep ai_pro.py's optional Flask dashboard off that port to avoid conflicts.
+    preferred_port = int(os.getenv("APP_PORT", "5001"))
+    fallback_port = 5002
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:

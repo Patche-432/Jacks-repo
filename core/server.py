@@ -8,6 +8,10 @@ from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
 import logging
 from core.mt5_connection import MT5Connection
+import math
+
+import numpy as np
+import pandas as pd
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -25,6 +29,138 @@ mt5_status = {
     "account": None,
     "error": None,
 }
+
+# Dashboard runtime config (in-memory)
+_enabled_symbols = {"GBPJPY", "EURJPY", "GBPUSD", "EURUSD"}
+
+
+def _compute_atr(df: pd.DataFrame, period: int = 14) -> float:
+    if df is None or df.empty:
+        return float("nan")
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.rolling(period).mean().iloc[-1]
+    return float(atr) if pd.notna(atr) else float("nan")
+
+
+def _rr_string(entry: float, sl: float, tp: float) -> str:
+    try:
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        if risk <= 0:
+            return "—"
+        return f"1:{reward / risk:.2f}"
+    except Exception:
+        return "—"
+
+
+def _mt5_signal_snapshot(symbol: str) -> dict:
+    """Compute a lightweight signal snapshot from MT5 rates.
+
+    This intentionally avoids importing/using the heavyweight LLM strategy.
+    Output shape matches what the dashboard expects.
+    """
+    import MetaTrader5 as mt5
+
+    symbol = symbol.upper().strip()
+
+    # Ensure MT5 is ready (auto-connect on demand)
+    global mt5_conn
+    if not mt5_conn or not mt5_conn.is_connected():
+        try:
+            mt5_conn = MT5Connection({})
+            if not mt5_conn.connect():
+                code, msg = mt5.last_error()
+                return {"error": f"MT5 not connected. initialize failed [{code}] {msg}. Open MT5 and log in."}
+        except Exception as exc:
+            return {"error": f"MT5 auto-connect failed: {exc}"}
+
+    if not mt5.symbol_select(symbol, True):
+        code, msg = mt5.last_error()
+        return {"error": f"Failed to select symbol {symbol} [{code}] {msg}"}
+
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 220)
+    if rates is None or len(rates) < 60:
+        code, msg = mt5.last_error()
+        return {"error": f"No rates for {symbol} [{code}] {msg}"}
+
+    df = pd.DataFrame(rates)
+    # time is seconds since epoch
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+
+    close = df["close"].astype(float)
+    sma_fast = close.rolling(20).mean()
+    sma_slow = close.rolling(50).mean()
+    atr = _compute_atr(df, 14)
+
+    last_close = float(close.iloc[-1])
+    fast = float(sma_fast.iloc[-1]) if pd.notna(sma_fast.iloc[-1]) else last_close
+    slow = float(sma_slow.iloc[-1]) if pd.notna(sma_slow.iloc[-1]) else last_close
+
+    # Bias by SMA trend
+    if fast > slow:
+        bias = "LONG"
+        environment = "Trend-UP (SMA20>SMA50)"
+    elif fast < slow:
+        bias = "SHORT"
+        environment = "Trend-DOWN (SMA20<SMA50)"
+    else:
+        bias = "—"
+        environment = "Neutral"
+
+    # Confidence from separation and slope (bounded 0-100)
+    sep = abs(fast - slow)
+    atr_safe = atr if (not math.isnan(atr) and atr > 0) else max(sep, 1e-8)
+    sep_score = min(1.0, sep / (atr_safe * 1.5))
+    slope_fast = float(sma_fast.iloc[-1] - sma_fast.iloc[-6]) if len(sma_fast) >= 6 and pd.notna(sma_fast.iloc[-6]) else 0.0
+    slope_score = min(1.0, abs(slope_fast) / (atr_safe * 0.5)) if atr_safe > 0 else 0.0
+    confidence = int(round(30 + 45 * sep_score + 25 * slope_score))
+    confidence = max(0, min(100, confidence))
+
+    tick = mt5.symbol_info_tick(symbol)
+    entry = float(getattr(tick, "ask", None) or getattr(tick, "last", None) or last_close)
+
+    # Simple ATR-based SL/TP
+    sl_mult = 2.5
+    tp_mult = 4.5
+    if math.isnan(atr_safe) or atr_safe <= 0:
+        atr_safe = max(abs(entry - last_close), 1e-4)
+
+    if bias == "SHORT":
+        sl = entry + sl_mult * atr_safe
+        tp = entry - tp_mult * atr_safe
+    elif bias == "LONG":
+        sl = entry - sl_mult * atr_safe
+        tp = entry + tp_mult * atr_safe
+    else:
+        sl = entry - sl_mult * atr_safe
+        tp = entry + tp_mult * atr_safe
+
+    return {
+        "symbol": symbol,
+        "bias": bias,
+        "confidence": confidence,
+        "environment": environment,
+        "choch_status": "—",
+        "level_interaction": "—",
+        "entry_price": round(entry, 5),
+        "sl_price": round(sl, 5),
+        "tp_price": round(tp, 5),
+        "rr": _rr_string(entry, sl, tp),
+        "atr": round(float(atr_safe), 5),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _sync_mt5_status() -> None:
@@ -53,7 +189,11 @@ def api_connect_mt5():
     """Connect to MT5"""
     global mt5_conn
     try:
+        payload = request.get_json(silent=True) or {}
         cfg = {}
+        # Optional terminal executable path override (helps when MT5 is installed in a broker-specific folder)
+        if isinstance(payload, dict) and payload.get("path"):
+            cfg["path"] = str(payload["path"])
         mt5_conn = MT5Connection(cfg)
         if mt5_conn.connect():
             _sync_mt5_status()
@@ -61,7 +201,16 @@ def api_connect_mt5():
             return jsonify({'connected': True, **runtime})
         else:
             _sync_mt5_status()
-            return jsonify({'connected': False, 'error': 'Failed to connect'}), 400
+            # Provide a more actionable error if possible
+            err = 'Failed to connect to MT5. Make sure the MT5 desktop terminal is installed, open, and logged into an account.'
+            try:
+                import MetaTrader5 as mt5
+                code, msg = mt5.last_error()
+                if code or msg:
+                    err = f"MT5 initialize failed [{code}] {msg}. Open MT5, log in, then try again."
+            except Exception:
+                pass
+            return jsonify({'connected': False, 'error': err}), 400
     except Exception as e:
         log.error(f"MT5 connect error: {e}")
         _sync_mt5_status()
@@ -152,6 +301,7 @@ def api_test_trade():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 import subprocess
+import time
 
 bot_process = None
 bot_running = False
@@ -162,20 +312,28 @@ def bot_start():
     global bot_process, bot_running
     
     if bot_running and bot_process and bot_process.poll() is None:
-        return jsonify({'ok': False, 'error': 'Bot already running'}), 400
+        return jsonify({'ok': False, 'error': 'Bot already running'}), 409
     
     try:
         ai_pro_path = os.path.join(root_path, 'ai_pro.py')
         env = os.environ.copy()
         env['PYTHONPATH'] = os.path.join(root_path, 'core') + os.pathsep + env.get('PYTHONPATH', '')
         bot_process = subprocess.Popen(
-            ['python', ai_pro_path, '--run', '--lot-size', '0.50'], 
+            [sys.executable, ai_pro_path, '--run', '--lot-size', '0.50'],
             cwd=root_path,
             env=env
         )
+        # Give the process a moment to fail fast (missing deps, bad args, etc.)
+        time.sleep(0.25)
+        rc = bot_process.poll()
+        if rc is not None:
+            bot_running = False
+            log.error("AI Pro bot failed to start (exit code: %s)", rc)
+            return jsonify({'ok': False, 'error': f'Bot failed to start (exit code {rc}). Check the bot console/log output.'}), 500
+
         bot_running = True
         log.info("AI Pro bot started (PID: %d)", bot_process.pid)
-        return jsonify({'ok': True, 'running': True})
+        return jsonify({'ok': True, 'running': True, 'pid': bot_process.pid})
     except Exception as e:
         log.error(f"Failed to start bot: {e}")
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -203,17 +361,64 @@ def bot_status():
     running = bot_process and bot_process.poll() is None
     if not running:
         bot_running = False
-    
+
+    # Sync MT5 connection state into a stable shape expected by the dashboard
+    _sync_mt5_status()
+    mt5_payload = {
+        'connected': bool(mt5_status.get('mt5_connected')),
+        'error': mt5_status.get('error'),
+        'account': mt5_status.get('account'),
+    }
+
     # Return comprehensive status for dashboard snapshot
     return jsonify({
         'ok': True,
-        'running': running,
-        'market_bias': 'Bullish',  # This would come from ai_pro.py in real implementation
-        'confidence': 0.75,  # This would come from ai_pro.py in real implementation
-        'last_signal': 'GBPJPY BUY',  # This would come from ai_pro.py in real implementation
-        'open_trades': [],  # This would be populated from MT5 positions
-        'session_summary': 'Portfolio: GBPJPY, EURJPY, GBPUSD, EURUSD | Lot: 0.50 | Status: Running' if running else 'Ready to start'
+        'bot': {
+            'running': bool(running),
+            'pid': bot_process.pid if (running and bot_process) else None,
+            'market_bias': 'Bullish',  # TODO: wire from ai_pro.py
+            'confidence': 0.75,        # TODO: wire from ai_pro.py
+            'last_signal': 'GBPJPY BUY',
+            'open_trades': [],
+            'session_summary': 'Portfolio: GBPJPY, EURJPY, GBPUSD, EURUSD | Lot: 0.50 | Status: Running' if running else 'Ready to start'
+        },
+        'mt5': mt5_payload,
     })
+
+
+@app.route('/bot/signal/<symbol>', methods=['GET'])
+def bot_signal(symbol: str):
+    """Return a lightweight signal snapshot for the dashboard Signals tab."""
+    try:
+        if symbol.upper() not in _enabled_symbols:
+            return jsonify({"error": f"{symbol.upper()} disabled"}), 404
+
+        snap = _mt5_signal_snapshot(symbol)
+        if snap.get("error"):
+            return jsonify(snap), 400
+        return jsonify(snap)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route('/bot/config/symbols', methods=['POST'])
+def bot_config_symbols():
+    """Enable/disable symbols from the Portfolio Watch cards."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        symbol = str(payload.get("symbol", "")).upper().strip()
+        enabled = bool(payload.get("enabled"))
+        if not symbol:
+            return jsonify({"success": False, "message": "Missing symbol"}), 400
+
+        if enabled:
+            _enabled_symbols.add(symbol)
+        else:
+            _enabled_symbols.discard(symbol)
+
+        return jsonify({"success": True, "enabled_symbols": sorted(_enabled_symbols)})
+    except Exception as exc:
+        return jsonify({"success": False, "message": str(exc)}), 500
 from collections import deque
 import threading
 
@@ -265,4 +470,6 @@ def clear_thoughts_api():
     return jsonify({"ok": True})
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000, debug=True)
+    # Important: disable the auto-reloader so long-running bot subprocesses
+    # started from HTTP requests are not interrupted by Flask restarts.
+    app.run(host='127.0.0.1', port=5000, debug=True, use_reloader=False)

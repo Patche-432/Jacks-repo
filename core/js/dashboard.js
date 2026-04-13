@@ -2,7 +2,26 @@
 window.addEventListener('load', () => {
     autoCheckMt5();
     initSymbolToggle();
+    setupTabClickTracking();
+    // Populate Signals tab even if the bot isn't running
+    fetchMarketScanBreakdown();
 });
+
+let __userHasChosenTab = false;
+let __autoTabSwitchInProgress = false;
+let __autoAiLogShown = false;
+let __botWasRunning = false;
+
+function setupTabClickTracking() {
+    // Mark when the user clicks a tab so we don't fight them by auto-switching.
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (!__autoTabSwitchInProgress) {
+                __userHasChosenTab = true;
+            }
+        }, true);
+    });
+}
 
 function initSymbolToggle() {
     // Add click handlers to portfolio watch cards
@@ -72,48 +91,52 @@ function toggleSymbol(pair, cardElement) {
 }
 
 function autoCheckMt5() {
-    // Just check status, don't attempt connection via endpoint
-    // Let the backend auto-connect in the background
+    // Just check status (no modal)
     pollMt5Status();
 }
 
 function pollMt5Status() {
-    fetch('/bot/status')
-    .then(response => response.json())
-    .then(data => {
-        if (data.mt5 && data.mt5.connected) {
-            updateMt5Display(data.mt5);
-            
-            // Hide Connect button when MT5 is already connected
-            const btn = document.getElementById('connect-btn');
-            btn.style.display = 'none';
-            btn.style.background = 'var(--green)';
-            btn.textContent = 'MT5 ✓';
-            
-            // Close modal if it was open
-            document.getElementById('mt5-modal-overlay').style.display = 'none';
-            
-            // Auto-show AI Log tab if bot is actively scanning
-            if (data.bot && data.bot.running) {
-                autoShowAiLogTab();
-            }
-        } else {
-            // Show Connect button when MT5 is not connected
-            const btn = document.getElementById('connect-btn');
-            btn.style.display = 'inline-block';
-            btn.style.background = '';
-            btn.textContent = 'Connect MT5';
-        }
-    })
-    .catch(() => {});
+    fetch('/api/mt5/status')
+        .then(response => response.json())
+        .then(data => {
+            updateMt5Display(data);
+            setConnectButtonState(!!data.connected);
+        })
+        .catch(() => {});
+}
+
+function setConnectButtonState(connected) {
+    const btn = document.getElementById('connect-btn');
+    if (!btn) return;
+    if (connected) {
+        btn.style.display = 'none';
+        btn.style.background = 'var(--green)';
+        btn.textContent = 'MT5 ✓';
+        // Close modal if it was open
+        const overlay = document.getElementById('mt5-modal-overlay');
+        if (overlay) overlay.style.display = 'none';
+    } else {
+        btn.style.display = 'inline-block';
+        btn.style.background = '';
+        btn.textContent = 'Connect MT5';
+    }
 }
 
 function autoShowAiLogTab() {
-    // Auto-show AI Log tab when bot is actively running
+    // Auto-show AI Log tab once when bot becomes active.
+    // Never override a tab the user picked manually.
+    if (__userHasChosenTab || __autoAiLogShown) return;
     const aiLogTab = document.querySelector('.tab-btn:nth-child(2)'); // "AI Log" is 2nd tab
-    if (aiLogTab && !aiLogTab.classList.contains('active')) {
-        aiLogTab.click(); // Trigger the click to show tab
+    if (!aiLogTab) return;
+    if (aiLogTab.classList.contains('active')) {
+        __autoAiLogShown = true;
+        return;
     }
+
+    __autoTabSwitchInProgress = true;
+    aiLogTab.click();
+    __autoTabSwitchInProgress = false;
+    __autoAiLogShown = true;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -121,8 +144,14 @@ function autoShowAiLogTab() {
 // ─────────────────────────────────────────────────────────────
 
 const marketScanCache = {};
+let lastMarketScanFetchMs = 0;
+const MARKET_SCAN_MIN_INTERVAL_MS = 15000;
 
 function fetchMarketScanBreakdown() {
+    const now = Date.now();
+    if (now - lastMarketScanFetchMs < MARKET_SCAN_MIN_INTERVAL_MS) return;
+    lastMarketScanFetchMs = now;
+
     const symbols = ['EURUSD', 'GBPUSD', 'EURJPY', 'GBPJPY'];
     const container = document.getElementById('signal-cards');
     
@@ -296,16 +325,93 @@ function renderSignalBreakdown(sig) {
     return html;
 }
 
-function connectMt5() {
-    const btn = document.getElementById('connect-btn');
-    
-    // If already connected, don't show modal
-    if (btn.style.display === 'none' || btn.textContent === 'MT5 ✓') {
+async function connectMt5() {
+    const headerBtn = document.getElementById('connect-btn');
+    const overlay = document.getElementById('mt5-modal-overlay');
+    const statusEl = document.getElementById('mt5-modal-status');
+    const modalBtn = document.getElementById('mt5-modal-btn');
+
+    // If already connected, do nothing
+    if (headerBtn && (headerBtn.style.display === 'none' || headerBtn.textContent === 'MT5 ✓')) {
         return;
     }
-    
-    // Show manual connection modal only when user explicitly clicks button
-    document.getElementById('mt5-modal-overlay').style.display = 'flex';
+
+    // Show modal as a status/progress UI
+    if (overlay) overlay.style.display = 'flex';
+    if (statusEl) {
+        statusEl.style.display = 'block';
+        statusEl.style.background = 'rgba(33,150,243,0.12)';
+        statusEl.style.border = '1px solid rgba(33,150,243,0.25)';
+        statusEl.style.color = 'var(--txt)';
+        statusEl.textContent = 'Connecting to MT5… (make sure MT5 is open + logged in)';
+    }
+
+    const terminalPathEl = document.getElementById('mt5-path');
+    const path = terminalPathEl ? (terminalPathEl.value || '').trim() : '';
+
+    try {
+        if (modalBtn) {
+            modalBtn.disabled = true;
+            modalBtn.textContent = 'Connecting…';
+        }
+        if (headerBtn) {
+            headerBtn.disabled = true;
+            headerBtn.textContent = 'Connecting…';
+        }
+
+        const r = await fetch('/api/mt5/connect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: path || null })
+        });
+        const data = await r.json().catch(() => ({}));
+
+        if (!r.ok || !data.connected) {
+            let msg = (data && data.error) ? data.error : 'Failed to connect to MT5';
+            if (r.status === 404) {
+                msg = 'Dashboard backend is missing /api/mt5/connect. Make sure you started core/server.py (not ai_pro.py).';
+            }
+            if (statusEl) {
+                statusEl.style.display = 'block';
+                statusEl.style.background = 'rgba(244,67,54,0.12)';
+                statusEl.style.border = '1px solid rgba(244,67,54,0.25)';
+                statusEl.style.color = 'var(--red)';
+                statusEl.textContent = msg;
+            }
+            setConnectButtonState(false);
+            return;
+        }
+
+        // Connected
+        updateMt5Display(data);
+        setConnectButtonState(true);
+    } catch (e) {
+        // fetch() rejects on network errors (server not running, wrong port, blocked, etc.)
+        let msg = (e && e.message) ? e.message : String(e);
+        if (/Failed to fetch|NetworkError|ERR_CONNECTION_REFUSED|refused/i.test(msg)) {
+            msg = 'Dashboard server not reachable. Start core/server.py and open http://127.0.0.1:5000 in your browser.';
+        }
+        if (statusEl) {
+            statusEl.style.display = 'block';
+            statusEl.style.background = 'rgba(244,67,54,0.12)';
+            statusEl.style.border = '1px solid rgba(244,67,54,0.25)';
+            statusEl.style.color = 'var(--red)';
+            statusEl.textContent = 'Connect error: ' + msg;
+        }
+        setConnectButtonState(false);
+    } finally {
+        if (modalBtn) {
+            modalBtn.disabled = false;
+            modalBtn.textContent = 'Auto Connect';
+        }
+        if (headerBtn) {
+            headerBtn.disabled = false;
+            // Button visibility is controlled by setConnectButtonState()
+            if (headerBtn.style.display !== 'none') {
+                headerBtn.textContent = 'Connect MT5';
+            }
+        }
+    }
 }
 
 function placeTestTrade() {
@@ -339,7 +445,7 @@ function updateMt5Display(data) {
         detail.style.display = 'none';
         return;
     }
-    
+
     dot.className = 'mt5-dot ok';
     statusTxt.textContent = 'Connected';
     statusTxt.style.color = 'var(--green)';
@@ -369,15 +475,27 @@ setInterval(() => {
         .then(r => r.json())
         .then(data => {
             updateMt5Display(data);
+            setConnectButtonState(!!data.connected);
             
             // Auto-show AI Log tab if bot is scanning
             fetch('/bot/status')
                 .then(b => b.json())
                 .then(botData => {
-                    if (botData.bot && botData.bot.running && data.connected) {
+                    const runningNow = !!(botData.bot && botData.bot.running && data.connected);
+
+                    // Only auto-switch on the transition to running.
+                    if (runningNow && !__botWasRunning) {
                         autoShowAiLogTab();
-                        // Fetch comprehensive market scan breakdown
-                        fetchMarketScanBreakdown();
+                    }
+                    __botWasRunning = runningNow;
+
+                    // If the bot stops and the user hasn't picked any tab yet,
+                    // allow the auto-switch again next time it starts.
+                    if (!runningNow && !__userHasChosenTab) {
+                        __autoAiLogShown = false;
+                    }
+
+                    if (runningNow) {
                         // Update Start/Stop buttons
                         document.getElementById('start-btn').style.display = 'none';
                         document.getElementById('stop-btn').style.display = 'inline-block';
@@ -389,6 +507,12 @@ setInterval(() => {
                         document.getElementById('stop-btn').style.display = 'none';
                         document.getElementById('dot').className = 'dot';
                         document.getElementById('status-text').textContent = 'idle';
+                    }
+
+                    // Refresh Signals while the Signals tab is visible
+                    const signalsTab = document.getElementById('tab-signals');
+                    if (signalsTab && signalsTab.classList.contains('active') && data.connected) {
+                        fetchMarketScanBreakdown();
                     }
                 })
                 .catch(() => {});
