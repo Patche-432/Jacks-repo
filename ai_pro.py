@@ -2757,6 +2757,42 @@ def bot_update_config():
     else:
         return jsonify(result), 400
 
+@app.route("/bot/config/symbols", methods=["POST"])
+def bot_config_symbols():
+    """Toggle symbol on/off in bot configuration."""
+    bot, thread = _get_bot()
+    
+    data = request.get_json(silent=True) or {}
+    symbol = data.get('symbol')
+    enabled = data.get('enabled', True)
+    
+    if not symbol:
+        return jsonify({"success": False, "message": "Symbol not provided"}), 400
+    
+    # Get current symbols
+    global _last_bot_config
+    current_symbols = _last_bot_config.get("symbols", ["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"])
+    
+    # Update symbols list
+    if enabled and symbol not in current_symbols:
+        current_symbols.append(symbol)
+    elif not enabled and symbol in current_symbols:
+        current_symbols.remove(symbol)
+    
+    # Ensure at least 1 symbol remains
+    if len(current_symbols) == 0:
+        return jsonify({"success": False, "message": "At least one symbol must be enabled"}), 400
+    
+    # Update config
+    _last_bot_config["symbols"] = current_symbols
+    
+    # If bot is running, update it too
+    if thread and thread.is_alive():
+        result = bot.update_config({"symbols": current_symbols})
+        return jsonify({"success": result.get("ok", False), "symbols": current_symbols})
+    
+    return jsonify({"success": True, "symbols": current_symbols})
+
 
 @app.route("/bot/history")
 def bot_history():

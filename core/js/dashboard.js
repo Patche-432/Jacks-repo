@@ -1,7 +1,75 @@
 // Auto-check MT5 connection on page load (silent, no modal)
 window.addEventListener('load', () => {
     autoCheckMt5();
+    initSymbolToggle();
 });
+
+function initSymbolToggle() {
+    // Add click handlers to portfolio watch cards
+    const watchCards = document.querySelectorAll('.watch-card');
+    watchCards.forEach(card => {
+        // Initialize all cards as active
+        card.classList.add('active');
+        card.classList.remove('inactive');
+        
+        card.addEventListener('click', (e) => {
+            const pair = card.getAttribute('data-pair');
+            toggleSymbol(pair, card);
+        });
+    });
+}
+
+function toggleSymbol(pair, cardElement) {
+    // Check if card is currently active/inactive
+    const isCurrentlyActive = cardElement.classList.contains('active');
+    const newState = !isCurrentlyActive;
+    
+    // Update visual state
+    if (newState) {
+        cardElement.classList.remove('inactive');
+        cardElement.classList.add('active');
+    } else {
+        cardElement.classList.add('inactive');
+        cardElement.classList.remove('active');
+    }
+    
+    // Send request to bot to update symbol selection
+    fetch('/bot/config/symbols', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            symbol: pair,
+            enabled: newState
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (!data.success) {
+            // Revert state on error
+            if (newState) {
+                cardElement.classList.remove('active');
+                cardElement.classList.add('inactive');
+            } else {
+                cardElement.classList.remove('inactive');
+                cardElement.classList.add('active');
+            }
+            console.error('Failed to toggle symbol:', data.message);
+        }
+    })
+    .catch(err => {
+        // Revert state on error
+        if (newState) {
+            cardElement.classList.remove('active');
+            cardElement.classList.add('inactive');
+        } else {
+            cardElement.classList.remove('inactive');
+            cardElement.classList.add('active');
+        }
+        console.error('Error toggling symbol:', err);
+    });
+}
 
 function autoCheckMt5() {
     // Just check status, don't attempt connection via endpoint
