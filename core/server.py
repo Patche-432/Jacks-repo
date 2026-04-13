@@ -469,6 +469,207 @@ def clear_thoughts_api():
     clear_thoughts()
     return jsonify({"ok": True})
 
+def _empty_kpis() -> dict:
+    return {
+        'win_rate': 0.0, 'profit_factor': 0.0, 'total_trades': 0,
+        'equity_return': 0.0, 'max_drawdown': 0.0, 'sharpe': 0.0,
+        'avg_win_loss_ratio': 0.0, 'current_drawdown': 0.0,
+        'recovery_factor': 0.0, 'sortino': 0.0,
+    }
+
+
+@app.route('/bot/positions', methods=['GET'])
+def bot_positions():
+    """Return live open positions from MT5."""
+    global mt5_conn
+    if not mt5_conn or not mt5_conn.is_connected():
+        return jsonify({'ok': True, 'positions': []})
+    try:
+        import MetaTrader5 as mt5
+        positions = mt5.positions_get()
+        if positions is None:
+            return jsonify({'ok': True, 'positions': []})
+        result = []
+        for pos in positions:
+            result.append({
+                'ticket': pos.ticket,
+                'symbol': pos.symbol,
+                'type': 'BUY' if pos.type == 0 else 'SELL',
+                'volume': pos.volume,
+                'open_price': round(pos.price_open, 5),
+                'current_price': round(pos.price_current, 5),
+                'sl': round(pos.sl, 5) if pos.sl else None,
+                'tp': round(pos.tp, 5) if pos.tp else None,
+                'profit': round(pos.profit, 2),
+                'swap': round(pos.swap, 2),
+                'open_time': datetime.fromtimestamp(pos.time, tz=timezone.utc).isoformat(),
+                'comment': pos.comment,
+                'magic': pos.magic,
+            })
+        return jsonify({'ok': True, 'positions': result})
+    except Exception as exc:
+        log.error("Error fetching positions: %s", exc)
+        return jsonify({'ok': True, 'positions': [], 'error': 'Failed to retrieve positions'})
+
+
+@app.route('/bot/history', methods=['GET'])
+def bot_history():
+    """Return recent closed-trade history from MT5 (last 30 days)."""
+    global mt5_conn
+    if not mt5_conn or not mt5_conn.is_connected():
+        return jsonify({'ok': True, 'trades': []})
+    try:
+        import MetaTrader5 as mt5
+        from datetime import timedelta
+        date_from = datetime.now(timezone.utc) - timedelta(days=30)
+        date_to = datetime.now(timezone.utc)
+        deals = mt5.history_deals_get(date_from, date_to)
+        if deals is None:
+            return jsonify({'ok': True, 'trades': []})
+        trades = []
+        for deal in deals:
+            if deal.entry == 1:  # DEAL_ENTRY_OUT — closed trade
+                trades.append({
+                    'ticket': deal.ticket,
+                    'order': deal.order,
+                    'symbol': deal.symbol,
+                    'type': 'BUY' if deal.type == 0 else 'SELL',
+                    'volume': deal.volume,
+                    'price': round(deal.price, 5),
+                    'profit': round(deal.profit, 2),
+                    'swap': round(deal.swap, 2),
+                    'commission': round(deal.commission, 2),
+                    'time': datetime.fromtimestamp(deal.time, tz=timezone.utc).isoformat(),
+                    'comment': deal.comment,
+                })
+        trades.sort(key=lambda x: x['time'], reverse=True)
+        return jsonify({'ok': True, 'trades': trades[:100]})
+    except Exception as exc:
+        log.error("Error fetching history: %s", exc)
+        return jsonify({'ok': True, 'trades': [], 'error': 'Failed to retrieve trade history'})
+
+
+@app.route('/bot/performance', methods=['GET'])
+def bot_performance():
+    """Calculate performance KPIs and equity curve from MT5 history (last 90 days)."""
+    global mt5_conn
+    if not mt5_conn or not mt5_conn.is_connected():
+        return jsonify({'ok': True, 'kpis': _empty_kpis(), 'equity_curve': []})
+    try:
+        import MetaTrader5 as mt5
+        import statistics
+        from datetime import timedelta
+        date_from = datetime.now(timezone.utc) - timedelta(days=90)
+        date_to = datetime.now(timezone.utc)
+        deals = mt5.history_deals_get(date_from, date_to)
+        if deals is None or len(deals) == 0:
+            return jsonify({'ok': True, 'kpis': _empty_kpis(), 'equity_curve': []})
+        closed = [d for d in deals if d.entry == 1]
+        if not closed:
+            return jsonify({'ok': True, 'kpis': _empty_kpis(), 'equity_curve': []})
+
+        profits = [d.profit + d.swap + d.commission for d in closed]
+        wins = [p for p in profits if p > 0]
+        losses = [p for p in profits if p < 0]
+        total = len(profits)
+        win_rate = (len(wins) / total * 100) if total > 0 else 0.0
+        gross_profit = sum(wins) if wins else 0.0
+        gross_loss = abs(sum(losses)) if losses else 0.0
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+
+        # Equity curve
+        cumulative, running = [], 0.0
+        for p in profits:
+            running += p
+            cumulative.append(round(running, 2))
+
+        # Determine starting equity from account balance
+        account = mt5.account_info()
+        initial_balance = ((account.balance - running) if account else 10000.0) or 10000.0
+        equity_return = (running / initial_balance * 100) if initial_balance > 0 else 0.0
+
+        # Max drawdown
+        peak, max_dd = 0.0, 0.0
+        for val in cumulative:
+            if val > peak:
+                peak = val
+            dd = peak - val
+            if dd > max_dd:
+                max_dd = dd
+        base = initial_balance + max(cumulative) if cumulative else initial_balance
+        max_dd_pct = (max_dd / base * 100) if base > 0 else 0.0
+        current_val = cumulative[-1] if cumulative else 0.0
+        current_base = initial_balance + (peak if peak > 0 else 0.0)
+        current_dd_pct = ((peak - current_val) / current_base * 100) if (current_base > 0 and peak > current_val) else 0.0
+
+        # Sharpe / Sortino (annualised, per-trade approximation)
+        sharpe, sortino = 0.0, 0.0
+        if len(profits) > 1:
+            mean_p = statistics.mean(profits)
+            std_p = statistics.stdev(profits)
+            sharpe = round((mean_p / std_p * (252 ** 0.5)) if std_p > 0 else 0.0, 2)
+            neg = [p for p in profits if p < 0]
+            if len(neg) > 1:
+                down_std = statistics.stdev(neg)
+                sortino = round((mean_p / down_std * (252 ** 0.5)) if down_std > 0 else 0.0, 2)
+
+        avg_win = (sum(wins) / len(wins)) if wins else 0.0
+        avg_loss = (abs(sum(losses)) / len(losses)) if losses else 0.0
+        avg_ratio = (avg_win / avg_loss) if avg_loss > 0 else (999.0 if avg_win > 0 else 0.0)
+        recovery = (abs(running) / max_dd) if max_dd > 0 else 0.0
+
+        kpis = {
+            'win_rate': round(win_rate, 1),
+            'profit_factor': round(profit_factor, 2),
+            'total_trades': total,
+            'equity_return': round(equity_return, 2),
+            'max_drawdown': round(max_dd_pct, 2),
+            'sharpe': round(sharpe, 2),
+            'avg_win_loss_ratio': round(avg_ratio, 2),
+            'current_drawdown': round(current_dd_pct, 2),
+            'recovery_factor': round(recovery, 2),
+            'sortino': round(sortino, 2),
+        }
+        return jsonify({'ok': True, 'kpis': kpis, 'equity_curve': cumulative[-200:]})
+    except Exception as exc:
+        log.error("Error calculating performance: %s", exc)
+        return jsonify({'ok': True, 'kpis': _empty_kpis(), 'equity_curve': [], 'error': 'Failed to calculate performance'})
+
+
+# In-memory config store (persists for the server lifetime)
+_bot_config: dict = {}
+
+
+@app.route('/bot/config', methods=['POST'])
+def bot_config_apply():
+    """Apply configuration from the dashboard sidebar."""
+    global _enabled_symbols, _bot_config
+    try:
+        payload = request.get_json(silent=True) or {}
+        # Update enabled symbols if provided
+        if payload.get('symbols'):
+            syms = [s.strip().upper() for s in str(payload['symbols']).split(',') if s.strip()]
+            if syms:
+                _enabled_symbols = set(syms)
+        # Persist remaining config values
+        for key in ('volume', 'poll_interval', 'dry_run', 'ai_review', 'auto_trade',
+                    'sl_mult', 'tp_mult', 'atr_mult', 'pc_rr', 'be_buffer'):
+            if key in payload:
+                _bot_config[key] = payload[key]
+        return jsonify({
+            'ok': True,
+            'applied': {
+                'symbols': sorted(_enabled_symbols),
+                **{k: _bot_config.get(k) for k in ('volume', 'poll_interval', 'dry_run',
+                                                     'ai_review', 'auto_trade', 'sl_mult',
+                                                     'tp_mult', 'atr_mult', 'pc_rr', 'be_buffer')},
+            },
+        })
+    except Exception as exc:
+        log.error("Config apply error: %s", exc)
+        return jsonify({'ok': False, 'error': 'Failed to apply configuration'}), 500
+
+
 if __name__ == '__main__':
     # Important: disable the auto-reloader so long-running bot subprocesses
     # started from HTTP requests are not interrupted by Flask restarts.
