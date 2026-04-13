@@ -2270,13 +2270,29 @@ _last_bot_config: dict = {
 }
 
 
+# ── Global shared MT5Connection (used by Bot and Flask) ──────────────────────
+_mt5_connection: Optional[MT5Connection] = None
+
+def _get_mt5_connection() -> Optional[MT5Connection]:
+    """Get or create the global shared MT5Connection."""
+    global _mt5_connection
+    return _mt5_connection
+
+def _set_mt5_connection(conn: Optional[MT5Connection]) -> None:
+    """Set the global shared MT5Connection."""
+    global _mt5_connection
+    _mt5_connection = conn
+
 def _mt5_initialize() -> bool:
     """
     Initialize MT5 using MT5Connection.
     Uses the global MT5_CONFIG (populated from env vars + saved credentials).
+    Stores result in global _mt5_connection so Flask + Bot share the same instance.
     Returns True on success.
     """
     import os
+    global _mt5_connection
+    
     cfg = dict(MT5_CONFIG)
 
     # Allow env vars to override without editing this file
@@ -2286,7 +2302,10 @@ def _mt5_initialize() -> bool:
     if os.getenv("MT5_SERVER"):   cfg["server"]   = os.environ["MT5_SERVER"]
 
     conn = MT5Connection(cfg)
-    return conn.connect()
+    if conn.connect():
+        _mt5_connection = conn  # Store globally for Flask + Bot to use
+        return True
+    return False
 
 
 def _read_mt5_runtime_info(mt5) -> dict:
@@ -2311,30 +2330,66 @@ def _read_mt5_runtime_info(mt5) -> dict:
 
 def _mt5_snapshot(shutdown_when_done: bool = True) -> dict:
     """
-    Connect, read terminal + account info, then disconnect.
+    Get terminal + account info snapshot.
+    Uses shared _mt5_connection if available (preferred), otherwise creates temporary.
+    Only disconnects temporary connections, never disconnects the shared one.
     Returns a serialisable dict; 'connected' is False on any failure.
     """
     import os
-    cfg = dict(MT5_CONFIG)
-    if os.getenv("MT5_PATH"):     cfg["path"]     = os.environ["MT5_PATH"]
-    if os.getenv("MT5_LOGIN"):    cfg["login"]    = os.environ["MT5_LOGIN"]
-    if os.getenv("MT5_PASSWORD"): cfg["password"] = os.environ["MT5_PASSWORD"]
-    if os.getenv("MT5_SERVER"):   cfg["server"]   = os.environ["MT5_SERVER"]
+    
+    # Try to use shared connection first (used by Flask + Bot)
+    conn = _get_mt5_connection()
+    owns_connection = False
+    
+    if conn is None or not conn.is_connected():
+        # No shared connection; create temporary one for this call only
+        cfg = dict(MT5_CONFIG)
+        if os.getenv("MT5_PATH"):     cfg["path"]     = os.environ["MT5_PATH"]
+        if os.getenv("MT5_LOGIN"):    cfg["login"]    = os.environ["MT5_LOGIN"]
+        if os.getenv("MT5_PASSWORD"): cfg["password"] = os.environ["MT5_PASSWORD"]
+        if os.getenv("MT5_SERVER"):   cfg["server"]   = os.environ["MT5_SERVER"]
+
+        try:
+            conn = MT5Connection(cfg)
+            owns_connection = True  # We own this temporary connection
+        except Exception as exc:
+            return {"connected": False, "error": str(exc)}
+
+        if not conn.connect():
+            import MetaTrader5 as mt5
+            err = mt5.last_error()
+            return {"connected": False, "error": f"MT5 initialize failed: {err}"}
 
     try:
-        conn = MT5Connection(cfg)
-    except Exception as exc:
-        return {"connected": False, "error": str(exc)}
-
-    if not conn.connect():
+        # Use connection's built-in runtime_info() method if available
+        if hasattr(conn, 'runtime_info'):
+            return conn.runtime_info()
+        
+        # Fallback: manually read runtime info
         import MetaTrader5 as mt5
-        err = mt5.last_error()
-        return {"connected": False, "error": f"MT5 initialize failed: {err}"}
-
-    try:
-        return conn.runtime_info()
+        terminal = mt5.terminal_info()
+        account = mt5.account_info()
+        symbols = list(mt5.symbols_get() or [])
+        visible_symbols = [str(s.name) for s in symbols if getattr(s, "visible", False)]
+        return {
+            "connected": True,
+            "terminal_name": getattr(terminal, "name", None) if terminal else None,
+            "terminal_company": getattr(terminal, "company", None) if terminal else None,
+            "terminal_path": getattr(terminal, "path", None) if terminal else None,
+            "login": getattr(account, "login", None) if account else None,
+            "server": getattr(account, "server", None) if account else None,
+            "account_name": getattr(account, "name", None) if account else None,
+            "currency": getattr(account, "currency", None) if account else None,
+            "balance": round(getattr(account, "balance", 0), 2) if account else 0,
+            "equity": round(getattr(account, "equity", 0), 2) if account else 0,
+            "trade_allowed": bool(getattr(account, "trade_allowed", False)) if account else False,
+            "error": None,
+            "visible_symbols": visible_symbols,
+            "symbols_total": len(symbols),
+        }
     finally:
-        if shutdown_when_done:
+        # Only disconnect if we created this temporary connection
+        if owns_connection and shutdown_when_done:
             conn.disconnect()
 
 
@@ -2695,13 +2750,16 @@ def bot_start():
 
     clear_thoughts()
 
+    # Pass the shared MT5Connection to the Bot so they both use the same one
+    shared_conn = _get_mt5_connection()
+    
     new_bot = Bot(
         symbols=symbols,
         volume=volume,
         poll_secs=poll_secs,
-
         auto_trade=auto_trade,
         use_ai=use_ai,
+        conn=shared_conn,  # ← Pass shared connection
         atr_tolerance_multiplier = float(strategy.get("atr_tolerance_multiplier", 1.5)),
         sl_atr_mult              = float(strategy.get("sl_atr_mult",              1.5)),
         tp_atr_mult              = float(strategy.get("tp_atr_mult",              3.0)),
@@ -2953,11 +3011,15 @@ if __name__ == "__main__":
         def _auto_connect_mt5():
             if MT5_CONFIG.get("login"):
                 log.info("Auto-connecting MT5 with saved credentials (login=%s) ...", MT5_CONFIG["login"])
-                result = _mt5_snapshot(shutdown_when_done=True)
-                if result.get("connected"):
-                    log.info("MT5 auto-connect OK — server=%s", result.get("server"))
+                if _mt5_initialize():  # ← This sets up the shared _mt5_connection
+                    conn = _get_mt5_connection()
+                    if conn and conn.is_connected():
+                        status = conn.status()
+                        log.info("MT5 auto-connect OK — server=%s login=%s", 
+                                status.get("account", {}).get("server"),
+                                status.get("account", {}).get("login"))
                 else:
-                    log.warning("MT5 auto-connect failed: %s", result.get("error"))
+                    log.warning("MT5 auto-connect failed")
             else:
                 log.info("No saved MT5 credentials — waiting for manual connect via dashboard.")
 
@@ -2966,25 +3028,38 @@ if __name__ == "__main__":
         # Test trade on startup to confirm everything is working
         def _test_trade_on_startup():
             import time
-            time.sleep(2)  # Wait for Flask to be ready
+            time.sleep(2)  # Wait for Flask and MT5 to be ready
             log.info(">>> Running startup test trade (0.001 lot EURUSD BUY)...")
             try:
                 # Reload credentials before test (in case they were just saved)
                 _load_saved_credentials()
                 
-                conn = MT5Connection(dict(MT5_CONFIG))
-                if conn.connect():
-                    try:
-                        result = conn.place_test_trade(symbol="EURUSD", volume=0.001)
-                        if result.get("ok"):
-                            log.info("===== SUCCESS: Test trade placed! Ticket=%s =====", result.get("ticket"))
-                            return
-                        else:
-                            log.warning("Test trade failed: %s", result.get("error"))
-                    finally:
-                        conn.disconnect()
+                # Use shared connection if available, otherwise create new one
+                conn = _get_mt5_connection()
+                if not conn or not conn.is_connected():
+                    # If no shared connection yet, create temporary one for test
+                    cfg = dict(MT5_CONFIG)
+                    conn = MT5Connection(cfg)
+                    if not conn.connect():
+                        log.warning("Could not connect to MT5 for test trade. Enter credentials via dashboard.")
+                        return
+                    owns_conn = True
                 else:
-                    log.warning("Could not connect to MT5 for test trade. Enter credentials via dashboard.")
+                    owns_conn = False  # Don't disconnect shared connection
+                    
+                try:
+                    result = conn.place_test_trade(symbol="EURUSD", volume=0.001)
+                    if result.get("ok"):
+                        log.info("===== SUCCESS: Test trade placed! Ticket=%s =====", result.get("ticket"))
+                        # If we created a new connection for the test, make it the shared one for the bot
+                        if owns_conn:
+                            _set_mt5_connection(conn)
+                            owns_conn = False  # Don't disconnect it anymore
+                    else:
+                        log.warning("Test trade failed: %s", result.get("error"))
+                finally:
+                    if owns_conn:
+                        conn.disconnect()
             except Exception as exc:
                 log.warning("Test trade not executed (waiting for MT5 connection): %s", exc)
 
@@ -2998,28 +3073,31 @@ if __name__ == "__main__":
             while elapsed < max_wait:
                 time.sleep(1)
                 elapsed += 1
-                mt5_status = _mt5_snapshot(shutdown_when_done=True)
-                if mt5_status.get("connected") and mt5_status.get("trade_allowed"):
-                    log.info("MT5 connected ✓ — auto-starting bot polling...")
-                    auto_bot = Bot(
-                        symbols=["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
-                        volume=0.50,
-                        poll_secs=300,
-                        auto_trade=True,
-                        use_ai=True,
-                        atr_tolerance_multiplier=1.5,
-                        sl_atr_mult=2.5,
-                        tp_atr_mult=4.5,
-                        partial_close_rr=1.0,
-                        breakeven_buffer_pips=1.0,
-                    )
-                    t = threading.Thread(target=_run_bot_thread, args=(auto_bot,), daemon=True)
-                    with _bot_lock:
-                        global _bot, _bot_thread
-                        _bot = auto_bot
-                        _bot_thread = t
-                    t.start()
-                    log.info("===== BOT AUTO-STARTED — Scanning: EURUSD, GBPUSD, EURJPY, GBPJPY =====")
+                conn = _get_mt5_connection()
+                if conn and conn.is_connected():
+                    status = conn.status()
+                    if status.get("account", {}).get("trade_allowed"):
+                        log.info("MT5 connected ✓ — auto-starting bot polling...")
+                        auto_bot = Bot(
+                            symbols=["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
+                            volume=0.50,
+                            poll_secs=300,
+                            auto_trade=True,
+                            use_ai=True,
+                            conn=conn,  # ← Pass shared connection
+                            atr_tolerance_multiplier=1.5,
+                            sl_atr_mult=2.5,
+                            tp_atr_mult=4.5,
+                            partial_close_rr=1.0,
+                            breakeven_buffer_pips=1.0,
+                        )
+                        t = threading.Thread(target=_run_bot_thread, args=(auto_bot,), daemon=True)
+                        with _bot_lock:
+                            global _bot, _bot_thread
+                            _bot = auto_bot
+                            _bot_thread = t
+                        t.start()
+                        log.info("===== BOT AUTO-STARTED — Scanning: EURUSD, GBPUSD, EURJPY, GBPJPY =====")
                     return
             log.info("Auto-start timeout — bot waiting for MT5 connection via dashboard")
 
