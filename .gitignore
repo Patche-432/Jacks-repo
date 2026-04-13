@@ -3,3 +3,9 @@ __pycache__/
 *.pyo
 core/.mt5_key
 core/mt5_credentials_config.json
+
+# Backtest helpers and temp files
+backtest_fast_eurusd.py
+backtest_result.txt
+capture_backtest.py
+run_eurusd_backtest.py
