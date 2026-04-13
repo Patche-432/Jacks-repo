@@ -509,7 +509,7 @@ def bot_positions():
         return jsonify({'ok': True, 'positions': result})
     except Exception as exc:
         log.error("Error fetching positions: %s", exc)
-        return jsonify({'ok': True, 'positions': [], 'error': str(exc)})
+        return jsonify({'ok': True, 'positions': [], 'error': 'Failed to retrieve positions'})
 
 
 @app.route('/bot/history', methods=['GET'])
@@ -546,7 +546,7 @@ def bot_history():
         return jsonify({'ok': True, 'trades': trades[:100]})
     except Exception as exc:
         log.error("Error fetching history: %s", exc)
-        return jsonify({'ok': True, 'trades': [], 'error': str(exc)})
+        return jsonify({'ok': True, 'trades': [], 'error': 'Failed to retrieve trade history'})
 
 
 @app.route('/bot/performance', methods=['GET'])
@@ -633,7 +633,7 @@ def bot_performance():
         return jsonify({'ok': True, 'kpis': kpis, 'equity_curve': cumulative[-200:]})
     except Exception as exc:
         log.error("Error calculating performance: %s", exc)
-        return jsonify({'ok': True, 'kpis': _empty_kpis(), 'equity_curve': [], 'error': str(exc)})
+        return jsonify({'ok': True, 'kpis': _empty_kpis(), 'equity_curve': [], 'error': 'Failed to calculate performance'})
 
 
 # In-memory config store (persists for the server lifetime)
@@ -667,7 +667,7 @@ def bot_config_apply():
         })
     except Exception as exc:
         log.error("Config apply error: %s", exc)
-        return jsonify({'ok': False, 'error': str(exc)}), 500
+        return jsonify({'ok': False, 'error': 'Failed to apply configuration'}), 500
 
 
 if __name__ == '__main__':
