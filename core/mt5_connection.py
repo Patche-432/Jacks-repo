@@ -94,6 +94,11 @@ class MT5Connection:
         self._last_heartbeat = 0
         self._heartbeat_interval = 30  # Check connection health every 30 seconds
 
+        # Background monitor
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_stop = threading.Event()
+        self._monitor_interval: int = 12  # seconds between health-checks
+
     # ── Connection ────────────────────────────────────────────────────────────
 
     def connect(self) -> bool:
@@ -143,6 +148,10 @@ class MT5Connection:
 
     def disconnect(self) -> None:
         """Shut down the MT5 connection. Safe to call even if not connected."""
+        # Stop the background monitor before closing the connection so it
+        # doesn't race with mt5.shutdown().
+        self.stop_monitor()
+
         if not self._connected:
             return
         import MetaTrader5 as mt5
@@ -235,6 +244,78 @@ class MT5Connection:
         
         log.error("All reconnection attempts failed ({} total)", max_attempts)
         return False
+
+    # ── Background monitor ────────────────────────────────────────────────────
+
+    def start_monitor(self, interval: int = 12) -> None:
+        """
+        Start a background daemon thread that periodically checks the
+        connection and automatically calls ``reconnect()`` on failure.
+
+        Safe to call multiple times — a new thread is only launched when
+        none is already running.
+
+        Args:
+            interval: Seconds between health-checks (default 12, min 5).
+        """
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            log.debug("MT5 monitor already running — skipping start")
+            return
+
+        self._monitor_interval = max(5, int(interval))
+        self._monitor_stop.clear()
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_loop,
+            name="mt5-connection-monitor",
+            daemon=True,
+        )
+        self._monitor_thread.start()
+        log.info("MT5 background monitor started (interval=%ds)", self._monitor_interval)
+
+    def stop_monitor(self) -> None:
+        """Signal the background monitor thread to stop and wait for it to exit."""
+        self._monitor_stop.set()
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=self._monitor_interval + 2)
+            if self._monitor_thread.is_alive():
+                log.warning("MT5 monitor thread did not stop within timeout")
+        self._monitor_thread = None
+        log.info("MT5 background monitor stopped")
+
+    def _monitor_loop(self) -> None:
+        """Internal loop executed by the background monitor thread."""
+        log.debug("MT5 monitor loop started")
+        while not self._monitor_stop.is_set():
+            # Wait for the configured interval (or until stop is signalled)
+            self._monitor_stop.wait(timeout=self._monitor_interval)
+            if self._monitor_stop.is_set():
+                break
+
+            if not self._connected:
+                # Not connected — skip (server-initiated disconnects are intentional)
+                continue
+
+            try:
+                healthy = self.check_connection()
+            except Exception as exc:
+                log.error("MT5 monitor: health check raised %s", exc)
+                healthy = False
+
+            if not healthy:
+                log.warning("MT5 monitor: connection lost — attempting reconnect…")
+                try:
+                    restored = self.reconnect()
+                except Exception as exc:
+                    log.error("MT5 monitor: reconnect raised %s", exc)
+                    restored = False
+
+                if restored:
+                    log.info("MT5 monitor: connection restored successfully ✓")
+                else:
+                    log.error("MT5 monitor: reconnect failed — will retry in %ds",
+                              self._monitor_interval)
+
+        log.debug("MT5 monitor loop exited")
 
     # ── Data helpers ──────────────────────────────────────────────────────────
 

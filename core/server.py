@@ -3,6 +3,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import atexit
 from datetime import datetime, timezone
 from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
@@ -32,6 +33,19 @@ mt5_status = {
 
 # Dashboard runtime config (in-memory)
 _enabled_symbols = {"GBPJPY", "EURJPY", "GBPUSD", "EURUSD"}
+
+
+def _shutdown_monitor() -> None:
+    """Stop the MT5 background monitor when the server process exits."""
+    global mt5_conn
+    if mt5_conn is not None:
+        try:
+            mt5_conn.stop_monitor()
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_monitor)
 
 
 def _compute_atr(df: pd.DataFrame, period: int = 14) -> float:
@@ -196,6 +210,7 @@ def api_connect_mt5():
             cfg["path"] = str(payload["path"])
         mt5_conn = MT5Connection(cfg)
         if mt5_conn.connect():
+            mt5_conn.start_monitor()
             _sync_mt5_status()
             runtime = mt5_conn.runtime_info()
             return jsonify({'connected': True, **runtime})
