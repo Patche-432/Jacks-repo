@@ -60,13 +60,13 @@
   </div>
 
   <div class="hdr-center">
-    <button class="tab-btn active" onclick="showTab('signals')">Signals</button>
-    <button class="tab-btn" onclick="showTab('thoughts')">AI Log</button>
-    <button class="tab-btn" onclick="showTab('positions')">Positions</button>
-    <button class="tab-btn" onclick="showTab('history')">History</button>
-    <button class="tab-btn" onclick="showTab('performance')">Performance</button>
-    <button class="tab-btn" onclick="showTab('backtest')">Backtest</button>
-    <button class="tab-btn" onclick="showTab('snapshot')">Market Watch</button>
+    <button class="tab-btn active" data-tab="signals" onclick="showTab('signals', this)">Signals</button>
+    <button class="tab-btn" data-tab="thoughts" onclick="showTab('thoughts', this)">AI Log</button>
+    <button class="tab-btn" data-tab="positions" onclick="showTab('positions', this)">Positions</button>
+    <button class="tab-btn" data-tab="history" onclick="showTab('history', this)">History</button>
+    <button class="tab-btn" data-tab="performance" onclick="showTab('performance', this)">Performance</button>
+    <button class="tab-btn" data-tab="backtest" onclick="showTab('backtest', this)">Backtest</button>
+    <button class="tab-btn" data-tab="snapshot" onclick="showTab('snapshot', this)">Market Watch</button>
   </div>
 
   <div class="hdr-right">

@@ -259,6 +259,44 @@ class LocalLLM:
 _thoughts_lock: threading.Lock = threading.Lock()
 _thoughts: deque                = deque(maxlen=120)
 
+# ── Cross-process thought bridge ──────────────────────────────────────────
+# The dashboard server (core/server.py) runs in a separate process from
+# this bot. A shared JSONL file lets both processes see the same stream of
+# thoughts. ai_pro.py appends; server.py tails.
+import json as _json
+import os as _os
+
+_THOUGHT_LOG_PATH = _os.path.join(
+    _os.path.dirname(_os.path.abspath(__file__)),
+    "ai_thoughts.jsonl",
+)
+# Cap the file size so it doesn't grow unbounded — when it exceeds this we
+# keep only the most recent entries on disk.
+_THOUGHT_LOG_MAX_LINES = 2000
+_thought_file_lock: threading.Lock = threading.Lock()
+
+
+def _append_thought_to_file(entry: dict) -> None:
+    """Append a thought entry to the shared JSONL file. Best-effort; never raises."""
+    try:
+        line = _json.dumps(entry, ensure_ascii=False, default=str)
+        with _thought_file_lock:
+            with open(_THOUGHT_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            # Occasional size-cap — rewrite with only the tail when too big
+            try:
+                if _os.path.getsize(_THOUGHT_LOG_PATH) > 2_000_000:  # ~2MB
+                    with open(_THOUGHT_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                        lines = f.readlines()
+                    if len(lines) > _THOUGHT_LOG_MAX_LINES:
+                        lines = lines[-_THOUGHT_LOG_MAX_LINES:]
+                        with open(_THOUGHT_LOG_PATH, "w", encoding="utf-8") as f:
+                            f.writelines(lines)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 def log_thought(
     source: str,
@@ -282,6 +320,9 @@ def log_thought(
         }
         with _thoughts_lock:
             _thoughts.append(entry)
+        # Also write to the shared file so the dashboard server process can
+        # see bot thoughts. (The in-memory deque is only used by this process.)
+        _append_thought_to_file(entry)
     except Exception:
         pass
 
@@ -2996,8 +3037,8 @@ if __name__ == "__main__":
     if "--run" in sys.argv:
         # Headless bot mode — no Flask (always live trading)
         bot = Bot(
-            symbols=["EURUSD", "GBPUSD", "USDJPY", "GBPJPY", "AUDUSD", "USDCAD", "USDCHF"],
-            volume=0.01,
+            symbols=["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
+            volume=0.50,
             poll_secs=300,
             auto_trade=True,
             use_ai=True,

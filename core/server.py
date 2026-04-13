@@ -30,6 +30,10 @@ mt5_status = {
     "account": None,
     "error": None,
 }
+# Guard mutations to mt5_conn / mt5_status across request threads and the
+# MT5 background monitor thread.
+import threading as _threading
+_mt5_state_lock = _threading.Lock()
 
 # Dashboard runtime config (in-memory)
 _enabled_symbols = {"GBPJPY", "EURJPY", "GBPUSD", "EURUSD"}
@@ -79,120 +83,113 @@ def _rr_string(entry: float, sl: float, tp: float) -> str:
 
 
 def _mt5_signal_snapshot(symbol: str) -> dict:
-    """Compute a lightweight signal snapshot from MT5 rates.
+    """Run the real AI_Pro 4-environment strategy and return a dashboard snapshot.
 
-    This intentionally avoids importing/using the heavyweight LLM strategy.
-    Output shape matches what the dashboard expects.
+    Uses AI_Pro.generate_trade_signal() with use_ai=False (no LLM overhead) so
+    the dashboard shows signals from the same CHoCH + PDH/PDL logic the bot uses,
+    not the old SMA20/SMA50 approximation.
+
+    Falls back to an error dict on import or strategy failures.
     """
-    import MetaTrader5 as mt5
-
     symbol = symbol.upper().strip()
 
-    # Ensure MT5 is ready (auto-connect on demand)
+    # Ensure MT5 is connected before handing off to the strategy
     global mt5_conn
     if not mt5_conn or not mt5_conn.is_connected():
-        try:
-            mt5_conn = MT5Connection({})
-            if not mt5_conn.connect():
-                code, msg = mt5.last_error()
-                return {"error": f"MT5 not connected. initialize failed [{code}] {msg}. Open MT5 and log in."}
-        except Exception as exc:
-            return {"error": f"MT5 auto-connect failed: {exc}"}
+        return {"error": "MT5 not connected. Connect first then refresh signals."}
 
-    if not mt5.symbol_select(symbol, True):
-        code, msg = mt5.last_error()
-        return {"error": f"Failed to select symbol {symbol} [{code}] {msg}"}
+    try:
+        # Import AI_Pro at call-time to avoid circular-import issues at startup.
+        # The module-level Flask app in ai_pro.py is created but never started,
+        # so importing it here is safe.
+        from ai_pro import AI_Pro
+    except Exception as exc:
+        log.error("Could not import AI_Pro: %s", exc)
+        return {"error": f"Strategy import failed: {exc}"}
 
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 220)
-    if rates is None or len(rates) < 60:
-        code, msg = mt5.last_error()
-        return {"error": f"No rates for {symbol} [{code}] {msg}"}
+    try:
+        # use_ai=False skips the heavy DeepSeek LLM — pure rule-based signal
+        strategy = AI_Pro(use_ai=False)
+        sig = strategy.generate_trade_signal(symbol)
+    except Exception as exc:
+        log.error("AI_Pro.generate_trade_signal(%s) raised: %s", symbol, exc)
+        return {"error": f"Strategy error: {exc}"}
 
-    df = pd.DataFrame(rates)
-    # time is seconds since epoch
-    if "time" in df.columns:
-        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    # Map AI_Pro signal → dashboard format
+    # signal_source encodes the environment: CHoCH-BUY@PDL / CHoCH-SELL@PDH /
+    # Continuation-BUY@PDH / Continuation-SELL@PDL
+    raw_signal = sig.get("signal", "neutral")
+    source     = sig.get("signal_source") or ""
+    bias = "LONG" if raw_signal == "BUY" else "SHORT" if raw_signal == "SELL" else "—"
 
-    close = df["close"].astype(float)
-    sma_fast = close.rolling(20).mean()
-    sma_slow = close.rolling(50).mean()
-    atr = _compute_atr(df, 14)
+    # Human-readable environment label from signal_source
+    env_map = {
+        "CHoCH-BUY@PDL":          "ENV 1 — CHoCH BUY at PDL (failed lower low)",
+        "CHoCH-SELL@PDH":         "ENV 2 — CHoCH SELL at PDH (failed higher high)",
+        "Continuation-BUY@PDH":   "ENV 3 — Continuation BUY (broke above PDH, retesting)",
+        "Continuation-SELL@PDL":  "ENV 4 — Continuation SELL (broke below PDL, retesting)",
+    }
+    environment = env_map.get(source, sig.get("reason") or "No active environment")
 
-    last_close = float(close.iloc[-1])
-    fast = float(sma_fast.iloc[-1]) if pd.notna(sma_fast.iloc[-1]) else last_close
-    slow = float(sma_slow.iloc[-1]) if pd.notna(sma_slow.iloc[-1]) else last_close
+    # CHoCH status from signal_source / reason
+    choch_status = "—"
+    if "CHoCH" in source:
+        choch_status = "Detected ✓" if raw_signal != "neutral" else "Not confirmed"
 
-    # Bias by SMA trend
-    if fast > slow:
-        bias = "LONG"
-        environment = "Trend-UP (SMA20>SMA50)"
-    elif fast < slow:
-        bias = "SHORT"
-        environment = "Trend-DOWN (SMA20<SMA50)"
-    else:
-        bias = "—"
-        environment = "Neutral"
+    # Level interaction from reason text
+    level_interaction = "—"
+    if sig.get("previous_day_high") and sig.get("previous_day_low"):
+        pdh = sig["previous_day_high"]
+        pdl = sig["previous_day_low"]
+        level_interaction = f"PDH {round(pdh, 5)} / PDL {round(pdl, 5)}"
 
-    # Confidence from separation and slope (bounded 0-100)
-    sep = abs(fast - slow)
-    atr_safe = atr if (not math.isnan(atr) and atr > 0) else max(sep, 1e-8)
-    sep_score = min(1.0, sep / (atr_safe * 1.5))
-    slope_fast = float(sma_fast.iloc[-1] - sma_fast.iloc[-6]) if len(sma_fast) >= 6 and pd.notna(sma_fast.iloc[-6]) else 0.0
-    slope_score = min(1.0, abs(slope_fast) / (atr_safe * 0.5)) if atr_safe > 0 else 0.0
-    confidence = int(round(30 + 45 * sep_score + 25 * slope_score))
-    confidence = max(0, min(100, confidence))
-
-    tick = mt5.symbol_info_tick(symbol)
-    entry = float(getattr(tick, "ask", None) or getattr(tick, "last", None) or last_close)
-
-    # Simple ATR-based SL/TP
-    sl_mult = 2.5
-    tp_mult = 4.5
-    if math.isnan(atr_safe) or atr_safe <= 0:
-        atr_safe = max(abs(entry - last_close), 1e-4)
-
-    if bias == "SHORT":
-        sl = entry + sl_mult * atr_safe
-        tp = entry - tp_mult * atr_safe
-    elif bias == "LONG":
-        sl = entry - sl_mult * atr_safe
-        tp = entry + tp_mult * atr_safe
-    else:
-        sl = entry - sl_mult * atr_safe
-        tp = entry + tp_mult * atr_safe
+    entry    = sig.get("entry_price") or 0.0
+    sl_price = sig.get("stop_loss")   or 0.0
+    tp_price = sig.get("take_profit") or 0.0
+    atr_val  = sig.get("atr")         or 0.0
+    conf     = sig.get("confidence")  or 0
 
     return {
-        "symbol": symbol,
-        "bias": bias,
-        "confidence": confidence,
-        "environment": environment,
-        "choch_status": "—",
-        "level_interaction": "—",
-        "entry_price": round(entry, 5),
-        "sl_price": round(sl, 5),
-        "tp_price": round(tp, 5),
-        "rr": _rr_string(entry, sl, tp),
-        "atr": round(float(atr_safe), 5),
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "symbol":            symbol,
+        "bias":              bias,
+        "confidence":        conf,
+        "environment":       environment,
+        "choch_status":      choch_status,
+        "level_interaction": level_interaction,
+        "entry_price":       round(float(entry),    5) if entry    else 0.0,
+        "sl_price":          round(float(sl_price), 5) if sl_price else 0.0,
+        "tp_price":          round(float(tp_price), 5) if tp_price else 0.0,
+        "rr":                _rr_string(entry, sl_price, tp_price),
+        "atr":               round(float(atr_val),  5) if atr_val  else 0.0,
+        "signal_source":     source,
+        "ai_approved":       sig.get("ai_approved"),
+        "ts":                datetime.now(timezone.utc).isoformat(),
     }
 
 
 def _sync_mt5_status() -> None:
     """Pull the latest MT5 connection state into the global mt5_status dict."""
     global mt5_conn, mt5_status
-    if mt5_conn is None:
-        mt5_status = {"mt5_connected": False, "account": None, "error": "No connection object"}
+    with _mt5_state_lock:
+        conn = mt5_conn
+
+    if conn is None:
+        with _mt5_state_lock:
+            mt5_status.update({"mt5_connected": False, "account": None,
+                               "error": "No connection object"})
         return
-    
+
     try:
-        conn_status = mt5_conn.status()
-        mt5_status["mt5_connected"] = conn_status["connected"]
-        mt5_status["account"] = conn_status["account"]
-        mt5_status["error"] = conn_status["error"]
+        conn_status = conn.status()
+        with _mt5_state_lock:
+            mt5_status["mt5_connected"] = conn_status["connected"]
+            mt5_status["account"] = conn_status["account"]
+            mt5_status["error"] = conn_status["error"]
     except Exception as exc:
         log.error("Failed to sync MT5 status: %s", exc)
-        mt5_status["mt5_connected"] = False
-        mt5_status["error"] = str(exc)
+        with _mt5_state_lock:
+            mt5_status["mt5_connected"] = False
+            mt5_status["error"] = str(exc)
 
 @app.route('/')
 def serve_dashboard():
@@ -436,12 +433,59 @@ def bot_config_symbols():
         return jsonify({"success": False, "message": str(exc)}), 500
 from collections import deque
 import threading
+import json as _json
 
-# AI Thoughts storage (same as ai_pro.py)
+# ── Shared thought log ────────────────────────────────────────────────────
+# The trading bot (ai_pro.py) runs as a separate subprocess, so we can't
+# share a Python deque. Instead, both processes read/write a shared JSONL
+# file. The server only reads it; the bot appends.
+_THOUGHT_LOG_PATH = os.path.join(root_path, "ai_thoughts.jsonl")
 _thoughts_lock = threading.Lock()
-_thoughts = deque(maxlen=120)
+# In-memory cache of the most recent entries, rebuilt from disk on each read
+# when the file has changed. Keeps reads fast for the 2s dashboard poll.
+_thoughts_cache: deque = deque(maxlen=500)
+_thoughts_cache_mtime: float = 0.0
+
+
+def _reload_thoughts_from_file() -> None:
+    """Refresh the in-memory cache from the shared JSONL file if it has changed."""
+    global _thoughts_cache_mtime
+    try:
+        st = os.stat(_THOUGHT_LOG_PATH)
+    except FileNotFoundError:
+        # No bot has written yet — leave cache as-is (likely empty)
+        return
+    except Exception as exc:
+        log.debug("thought log stat failed: %s", exc)
+        return
+
+    if st.st_mtime <= _thoughts_cache_mtime:
+        return  # file hasn't changed
+
+    entries: list = []
+    try:
+        with open(_THOUGHT_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(_json.loads(line))
+                except Exception:
+                    # Skip malformed lines (e.g. partial write in progress)
+                    continue
+    except Exception as exc:
+        log.debug("thought log read failed: %s", exc)
+        return
+
+    with _thoughts_lock:
+        _thoughts_cache.clear()
+        _thoughts_cache.extend(entries[-_thoughts_cache.maxlen:])
+        _thoughts_cache_mtime = st.st_mtime
+
 
 def log_thought(source, symbol, stage, summary, detail=None, action=None, confidence=None):
+    """Append a thought to the shared JSONL file (used if the server itself logs)."""
     try:
         from datetime import datetime, timezone
         entry = {
@@ -454,21 +498,35 @@ def log_thought(source, symbol, stage, summary, detail=None, action=None, confid
             "action": action or "",
             "confidence": round(confidence, 2) if confidence is not None else None,
         }
+        line = _json.dumps(entry, ensure_ascii=False, default=str)
         with _thoughts_lock:
-            _thoughts.append(entry)
-    except Exception:
-        pass
+            with open(_THOUGHT_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception as exc:
+        log.debug("log_thought failed: %s", exc)
+
 
 def get_thoughts(since_ts=None, limit=60):
+    _reload_thoughts_from_file()
     with _thoughts_lock:
-        items = list(_thoughts)
+        items = list(_thoughts_cache)
     if since_ts:
-        items = [t for t in items if t["ts"] > since_ts]
+        items = [t for t in items if str(t.get("ts", "")) > since_ts]
     return items[-limit:]
 
+
 def clear_thoughts():
-    with _thoughts_lock:
-        _thoughts.clear()
+    """Clear the shared thought log (truncates the file)."""
+    global _thoughts_cache_mtime
+    try:
+        with _thoughts_lock:
+            # Truncate rather than delete so file handles remain valid
+            with open(_THOUGHT_LOG_PATH, "w", encoding="utf-8") as f:
+                f.truncate(0)
+            _thoughts_cache.clear()
+            _thoughts_cache_mtime = 0.0
+    except Exception as exc:
+        log.error("clear_thoughts failed: %s", exc)
 
 @app.route('/bot/ai_thoughts', methods=['GET'])
 def bot_ai_thoughts():

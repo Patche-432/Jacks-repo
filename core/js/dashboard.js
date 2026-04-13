@@ -8,6 +8,12 @@ let __autoTabSwitchInProgress = false;
 let __autoAiLogShown = false;
 let __botWasRunning = false;
 let lastThoughtTs = null;
+// Accumulated thoughts buffer — the /bot/ai_thoughts endpoint returns
+// INCREMENTAL results (only entries newer than lastThoughtTs). We must keep
+// a client-side buffer so the UI doesn't flash "No AI thoughts yet" every
+// time a poll returns an empty delta.
+const THOUGHTS_BUFFER_MAX = 200;
+let thoughtsBuffer = [];
 let equityData = [];
 
 const marketScanCache = {};
@@ -32,29 +38,80 @@ function setupTabClickTracking() {
 }
 
 // ── Tab switching ─────────────────────────────────────────────
-function showTab(tab) {
+// `btn` is passed explicitly from inline onclick (e.g. showTab('signals', this)).
+// This avoids relying on the deprecated global `event` object and works
+// correctly when the tab is switched programmatically too.
+function showTab(tab, btn) {
     document.querySelectorAll('.tab-panel').forEach(el => el.classList.remove('active'));
     document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+
     const panel = document.getElementById('tab-' + tab);
-    if (panel) panel.classList.add('active');
-    if (event && event.currentTarget) event.currentTarget.classList.add('active');
-    if (tab === 'positions') fetchPositions();
-    if (tab === 'history') fetchHistory();
-    if (tab === 'performance') fetchPerformance();
-    if (tab === 'snapshot') fetchBotSnapshot();
+    if (panel) {
+        panel.classList.add('active');
+    } else {
+        console.warn('showTab: no panel found for tab "' + tab + '"');
+    }
+
+    // Find the button either from the event (preferred) or by data-tab attr
+    let targetBtn = btn || null;
+    if (!targetBtn) {
+        targetBtn = document.querySelector('.tab-btn[data-tab="' + tab + '"]');
+    }
+    if (targetBtn) targetBtn.classList.add('active');
+
+    // Fire-and-forget data loads for tabs that pull server data on open
+    try {
+        if (tab === 'signals') fetchMarketScanBreakdown();
+        if (tab === 'thoughts') {
+            // Force a full refresh so the user sees latest state immediately.
+            // Reset the buffer so we rebuild from the server's current view
+            // rather than stacking duplicates over what we already had.
+            lastThoughtTs = null;
+            thoughtsBuffer = [];
+            fetchThoughtsNow();
+        }
+        if (tab === 'positions') fetchPositions();
+        if (tab === 'history') fetchHistory();
+        if (tab === 'performance') fetchPerformance();
+        if (tab === 'snapshot') fetchBotSnapshot();
+        // 'backtest' is static HTML — no fetch required
+    } catch (err) {
+        console.error('showTab data load failed for "' + tab + '":', err);
+    }
+}
+
+// Explicit helper so the AI Log tab can refresh on demand
+function fetchThoughtsNow() {
+    const url = lastThoughtTs
+        ? '/bot/ai_thoughts?limit=60&since=' + encodeURIComponent(lastThoughtTs)
+        : '/bot/ai_thoughts?limit=60';
+    return fetch(url)
+        .then(r => r.json())
+        .then(data => {
+            if (!data || !data.ok) return;
+            const thoughts = data.thoughts || [];
+            if (thoughts.length > 0) lastThoughtTs = thoughts[thoughts.length - 1].ts;
+            displayThoughts(thoughts);
+        })
+        .catch(err => console.error('fetchThoughtsNow error:', err));
 }
 
 function autoShowAiLogTab() {
     if (__userHasChosenTab || __autoAiLogShown) return;
-    const aiLogTab = document.querySelector('.tab-btn:nth-child(2)');
+    const aiLogTab = document.querySelector('.tab-btn[data-tab="thoughts"]')
+        || document.querySelector('.tab-btn:nth-child(2)');
     if (!aiLogTab || aiLogTab.classList.contains('active')) {
         __autoAiLogShown = true;
         return;
     }
     __autoTabSwitchInProgress = true;
-    aiLogTab.click();
-    __autoTabSwitchInProgress = false;
-    __autoAiLogShown = true;
+    try {
+        // Call showTab directly so it doesn't depend on the click event
+        showTab('thoughts', aiLogTab);
+    } finally {
+        __autoTabSwitchInProgress = false;
+        __autoAiLogShown = true;
+    }
 }
 
 // ── Symbol toggle ─────────────────────────────────────────────
@@ -377,23 +434,46 @@ async function applyConfig() {
 // ── AI Log ────────────────────────────────────────────────────
 async function clearThoughts() {
     try { await fetch('/bot/thoughts/clear', { method: 'POST' }); } catch (_) {}
+    thoughtsBuffer = [];
+    lastThoughtTs = null;
     const container = document.getElementById('thoughts');
     if (container) container.innerHTML = '<div style="padding:40px;text-align:center;color:var(--txt3)">Log cleared</div>';
     _setText('thought-count', '0 entries');
-    lastThoughtTs = null;
 }
 
-function displayThoughts(thoughts) {
+// Merge incoming thoughts into the persistent buffer (dedup by ts+summary)
+// and render the full accumulated list. This prevents the UI from flashing
+// the empty-state message every time a polling response is empty.
+function displayThoughts(newThoughts) {
     const container = document.getElementById('thoughts');
     const countEl = document.getElementById('thought-count');
     if (!container) return;
-    if (!thoughts || thoughts.length === 0) {
+
+    if (Array.isArray(newThoughts) && newThoughts.length > 0) {
+        const seen = new Set(
+            thoughtsBuffer.map(t => (t.ts || '') + '|' + (t.summary || ''))
+        );
+        for (const t of newThoughts) {
+            const key = (t.ts || '') + '|' + (t.summary || '');
+            if (!seen.has(key)) {
+                thoughtsBuffer.push(t);
+                seen.add(key);
+            }
+        }
+        // Cap buffer size to avoid DOM bloat on long sessions
+        if (thoughtsBuffer.length > THOUGHTS_BUFFER_MAX) {
+            thoughtsBuffer = thoughtsBuffer.slice(-THOUGHTS_BUFFER_MAX);
+        }
+    }
+
+    if (thoughtsBuffer.length === 0) {
         container.innerHTML = '<div style="padding:40px;text-align:center;color:var(--txt3)">No AI thoughts yet — start the bot to see live reasoning.</div>';
         if (countEl) countEl.textContent = '0 entries';
         return;
     }
-    if (countEl) countEl.textContent = thoughts.length + ' entries';
-    container.innerHTML = thoughts.map(t => {
+
+    if (countEl) countEl.textContent = thoughtsBuffer.length + ' entries';
+    container.innerHTML = thoughtsBuffer.map(t => {
         const confHtml = (t.confidence !== null && t.confidence !== undefined)
             ? `<span style="background:var(--cyan-bg);color:var(--cyan);padding:2px 6px;border-radius:3px;margin-left:6px">${(t.confidence * 100).toFixed(0)}%</span>`
             : '';
@@ -474,9 +554,39 @@ function renderMarketScanBreakdown() {
         const entry = sig.entry_price ? sig.entry_price.toFixed(5) : '—';
         const sl = sig.sl_price ? sig.sl_price.toFixed(5) : '—';
         const tp = sig.tp_price ? sig.tp_price.toFixed(5) : '—';
-        const rr = sig.rr || '—';
         const biasColor = bias === 'LONG' ? 'var(--green)' : bias === 'SHORT' ? 'var(--red)' : 'var(--txt2)';
         const confColor = conf >= 70 ? 'var(--green)' : conf >= 50 ? 'var(--amber)' : 'var(--red)';
+
+        // Pip Risk: distance from entry to SL in pips
+        // JPY pairs use 2 decimal places (1 pip = 0.01), others use 4 (1 pip = 0.0001)
+        let pipRiskHtml = '—';
+        if (sig.entry_price && sig.sl_price) {
+            const pipSize = symbol.includes('JPY') ? 0.01 : 0.0001;
+            const slPips = Math.abs(sig.entry_price - sig.sl_price) / pipSize;
+            const tpPips = Math.abs((sig.tp_price || sig.entry_price) - sig.entry_price) / pipSize;
+            const slPipsStr = slPips.toFixed(1);
+            const tpPipsStr = tpPips.toFixed(1);
+            pipRiskHtml = `
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="color:var(--txt3);font-size:10px">SL</span>
+                    <span style="color:var(--red);font-family:var(--mono);font-weight:600">${slPipsStr} pips</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">
+                    <span style="color:var(--txt3);font-size:10px">TP</span>
+                    <span style="color:var(--green);font-family:var(--mono);font-weight:600">${tpPipsStr} pips</span>
+                </div>`;
+        }
+
+        // Trend Strength: derived from confidence score
+        let strengthLabel, strengthColor, strengthBg;
+        if (conf >= 75) {
+            strengthLabel = 'STRONG'; strengthColor = 'var(--green)'; strengthBg = 'rgba(0,255,136,0.1)';
+        } else if (conf >= 50) {
+            strengthLabel = 'MODERATE'; strengthColor = 'var(--amber)'; strengthBg = 'rgba(255,170,0,0.1)';
+        } else {
+            strengthLabel = 'WEAK'; strengthColor = 'var(--red)'; strengthBg = 'rgba(255,80,80,0.1)';
+        }
+
         html += `
         <div style="background:var(--bg0);border:1px solid var(--line);border-radius:8px;padding:16px">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--line)">
@@ -491,9 +601,15 @@ function renderMarketScanBreakdown() {
                 <div><div style="color:var(--txt3);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px">Stop Loss</div><div style="font-family:var(--mono);color:var(--red);font-size:12px;font-weight:500">${sl}</div></div>
                 <div><div style="color:var(--txt3);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px">Take Profit</div><div style="font-family:var(--mono);color:var(--green);font-size:12px;font-weight:500">${tp}</div></div>
             </div>
-            <div style="background:var(--bg1);border-left:3px solid var(--cyan);border-radius:4px;padding:10px;margin-bottom:12px">
-                <div style="font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Risk : Reward</div>
-                <div style="font-size:14px;font-weight:600;color:var(--cyan);font-family:var(--mono)">${rr}</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+                <div style="background:var(--bg1);border-left:3px solid var(--cyan);border-radius:4px;padding:10px">
+                    <div style="font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Pip Risk / Reward</div>
+                    ${pipRiskHtml}
+                </div>
+                <div style="background:${strengthBg};border:1px solid ${strengthColor};border-radius:4px;padding:10px;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:4px">
+                    <div style="font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:.08em">Trend Strength</div>
+                    <div style="font-size:15px;font-weight:700;color:${strengthColor};letter-spacing:.06em">${strengthLabel}</div>
+                </div>
             </div>
             <div style="display:grid;gap:8px;font-size:10px">${renderSignalBreakdown(sig)}</div>
         </div>`;
@@ -504,10 +620,51 @@ function renderMarketScanBreakdown() {
 
 function renderSignalBreakdown(sig) {
     let html = '';
-    if (sig.environment) html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid var(--cyan)"><span style="color:var(--txt3)">Environment:</span><span style="color:var(--txt);margin-left:8px;font-weight:500">${_esc(sig.environment)}</span></div>`;
-    if (sig.choch_status && sig.choch_status !== '—') html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid var(--amber)"><span style="color:var(--txt3)">CHoCH Status:</span><span style="color:var(--txt);margin-left:8px;font-weight:500">${_esc(sig.choch_status)}</span></div>`;
-    if (sig.atr) html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid var(--purple)"><span style="color:var(--txt3)">ATR:</span><span style="color:var(--txt);margin-left:8px;font-family:var(--mono);font-weight:500">${parseFloat(sig.atr).toFixed(5)}</span></div>`;
-    if (sig.level_interaction && sig.level_interaction !== '—') html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid var(--green)"><span style="color:var(--txt3)">Level Interaction:</span><span style="color:var(--txt);margin-left:8px;font-weight:500">${_esc(sig.level_interaction)}</span></div>`;
+
+    // Environment — now carries the real ENV 1/2/3/4 label from AI_Pro
+    if (sig.environment && sig.environment !== 'No active environment') {
+        // Colour the ENV badge by number
+        const envNum = (sig.environment.match(/ENV\s*(\d)/i) || [])[1];
+        const envColors = { '1':'var(--green)', '2':'var(--red)', '3':'var(--cyan)', '4':'var(--amber)' };
+        const envColor  = envColors[envNum] || 'var(--cyan)';
+        html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid ${envColor}">
+            <span style="color:var(--txt3)">Environment:</span>
+            <span style="color:var(--txt);margin-left:8px;font-weight:500">${_esc(sig.environment)}</span>
+        </div>`;
+    } else if (sig.environment) {
+        html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid var(--line)">
+            <span style="color:var(--txt3)">Environment:</span>
+            <span style="color:var(--txt2);margin-left:8px">${_esc(sig.environment)}</span>
+        </div>`;
+    }
+
+    // CHoCH status
+    if (sig.choch_status && sig.choch_status !== '—') {
+        const chochColor = sig.choch_status.includes('✓') ? 'var(--green)' : 'var(--amber)';
+        html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid ${chochColor}">
+            <span style="color:var(--txt3)">CHoCH:</span>
+            <span style="color:var(--txt);margin-left:8px;font-weight:500">${_esc(sig.choch_status)}</span>
+        </div>`;
+    }
+
+    // PDH / PDL key levels
+    if (sig.level_interaction && sig.level_interaction !== '—') {
+        html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid var(--purple)">
+            <span style="color:var(--txt3)">Key Levels:</span>
+            <span style="color:var(--txt);margin-left:8px;font-family:var(--mono);font-size:10px">${_esc(sig.level_interaction)}</span>
+        </div>`;
+    }
+
+    // Scan age
+    if (sig.ts) {
+        const age = Math.round((Date.now() - new Date(sig.ts).getTime()) / 1000);
+        const ageStr = age < 60 ? age + 's ago' : Math.round(age / 60) + 'm ago';
+        html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid var(--line)">
+            <span style="color:var(--txt3)">Last Scan:</span>
+            <span style="color:var(--txt2);margin-left:8px;font-family:var(--mono)">${ageStr}</span>
+        </div>`;
+    }
+
     return html;
 }
 
@@ -846,6 +1003,18 @@ setInterval(() => {
     const snapTab = document.getElementById('tab-snapshot');
     if (snapTab && snapTab.classList.contains('active')) fetchBotSnapshot();
 }, 3000);
+
+// Refresh the History tab while it's the active panel (closed trades over time)
+setInterval(() => {
+    const histTab = document.getElementById('tab-history');
+    if (histTab && histTab.classList.contains('active')) fetchHistory();
+}, 10000);
+
+// Refresh the Performance tab while it's the active panel (KPIs + equity curve)
+setInterval(() => {
+    const perfTab = document.getElementById('tab-performance');
+    if (perfTab && perfTab.classList.contains('active')) fetchPerformance();
+}, 10000);
 
 // ── Utilities ─────────────────────────────────────────────────
 function _setText(id, text) {

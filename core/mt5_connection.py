@@ -91,13 +91,28 @@ class MT5Connection:
         self._cfg = cfg
         self._connected = False
         self._stop_event = threading.Event()
-        self._last_heartbeat = 0
+        self._last_heartbeat = 0.0
         self._heartbeat_interval = 30  # Check connection health every 30 seconds
+
+        # Serialise ALL calls into the MetaTrader5 C extension. The MT5 Python
+        # API is NOT thread-safe: concurrent calls from the Flask request
+        # threads and the background monitor cause spurious failures that
+        # previously caused the connection to "bounce" in and out.
+        self._mt5_lock = threading.RLock()
+
+        # Tolerance for transient failures so a single failed health-check
+        # doesn't immediately flip the connection to "disconnected".
+        self._consecutive_failures = 0
+        self._failure_threshold = 3  # require N consecutive failures to disconnect
 
         # Background monitor
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_stop = threading.Event()
         self._monitor_interval: int = 12  # seconds between health-checks
+        # Remember whether the monitor should be running so reconnect() can
+        # restart it after a successful reconnect (previously the monitor died
+        # permanently after the first auto-recovery).
+        self._monitor_wanted = False
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -118,51 +133,83 @@ class MT5Connection:
             kw["path"] = path
             attempts.append(kw)
 
-        for kw in attempts:
-            try:
-                if mt5.initialize(**kw):
-                    self._connected = True
-                    self._last_heartbeat = time.time()  # Initialize heartbeat timestamp
-                    self._log_account(mt5)
-                    # Verify account info to confirm successful connection
-                    account = mt5.account_info()
-                    if account is None:
-                        log.warning("MT5 authenticated but account_info() failed")
-                        self.disconnect()
-                        continue
-                    return True
-                code, msg = mt5.last_error()
-                log.debug("mt5.initialize() [%d] %s  kwargs=%s", code, msg, kw)
-            except Exception as exc:
-                log.debug("mt5.initialize() raised: %s  kwargs=%s", exc, kw)
-            # Clean up between attempts
-            try:
-                mt5.shutdown()
-            except Exception:
-                pass
+        last_code, last_msg = 0, ""
+        with self._mt5_lock:
+            for kw in attempts:
+                initialised = False
+                try:
+                    initialised = bool(mt5.initialize(**kw))
+                except Exception as exc:
+                    log.debug("mt5.initialize() raised: %s  kwargs=%s", exc, kw)
+                    initialised = False
 
-        code, msg = mt5.last_error()
+                if initialised:
+                    # Verify account info to confirm full login success.
+                    try:
+                        account = mt5.account_info()
+                    except Exception as exc:
+                        log.warning("account_info() raised after init: %s", exc)
+                        account = None
+
+                    if account is not None:
+                        self._connected = True
+                        self._last_heartbeat = time.time()
+                        self._consecutive_failures = 0
+                        self._log_account(mt5)
+                        return True
+
+                    # Authenticated but account missing — clean shutdown and retry
+                    log.warning("MT5 authenticated but account_info() returned None; retrying")
+                    try:
+                        mt5.shutdown()
+                    except Exception:
+                        pass
+                    continue
+
+                # initialize() returned False — record the error and try next path
+                try:
+                    last_code, last_msg = mt5.last_error()
+                except Exception:
+                    last_code, last_msg = 0, ""
+                log.debug("mt5.initialize() failed [%d] %s  kwargs=%s", last_code, last_msg, kw)
+                # Ensure we're not leaving a half-initialized terminal behind
+                try:
+                    mt5.shutdown()
+                except Exception:
+                    pass
+
         log.error("MT5 init failed after %d attempt(s) — last error [%d] %s",
-                  len(attempts), code, msg)
+                  len(attempts), last_code, last_msg)
+        self._connected = False
         return False
 
-    def disconnect(self) -> None:
-        """Shut down the MT5 connection. Safe to call even if not connected."""
-        # Stop the background monitor before closing the connection so it
-        # doesn't race with mt5.shutdown().
-        self.stop_monitor()
+    def disconnect(self, stop_monitor: bool = True) -> None:
+        """Shut down the MT5 connection. Safe to call even if not connected.
+
+        Args:
+            stop_monitor: If True (default), also stops the background monitor
+                thread. Set to False for internal transitions (e.g. reconnect
+                after a failed health-check) so the monitor survives the blip.
+        """
+        if stop_monitor:
+            # Stop the background monitor before closing the connection so it
+            # doesn't race with mt5.shutdown().
+            self.stop_monitor()
+            self._monitor_wanted = False
 
         if not self._connected:
             return
         import MetaTrader5 as mt5
-        try:
-            mt5.shutdown()
-            log.info("MT5Connection: disconnected.")
-        except Exception as exc:
-            log.error("Error during mt5.shutdown(): %s", exc)
-        finally:
-            self._connected = False
-            self._last_heartbeat = 0  # Reset heartbeat on disconnect
+        with self._mt5_lock:
+            try:
+                mt5.shutdown()
+                log.info("MT5Connection: disconnected.")
+            except Exception as exc:
+                log.error("Error during mt5.shutdown(): %s", exc)
+            finally:
+                self._connected = False
+                self._last_heartbeat = 0.0
+                self._consecutive_failures = 0
 
     def stop(self) -> None:
         """Signal any waiting poll loop to exit (thread-safe)."""
@@ -174,75 +221,111 @@ class MT5Connection:
     def check_connection(self) -> bool:
         """
         Check if connection is still alive and update heartbeat.
-        Detects stale connections with periodic health checks.
-        Returns True if connected, False otherwise.
+
+        Uses a consecutive-failure threshold so a single transient glitch
+        (network blip, MT5 terminal momentarily busy, symbol refresh, etc.)
+        does NOT immediately mark the connection as dead. This is the main
+        fix for the "connection bouncing in and out" symptom.
+
+        Returns True if the connection is considered healthy.
         """
         if not self._connected:
             return False
-        
+
         current_time = time.time()
-        
+
         # Skip heartbeat check if recently verified
         if current_time - self._last_heartbeat < self._heartbeat_interval:
             return True
-        
+
+        import MetaTrader5 as mt5
+
+        account = None
+        err_code, err_msg = 0, ""
         try:
-            # Test connection with account info
-            import MetaTrader5 as mt5
-            account = mt5.account_info()
-            if account is None:
-                code, msg = mt5.last_error()
-                log.warning("Connection health check failed [%d] %s", code, msg)
-                self._connected = False
-                return False
-            
-            # Connection is healthy, update heartbeat
-            self._last_heartbeat = current_time
-            return True
-            
+            with self._mt5_lock:
+                account = mt5.account_info()
+                if account is None:
+                    try:
+                        err_code, err_msg = mt5.last_error()
+                    except Exception:
+                        err_code, err_msg = 0, ""
         except Exception as exc:
-            log.error("Connection health check raised: %s", exc)
+            log.warning("Connection health check raised: %s", exc)
+            account = None
+
+        if account is not None:
+            # Healthy: reset failure counter and update heartbeat
+            self._last_heartbeat = current_time
+            self._consecutive_failures = 0
+            return True
+
+        # Tolerate transient failures — only disconnect after N in a row
+        self._consecutive_failures += 1
+        log.warning(
+            "Health check failed [%d] %s (%d/%d before reconnect)",
+            err_code, err_msg,
+            self._consecutive_failures, self._failure_threshold,
+        )
+        if self._consecutive_failures >= self._failure_threshold:
+            log.error("Health check failed %d times in a row — marking disconnected",
+                      self._consecutive_failures)
             self._connected = False
             return False
+
+        # Still within tolerance — report as healthy to avoid UI flicker
+        return True
 
     def reconnect(self, max_attempts: int = 3) -> bool:
         """
         Attempt to reconnect to MT5 after a connection loss.
-        Uses exponential backoff between attempts.
-        
+
+        Uses a gentler backoff (2s, 4s, 8s) than before to keep dashboard
+        flicker short. Always calls ``mt5.shutdown()`` between attempts and
+        restores the background monitor if it was wanted.
+
         Args:
             max_attempts: Maximum number of reconnection attempts (default 3)
-        
+
         Returns:
             True if reconnected, False if all attempts failed
         """
-        log.info("Attempting to reconnect to MT5 (max %d attempts)...", max_attempts)
-        
+        log.info("Attempting to reconnect to MT5 (max %d attempts)…", max_attempts)
+
+        # Reset failure counter so check_connection() starts fresh post-recovery
+        self._consecutive_failures = 0
+
         for attempt in range(1, max_attempts + 1):
             log.info("  Reconnect attempt %d/%d", attempt, max_attempts)
-            
-            # Check if connection was restored naturally
-            if self.check_connection():
-                log.info("Connection restored successfully")
-                return True
-            
-            # Clean shutdown before retry
-            self.disconnect()
-            
-            # Exponential backoff: 2s, 6s, 18s
-            wait_time = 2 * (3 ** (attempt - 1))
-            log.info("  Waiting %d seconds before next attempt...", wait_time)
-            time.sleep(wait_time)
-            
-            # Try to reconnect
+
+            # Always shut down any half-initialised state before retrying, but
+            # keep the monitor alive so we resume monitoring automatically.
+            try:
+                self.disconnect(stop_monitor=False)
+            except Exception as exc:
+                log.debug("disconnect() during reconnect raised: %s", exc)
+
+            # Gentler backoff: 2s, 4s, 8s (was 2/6/18)
+            wait_time = 2 * (2 ** (attempt - 1))
+            log.info("  Waiting %d seconds before next attempt…", wait_time)
+            # Honour monitor stop signal while waiting so shutdown is prompt
+            if self._monitor_stop.wait(timeout=wait_time):
+                log.info("Reconnect aborted — monitor stop requested")
+                return False
+
             try:
                 if self.connect():
                     log.info("Reconnected successfully on attempt %d", attempt)
+                    # If the monitor thread exited while we were down, restart it
+                    if self._monitor_wanted and not (
+                        self._monitor_thread and self._monitor_thread.is_alive()
+                    ):
+                        self.start_monitor(self._monitor_interval)
                     return True
             except Exception as exc:
-                log.error("Reconnection attempt %d failed: %s", attempt, exc)
-        
-        log.error("All reconnection attempts failed ({} total)", max_attempts)
+                log.error("Reconnection attempt %d raised: %s", attempt, exc)
+
+        log.error("All reconnection attempts failed (%d total)", max_attempts)
         return False
 
     # ── Background monitor ────────────────────────────────────────────────────
@@ -263,6 +346,7 @@ class MT5Connection:
             return
 
         self._monitor_interval = max(5, int(interval))
+        self._monitor_wanted = True
         self._monitor_stop.clear()
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
@@ -324,10 +408,11 @@ class MT5Connection:
         self._require_connected()
         import MetaTrader5 as mt5
         try:
-            result = mt5.account_info()
-            if result is None:
-                code, msg = mt5.last_error()
-                log.error("account_info() None [%d] %s", code, msg)
+            with self._mt5_lock:
+                result = mt5.account_info()
+                if result is None:
+                    code, msg = mt5.last_error()
+                    log.error("account_info() None [%d] %s", code, msg)
             return result
         except Exception as exc:
             log.error("account_info() raised: %s", exc)
@@ -338,10 +423,11 @@ class MT5Connection:
         self._require_connected()
         import MetaTrader5 as mt5
         try:
-            result = mt5.terminal_info()
-            if result is None:
-                code, msg = mt5.last_error()
-                log.error("terminal_info() None [%d] %s", code, msg)
+            with self._mt5_lock:
+                result = mt5.terminal_info()
+                if result is None:
+                    code, msg = mt5.last_error()
+                    log.error("terminal_info() None [%d] %s", code, msg)
             return result
         except Exception as exc:
             log.error("terminal_info() raised: %s", exc)
@@ -354,9 +440,10 @@ class MT5Connection:
         """
         self._require_connected()
         import MetaTrader5 as mt5
-        terminal = mt5.terminal_info()
-        account  = mt5.account_info()
-        symbols  = list(mt5.symbols_get() or [])
+        with self._mt5_lock:
+            terminal = mt5.terminal_info()
+            account  = mt5.account_info()
+            symbols  = list(mt5.symbols_get() or [])
         visible  = [str(s.name) for s in symbols if getattr(s, "visible", False)]
         return {
             "connected":        True,
@@ -416,32 +503,42 @@ class MT5Connection:
         import MetaTrader5 as mt5
 
         try:
-            # Get symbol info
-            symbol_info = mt5.symbol_info(symbol)
-            if symbol_info is None:
-                return {"ok": False, "error": f"Symbol {symbol} not found"}
+            with self._mt5_lock:
+                # Get symbol info
+                symbol_info = mt5.symbol_info(symbol)
+                if symbol_info is None:
+                    return {"ok": False, "error": f"Symbol {symbol} not found"}
 
-            # Get current price
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                return {"ok": False, "error": f"Cannot get price for {symbol}"}
+                # Ensure symbol is selected in Market Watch
+                if not symbol_info.visible:
+                    if not mt5.symbol_select(symbol, True):
+                        return {"ok": False, "error": f"Cannot select symbol {symbol}"}
 
-            # Prepare order
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": volume,
-                "type": mt5.ORDER_TYPE_BUY,
-                "price": tick.ask,
-                "deviation": 20,
-                "magic": 234000,
-                "comment": "Taste test trade 0.001",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
+                # Get current price
+                tick = mt5.symbol_info_tick(symbol)
+                if tick is None:
+                    return {"ok": False, "error": f"Cannot get price for {symbol}"}
 
-            # Send order
-            result = mt5.order_send(request)
+                # Prepare order
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": symbol,
+                    "volume": volume,
+                    "type": mt5.ORDER_TYPE_BUY,
+                    "price": tick.ask,
+                    "deviation": 20,
+                    "magic": 234000,
+                    "comment": "Taste test trade 0.001",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+
+                # Send order
+                result = mt5.order_send(request)
+
+            if result is None:
+                code, msg = mt5.last_error()
+                return {"ok": False, "error": f"order_send returned None [{code}] {msg}"}
 
             # Check for success (retcode is 0-based, success codes are < 10030)
             if result.retcode in [mt5.TRADE_RETCODE_DONE, 10030]:  # 10030 = success with IOC
