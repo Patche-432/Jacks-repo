@@ -2268,7 +2268,7 @@ _bot:        Optional[Bot]           = None
 _bot_thread: Optional[threading.Thread] = None
 _bot_last_error: Optional[str] = None
 _last_bot_config: dict = {
-    "symbols":    ["EURUSD", "GBPUSD", "USDJPY", "GBPJPY", "AUDUSD", "USDCAD", "USDCHF"],
+    "symbols":    ["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
     "volume":     0.01,
     "poll_secs":  180.0,
 

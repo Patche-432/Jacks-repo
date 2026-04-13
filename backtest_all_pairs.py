@@ -9,7 +9,7 @@ from backtest import AI_ProBacktester
 import pandas as pd
 
 # Trading pairs from configuration
-PAIRS = ["EURUSD", "AUDUSD", "GBPJPY", "GBPUSD", "USDCAD", "USDJPY"]
+PAIRS = ["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"]
 DAYS = 7
 
 def run_all_backtests(days=7):
