@@ -2270,7 +2270,7 @@ _bot_last_error: Optional[str] = None
 _last_bot_config: dict = {
     "symbols":    ["EURUSD", "GBPUSD", "USDJPY", "GBPJPY", "AUDUSD", "USDCAD", "USDCHF"],
     "volume":     0.01,
-    "poll_secs":  300.0,
+    "poll_secs":  180.0,
 
     "auto_trade": True,
     "use_ai":     True,
@@ -3031,7 +3031,7 @@ if __name__ == "__main__":
                     auto_bot = Bot(
                         symbols=["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
                         volume=0.50,
-                        poll_secs=300,
+                        poll_secs=180,
                         auto_trade=True,
                         use_ai=True,
                         conn=shared_conn,
