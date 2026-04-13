@@ -25,7 +25,7 @@ ENV 4 │ Continuation SELL — broke below PDL, retesting it as resistance
 
 All environments require level interaction for confirmation.
 CHoCH signals have priority (confidence 85) over Continuation (65-75).
-Auto-trade only fires when confidence >= 70 AND DeepSeek approves.
+Auto-trade fires when DeepSeek approves (confidence pre-filtered to >= 75).
 
 Usage:
     python ai_pro.py              # starts Flask on :5000, bot idle
@@ -1790,7 +1790,7 @@ Reply ONLY with JSON:
             "ai_pro_signal", symbol, "signal",
             f"Signal: {signal['signal']} [{signal.get('signal_source','—')}] "
             f"conf={signal['confidence']}% "
-            f"AI={'✓' if signal.get('ai_approved') else '✗' if signal.get('ai_approved') is False else '—'}",
+            f"AI={'AI verified' if signal.get('ai_approved') else '✗' if signal.get('ai_approved') is False else '—'}",
             detail=signal["reason"],
             action=signal["signal"].lower(),
             confidence=signal["confidence"] / 100 if signal["confidence"] else None,
@@ -1931,7 +1931,7 @@ Reply ONLY with JSON:
           2. AI risk manager (rule-based + Qwen)
           3. AI Pro signal generation
           4. AI signal review (Qwen gate)
-          5. Auto-execution if confidence >= 70 AND AI approved
+          5. Auto-execution if AI approved (confidence pre-filtered to >= 75)
         """
         log.info("=" * 65)
         log.info("AI Pro — %s", symbol)
@@ -1968,7 +1968,6 @@ Reply ONLY with JSON:
 
             # Step 6 — Execute
             if (auto_trade
-                    and signal["confidence"] >= 70
                     and signal.get("ai_approved", False)):
                 log.info("AUTO TRADE — executing")
                 trade_result = self.execute_trade(symbol, signal, lot_size)
@@ -1980,9 +1979,6 @@ Reply ONLY with JSON:
                     log.error("FAILED: %s", trade_result["message"])
             elif auto_trade and not signal.get("ai_approved", True):
                 log.info("AUTO TRADE skipped — AI rejected signal")
-            elif auto_trade:
-                log.info("AUTO TRADE skipped — confidence %s%% < 70",
-                         signal["confidence"])
 
         if signal["signal"] != "neutral" and trade_result is None:
             if not auto_trade:
@@ -1994,11 +1990,6 @@ Reply ONLY with JSON:
                 trade_result = {
                     "success": False,
                     "message": "AUTO TRADE skipped: AI rejected signal",
-                }
-            elif signal["confidence"] < 70:
-                trade_result = {
-                    "success": False,
-                    "message": f"AUTO TRADE skipped: confidence {signal['confidence']}% < 70",
                 }
 
         return {

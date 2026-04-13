@@ -480,13 +480,16 @@ function displayThoughts(newThoughts) {
         const actionHtml = t.action
             ? `<span style="background:var(--amber-bg);color:var(--amber);padding:2px 6px;border-radius:3px;margin-left:6px">${_esc(t.action)}</span>`
             : '';
+        const symbolHtml = t.symbol
+            ? `<span style="background:rgba(33,150,243,0.15);color:#64B5F6;padding:2px 7px;border-radius:3px;font-weight:600;letter-spacing:.06em;margin-left:6px">${_esc(t.symbol)}</span>`
+            : '';
         return `
         <div style="padding:12px 16px;border-bottom:1px solid var(--line);font-size:11px;transition:background 0.15s" onmouseover="this.style.background='rgba(255,255,255,0.02)'" onmouseout="this.style.background=''">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;flex-wrap:wrap">
                 <div style="display:flex;align-items:center;gap:6px">
                     <strong style="color:var(--cyan)">${_esc(t.source || '—')}</strong>
                     <span style="background:var(--bg2);color:var(--txt2);padding:2px 6px;border-radius:3px">${_esc(t.stage || '')}</span>
-                    ${confHtml}${actionHtml}
+                    ${symbolHtml}${confHtml}${actionHtml}
                 </div>
                 <span style="color:var(--txt3);white-space:nowrap">${new Date(t.ts).toLocaleTimeString()}</span>
             </div>
