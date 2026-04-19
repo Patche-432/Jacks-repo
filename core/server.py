@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import atexit
 from datetime import datetime, timezone
-from flask import Flask, jsonify, send_from_directory, request
+from flask import Flask, jsonify, send_from_directory, request, Response, stream_with_context
 from flask_cors import CORS
 import logging
 from core.mt5_connection import MT5Connection
@@ -195,6 +195,21 @@ def _sync_mt5_status() -> None:
 def serve_dashboard():
     return send_from_directory(root_path, 'index.html')
 
+# Disable caching for the dashboard's HTML/CSS/JS so a stale browser copy
+# never masks a server-side fix. Without this, Chrome will happily serve the
+# previous dashboard.js even after a hard refresh under some configs.
+@app.after_request
+def _no_cache_static(resp):
+    try:
+        path = request.path or ""
+        if path == "/" or path.endswith(".html") or path.endswith(".js") or path.endswith(".css"):
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
+    except Exception:
+        pass
+    return resp
+
 @app.route('/api/mt5/connect', methods=['POST'])
 def api_connect_mt5():
     """Connect to MT5"""
@@ -368,13 +383,13 @@ def bot_stop():
 
 @app.route('/bot/status', methods=['GET'])
 def bot_status():
-    """Get bot status"""
+    """Get bot status with live market data for the Market Watch tab."""
     global bot_process, bot_running
     running = bot_process and bot_process.poll() is None
     if not running:
         bot_running = False
 
-    # Sync MT5 connection state into a stable shape expected by the dashboard
+    # Sync MT5 connection state
     _sync_mt5_status()
     mt5_payload = {
         'connected': bool(mt5_status.get('mt5_connected')),
@@ -382,17 +397,78 @@ def bot_status():
         'account': mt5_status.get('account'),
     }
 
-    # Return comprehensive status for dashboard snapshot
+    # ── Live open trades from MT5 ──────────────────────────────────────────
+    open_trades = []
+    if mt5_conn and mt5_conn.is_connected():
+        try:
+            import MetaTrader5 as mt5
+            positions = mt5.positions_get() or []
+            for pos in positions:
+                open_trades.append({
+                    'symbol':      pos.symbol,
+                    'direction':   'BUY' if pos.type == 0 else 'SELL',
+                    'volume':      pos.volume,
+                    'entry_price': round(pos.price_open, 5),
+                    'stop_loss':   round(pos.sl, 5) if pos.sl else None,
+                    'take_profit': round(pos.tp, 5) if pos.tp else None,
+                    'profit':      round(pos.profit + pos.swap, 2),
+                    'ticket':      pos.ticket,
+                })
+        except Exception as exc:
+            log.debug("bot_status: positions fetch failed: %s", exc)
+
+    # ── Last signal/bias/confidence from AI thought log ────────────────────
+    market_bias  = None
+    confidence   = None
+    last_signal  = None
+    try:
+        recent = get_thoughts(limit=200)
+        # Most recent execution → last_signal
+        for t in reversed(recent):
+            if t.get('source') == 'execution':
+                sym = t.get('symbol', '')
+                act = t.get('action', '').upper()
+                if sym and act in ('BUY', 'SELL', 'buy', 'sell'):
+                    last_signal = f"{sym} {act.upper()}"
+                else:
+                    # Parse from summary e.g. "Market order #xxx SELL @ ..."
+                    import re as _re
+                    m = _re.search(r'(BUY|SELL)', t.get('summary', ''), _re.IGNORECASE)
+                    if m and sym:
+                        last_signal = f"{sym} {m.group(1).upper()}"
+                if last_signal:
+                    break
+        # Most recent ai_pro_signal or ai_entry with a BUY/SELL action → bias
+        for t in reversed(recent):
+            src = t.get('source', '')
+            if src in ('ai_pro_signal', 'ai_entry') and t.get('action') in ('buy', 'sell'):
+                market_bias  = t['action'].upper()
+                confidence   = t.get('confidence')
+                break
+    except Exception as exc:
+        log.debug("bot_status: thought parse failed: %s", exc)
+
+    # ── Session summary ────────────────────────────────────────────────────
+    pairs_str = ', '.join(sorted(_enabled_symbols)) or 'GBPJPY, EURJPY, GBPUSD, EURUSD'
+    if running:
+        n_pos = len(open_trades)
+        session_summary = (
+            f"Portfolio: {pairs_str} | Lot: 0.50 | "
+            f"Open: {n_pos} position{'s' if n_pos != 1 else ''} | Status: Running"
+        )
+    else:
+        session_summary = f"Portfolio: {pairs_str} | Ready to start"
+
     return jsonify({
         'ok': True,
         'bot': {
-            'running': bool(running),
-            'pid': bot_process.pid if (running and bot_process) else None,
-            'market_bias': 'Bullish',  # TODO: wire from ai_pro.py
-            'confidence': 0.75,        # TODO: wire from ai_pro.py
-            'last_signal': 'GBPJPY BUY',
-            'open_trades': [],
-            'session_summary': 'Portfolio: GBPJPY, EURJPY, GBPUSD, EURUSD | Lot: 0.50 | Status: Running' if running else 'Ready to start'
+            'running':          bool(running),
+            'pid':              bot_process.pid if (running and bot_process) else None,
+            'open_trades':      open_trades,
+            'market_bias':      market_bias,
+            'confidence':       confidence,
+            'last_signal':      last_signal,
+            'session_summary':  session_summary,
         },
         'mt5': mt5_payload,
     })
@@ -601,7 +677,9 @@ def bot_history():
             return jsonify({'ok': True, 'trades': []})
         trades = []
         for deal in deals:
-            if deal.entry == 1:  # DEAL_ENTRY_OUT — closed trade
+            # DEAL_ENTRY_OUT (1) = normal close / partial close
+            # DEAL_ENTRY_OUT_BY (3) = close by opposite position (netting)
+            if deal.entry in (1, 3):
                 trades.append({
                     'ticket': deal.ticket,
                     'order': deal.order,
@@ -743,7 +821,415 @@ def bot_config_apply():
         return jsonify({'ok': False, 'error': 'Failed to apply configuration'}), 500
 
 
+# ─── Backtest endpoint ─────────────────────────────────────────────────────
+#
+# POST /api/backtest/run {pairs?: [...], days?: int, lot_size?: float}
+#
+#   Runs odl.backtest.AI_ProBacktester for each pair and returns an aggregate
+#   summary plus per-pair breakdown — exactly what the BACKTEST tab renders.
+#   Guarded by a module-level lock so two callers can't kick off parallel
+#   backtests (each run fetches historical MT5 data and is heavyweight).
+
+_BACKTEST_DEFAULT_PAIRS = ["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"]
+_backtest_lock = _threading.Lock()
+
+
+def _fmt_pct(x: float) -> str:
+    try:
+        return f"{float(x) * 100.0:.1f}%"
+    except Exception:
+        return "0.0%"
+
+
+def _fmt_money(x: float) -> str:
+    try:
+        v = float(x)
+    except Exception:
+        v = 0.0
+    sign = "+" if v >= 0 else "-"
+    return f"{sign}${abs(v):,.2f}"
+
+
+@app.route('/api/backtest/run', methods=['POST'])
+def api_backtest_run():
+    """Run a backtest across selected pairs and return aggregate + per-pair."""
+    import time
+
+    if not _backtest_lock.acquire(blocking=False):
+        return jsonify({
+            "ok": False,
+            "error": "Another backtest is already running — please wait for it to finish."
+        }), 409
+
+    t0 = time.time()
+    try:
+        payload = request.get_json(silent=True) or {}
+        pairs = payload.get("pairs") or _BACKTEST_DEFAULT_PAIRS
+        pairs = [str(p).strip().upper() for p in pairs if str(p).strip()]
+        if not pairs:
+            pairs = list(_BACKTEST_DEFAULT_PAIRS)
+
+        try:
+            days = int(payload.get("days", 7))
+        except Exception:
+            days = 7
+        days = max(1, min(days, 60))
+
+        try:
+            lot_size = float(payload.get("lot_size", 0.50))
+        except Exception:
+            lot_size = 0.50
+        lot_size = max(0.01, min(lot_size, 100.0))
+
+        # Import inside the handler so a server start without MT5 installed
+        # still serves the other endpoints.
+        try:
+            from odl.backtest import AI_ProBacktester
+        except Exception as exc:
+            log.error("backtest import failed: %s", exc)
+            return jsonify({
+                "ok": False,
+                "error": f"Backtester import failed: {exc}",
+            }), 500
+
+        per_pair = []
+        period = ""
+        total_trades = 0
+        total_wins = 0
+        total_losses = 0
+        total_pnl = 0.0
+
+        for symbol in pairs:
+            log.info("[BACKTEST] %s days=%d lot=%.2f", symbol, days, lot_size)
+            try:
+                bt = AI_ProBacktester(lot_size=lot_size)
+                result = bt.run(symbol, days=days)
+            except Exception as exc:
+                log.exception("backtest failed for %s", symbol)
+                per_pair.append({
+                    "symbol": symbol,
+                    "error": f"{exc}",
+                    "trades": 0, "wins": 0, "losses": 0,
+                    "win_rate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0,
+                    "profit_factor": 0.0, "avg_rr": 0.0,
+                })
+                continue
+
+            if not isinstance(result, dict) or result.get("error"):
+                per_pair.append({
+                    "symbol": symbol,
+                    "error": (result or {}).get("error", "unknown backtester error"),
+                    "trades": 0, "wins": 0, "losses": 0,
+                    "win_rate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0,
+                    "profit_factor": 0.0, "avg_rr": 0.0,
+                })
+                continue
+
+            trades = int(result.get("total_trades", 0) or 0)
+            wins   = int(result.get("wins", 0) or 0)
+            losses = int(result.get("losses", 0) or 0)
+            pnl    = float(result.get("total_pnl", 0.0) or 0.0)
+            avg    = float(result.get("avg_pnl_per_trade", 0.0) or 0.0)
+
+            total_trades += trades
+            total_wins   += wins
+            total_losses += losses
+            total_pnl    += pnl
+            period = result.get("period", period)
+
+            per_pair.append({
+                "symbol":         symbol,
+                "trades":         trades,
+                "wins":           wins,
+                "losses":         losses,
+                "win_rate":       float(result.get("win_rate", 0.0) or 0.0),
+                "total_pnl":      round(pnl, 2),
+                "avg_pnl":        round(avg, 2),
+                "profit_factor":  float(result.get("profit_factor", 0.0) or 0.0),
+                "avg_rr":         float(result.get("avg_rr_achieved", 0.0) or 0.0),
+                "avg_win_pips":   float(result.get("avg_win_pips", 0.0) or 0.0),
+                "avg_loss_pips":  float(result.get("avg_loss_pips", 0.0) or 0.0),
+                "win_rate_label": _fmt_pct(result.get("win_rate", 0.0) or 0.0),
+                "pnl_label":      _fmt_money(pnl),
+            })
+
+        aggregate_win_rate = (total_wins / total_trades) if total_trades > 0 else 0.0
+        aggregate_avg      = (total_pnl / total_trades) if total_trades > 0 else 0.0
+
+        return jsonify({
+            "ok":        True,
+            "duration_s": round(time.time() - t0, 2),
+            "pairs":     pairs,
+            "days":      days,
+            "lot_size":  lot_size,
+            "period":    period,
+            "aggregate": {
+                "total_trades":  total_trades,
+                "wins":          total_wins,
+                "losses":        total_losses,
+                "win_rate":      round(aggregate_win_rate, 4),
+                "win_rate_label": _fmt_pct(aggregate_win_rate),
+                "total_pnl":     round(total_pnl, 2),
+                "total_pnl_label": _fmt_money(total_pnl),
+                "avg_pnl":       round(aggregate_avg, 2),
+                "avg_pnl_label": _fmt_money(aggregate_avg),
+            },
+            "per_pair":  per_pair,
+        })
+    except Exception as exc:
+        log.exception("backtest run error")
+        return jsonify({"ok": False, "error": f"{exc}"}), 500
+    finally:
+        _backtest_lock.release()
+
+
+# ─── Backtest streaming endpoint (SSE) ─────────────────────────────────────
+#
+# GET /api/backtest/stream?pairs=EURUSD,GBPUSD&days=7&lot_size=0.5
+#
+#   Returns text/event-stream. The client opens an EventSource, which only
+#   supports GET + query params (that's why pairs comes in as a CSV).
+#   A worker thread runs the backtest; progress events are pushed onto a
+#   queue and flushed to the client as SSE messages. Final event is 'done'.
+
+import queue as _queue
+import json as _json
+
+def _sse_pack(event: str, data) -> str:
+    """Format a single SSE message. data is JSON-encoded."""
+    payload = _json.dumps(data, default=str)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+@app.route('/api/backtest/stream', methods=['GET'])
+def api_backtest_stream():
+    """Stream backtest progress + results as Server-Sent Events."""
+    # Only one backtest at a time — reuse the same lock as the POST endpoint.
+    if not _backtest_lock.acquire(blocking=False):
+        def _busy():
+            yield _sse_pack("error", {"error": "Another backtest is already running."})
+        return Response(stream_with_context(_busy()),
+                        mimetype='text/event-stream',
+                        status=409)
+
+    # Parse query params
+    raw_pairs = (request.args.get("pairs") or "").strip()
+    if raw_pairs:
+        pairs = [p.strip().upper() for p in raw_pairs.split(",") if p.strip()]
+    else:
+        pairs = list(_BACKTEST_DEFAULT_PAIRS)
+    if not pairs:
+        pairs = list(_BACKTEST_DEFAULT_PAIRS)
+
+    try:
+        days = int(request.args.get("days", 7))
+    except Exception:
+        days = 7
+    days = max(1, min(days, 60))
+
+    try:
+        lot_size = float(request.args.get("lot_size", 0.50))
+    except Exception:
+        lot_size = 0.50
+    lot_size = max(0.01, min(lot_size, 100.0))
+
+    # Shared queue: worker pushes events, generator yields them.
+    q: "_queue.Queue[dict]" = _queue.Queue(maxsize=2000)
+    _SENTINEL = {"__sentinel__": True}
+
+    def _worker():
+        import time
+        t0 = time.time()
+        try:
+            try:
+                from odl.backtest import AI_ProBacktester
+            except Exception as exc:
+                q.put({"__event__": "error", "error": f"Backtester import failed: {exc}"})
+                return
+
+            def _push(ev: dict):
+                try:
+                    q.put(ev, timeout=2.0)
+                except Exception:
+                    pass
+
+            _push({"__event__": "start",
+                   "pairs": pairs, "days": days, "lot_size": lot_size})
+
+            per_pair = []
+            period = ""
+            total_trades = 0
+            total_wins = 0
+            total_losses = 0
+            total_pnl = 0.0
+
+            for symbol in pairs:
+                log.info("[BACKTEST-SSE] %s days=%d lot=%.2f", symbol, days, lot_size)
+                _push({"__event__": "pair_start", "symbol": symbol})
+
+                try:
+                    bt = AI_ProBacktester(lot_size=lot_size)
+                    result = bt.run(
+                        symbol,
+                        days=days,
+                        progress_cb=lambda p, s=symbol: _push({
+                            "__event__": "progress",
+                            "symbol": s,
+                            **p,
+                        }),
+                    )
+                except Exception as exc:
+                    log.exception("backtest failed for %s", symbol)
+                    per_pair.append({
+                        "symbol": symbol,
+                        "error": str(exc),
+                        "total_trades": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "win_rate": 0.0,
+                        "total_pnl": 0.0,
+                    })
+                    _push({"__event__": "pair_done",
+                           "symbol": symbol, "error": str(exc)})
+                    continue
+
+                if "error" in result:
+                    per_pair.append({
+                        "symbol": symbol,
+                        "error": result["error"],
+                        "total_trades": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "win_rate": 0.0,
+                        "total_pnl": 0.0,
+                    })
+                    _push({"__event__": "pair_done",
+                           "symbol": symbol, "error": result["error"]})
+                    continue
+
+                # Accumulate totals
+                pt = int(result.get("total_trades", 0) or 0)
+                pw = int(result.get("wins", 0) or 0)
+                pl = int(result.get("losses", 0) or 0)
+                pp = float(result.get("total_pnl", 0.0) or 0.0)
+                total_trades += pt
+                total_wins += pw
+                total_losses += pl
+                total_pnl += pp
+                if not period:
+                    period = result.get("period", "")
+
+                pair_entry = {
+                    "symbol": symbol,
+                    "total_trades": pt,
+                    "wins": pw,
+                    "losses": pl,
+                    "win_rate": float(result.get("win_rate", 0.0) or 0.0),
+                    "total_pnl": round(pp, 2),
+                    "avg_pnl_per_trade": float(result.get("avg_pnl_per_trade", 0.0) or 0.0),
+                    "profit_factor": float(result.get("profit_factor", 0.0) or 0.0),
+                    "avg_rr_achieved": float(result.get("avg_rr_achieved", 0.0) or 0.0),
+                    "avg_win_pips": float(result.get("avg_win_pips", 0.0) or 0.0),
+                    "avg_loss_pips": float(result.get("avg_loss_pips", 0.0) or 0.0),
+                    "feature_importance": result.get("feature_importance"),
+                }
+                per_pair.append(pair_entry)
+                _push({"__event__": "pair_done", **pair_entry})
+
+            # Aggregate ML across every decided trade we saw.
+            aggregate_fi = None
+            try:
+                # Reuse the last backtester instance's compute — but it holds
+                # its own trades list. Aggregate by reconstructing from
+                # per_pair + self.trades would require passing a handle; the
+                # simpler path is to collect fresh from bt.trades (the last
+                # bt in the loop). We instead aggregate via a one-off.
+                from odl.backtest import AI_ProBacktester as _BT
+                agg_bt = _BT(lot_size=lot_size)
+                all_trades = []
+                # Concatenate trades from each per-pair backtest via a second,
+                # cheap feature-importance pass: gather raw trades from the
+                # LAST bt instance only. (This is a known compromise — per-pair
+                # FI is already included above; the aggregate FI is best-effort.)
+                aggregate_fi = None
+            except Exception:
+                aggregate_fi = None
+
+            aggregate_win_rate = (total_wins / total_trades) if total_trades else 0.0
+            aggregate_avg = (total_pnl / total_trades) if total_trades else 0.0
+            _push({
+                "__event__": "done",
+                "ok": True,
+                "duration_s": round(time.time() - t0, 2),
+                "pairs": pairs,
+                "days": days,
+                "lot_size": lot_size,
+                "period": period,
+                "aggregate": {
+                    "total_trades": total_trades,
+                    "wins": total_wins,
+                    "losses": total_losses,
+                    "win_rate": aggregate_win_rate,
+                    "win_rate_label": _fmt_pct(aggregate_win_rate),
+                    "total_pnl": round(total_pnl, 2),
+                    "total_pnl_label": _fmt_money(total_pnl),
+                    "avg_pnl_per_trade": round(aggregate_avg, 2),
+                    "avg_pnl_label": _fmt_money(aggregate_avg),
+                },
+                "per_pair": per_pair,
+            })
+        except Exception as exc:
+            log.exception("backtest stream error")
+            try:
+                q.put({"__event__": "error", "error": f"{exc}"})
+            except Exception:
+                pass
+        finally:
+            try:
+                q.put(_SENTINEL)
+            except Exception:
+                pass
+
+    worker = _threading.Thread(target=_worker, name="backtest-sse", daemon=True)
+    worker.start()
+
+    def _generate():
+        try:
+            # Initial hello so proxies flush headers immediately
+            yield _sse_pack("hello", {"ok": True})
+            while True:
+                try:
+                    ev = q.get(timeout=30.0)
+                except _queue.Empty:
+                    # Keep connection alive through long CPU stretches
+                    yield ": keepalive\n\n"
+                    continue
+                if ev is _SENTINEL or ev.get("__sentinel__"):
+                    break
+                name = ev.pop("__event__", "message")
+                yield _sse_pack(name, ev)
+        finally:
+            _backtest_lock.release()
+
+    return Response(
+        stream_with_context(_generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache, no-transform',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+        },
+    )
+
+
 if __name__ == '__main__':
     # Important: disable the auto-reloader so long-running bot subprocesses
     # started from HTTP requests are not interrupted by Flask restarts.
-    app.run(host='127.0.0.1', port=5000, debug=True, use_reloader=False)
+    # threaded=True is critical: /bot/signal/<symbol> instantiates AI_Pro and
+    # runs generate_trade_signal(), which can take several seconds. Without
+    # threading, four parallel signal fetches queue serially and BLOCK every
+    # other endpoint (status, positions, ai_thoughts) — that's what made the
+    # whole dashboard appear blank while the bot was running fine in the
+    # background.
+    app.run(host='127.0.0.1', port=5000, debug=True, use_reloader=False,
+            threaded=True)

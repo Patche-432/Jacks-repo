@@ -540,8 +540,8 @@ class MT5Connection:
                 code, msg = mt5.last_error()
                 return {"ok": False, "error": f"order_send returned None [{code}] {msg}"}
 
-            # Check for success (retcode is 0-based, success codes are < 10030)
-            if result.retcode in [mt5.TRADE_RETCODE_DONE, 10030]:  # 10030 = success with IOC
+            # Check for success — TRADE_RETCODE_DONE (10009) is the canonical success code
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
                 return {
                     "ok": True,
                     "ticket": result.order,

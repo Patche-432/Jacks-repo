@@ -1,4 +1,8 @@
-"""MT5 credentials management — encryption and persistence."""
+"""MT5 credentials management — plaintext JSON persistence.
+
+NOTE: Credentials are stored as plaintext JSON. Do not commit the
+credentials file (mt5_credentials.json) to version control.
+"""
 
 import json
 import logging
@@ -25,7 +29,7 @@ def load_credentials() -> Optional[Dict[str, Any]]:
 
 
 def save_credentials(login: str, password: str, server: str, path: str) -> bool:
-    """Save MT5 credentials to disk. Returns True on success."""
+    """Save MT5 credentials to disk as plaintext JSON. Returns True on success."""
     try:
         data = {
             "login": login,

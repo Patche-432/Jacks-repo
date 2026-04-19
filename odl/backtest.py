@@ -23,11 +23,18 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Callable, Any
 import sys
 
 import numpy as np
 import pandas as pd
+
+# Optional: sklearn for feature-importance diagnostics
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 # Optional: for plotting
 try:
@@ -288,13 +295,21 @@ class AI_ProBacktester:
             log.error("Weekly data fetch error [%s]: %s", symbol, e)
             return pd.DataFrame()
     
-    def generate_signals(self, symbol: str, df: pd.DataFrame) -> List[Signal]:
+    def generate_signals(self, symbol: str, df: pd.DataFrame,
+                         progress_cb: Optional[Callable[[dict], None]] = None) -> List[Signal]:
         """Generate signals for each candle in history."""
         self._ensure_mt5()
-        
+
         if self._strategy is None:
             log.error("Strategy not initialized")
             return []
+
+        def _emit(payload: dict) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(payload)
+                except Exception:
+                    pass  # never let a progress hook break the backtest
         
         # Fetch daily and weekly data once before the loop
         df_daily = self._fetch_daily(symbol, bars=90)
@@ -308,9 +323,20 @@ class AI_ProBacktester:
             df_weekly = None
         
         signals = []
-        
+        total_bars = max(1, len(df) - 50)
+        _emit({"type": "signals_begin", "symbol": symbol, "total_bars": total_bars})
+
         # Simulate walking through history
         for i in range(50, len(df)):  # Start after 50 candles (need lookback)
+            # Emit progress every ~5% of the run so the UI can update live
+            if (i - 50) > 0 and (i - 50) % max(1, total_bars // 20) == 0:
+                _emit({
+                    "type": "bar",
+                    "symbol": symbol,
+                    "bar": i - 50,
+                    "total": total_bars,
+                    "signals_so_far": len(signals),
+                })
             try:
                 # Create a slice of data up to this candle
                 df_slice = df.iloc[:i+1].copy()
@@ -404,14 +430,33 @@ class AI_ProBacktester:
                 continue
         
         log.info("Generated %d signals for %s", len(signals), symbol)
+        _emit({"type": "signals_done", "symbol": symbol, "signals": len(signals)})
         return signals
     
     def simulate_trades(self, symbol: str, signals: List[Signal],
-                        df: pd.DataFrame) -> List[Trade]:
+                        df: pd.DataFrame,
+                        progress_cb: Optional[Callable[[dict], None]] = None) -> List[Trade]:
         """Simulate trade execution and exit."""
         trades = []
-        
-        for sig in signals:
+
+        def _emit(payload: dict) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(payload)
+                except Exception:
+                    pass
+
+        total_sigs = max(1, len(signals))
+        _emit({"type": "sim_begin", "symbol": symbol, "total_signals": total_sigs})
+
+        for idx, sig in enumerate(signals):
+            if idx > 0 and idx % max(1, total_sigs // 10) == 0:
+                _emit({
+                    "type": "sim_progress",
+                    "symbol": symbol,
+                    "done": idx,
+                    "total": total_sigs,
+                })
             # Find candle index closest to signal time
             entry_idx = None
             for i, row in df.iterrows():
@@ -476,8 +521,9 @@ class AI_ProBacktester:
             
             trades.append(trade)
         
-        log.info("Simulated %d trades, closed %d", len(trades), 
+        log.info("Simulated %d trades, closed %d", len(trades),
                  len([t for t in trades if t.outcome != "open"]))
+        _emit({"type": "sim_done", "symbol": symbol, "trades": len(trades)})
         return trades
     
     def analyze_early_exits(self, trades: List[Trade]) -> Dict:
@@ -587,23 +633,33 @@ class AI_ProBacktester:
             "early_exits": early_exits,
         }
     
-    def run(self, symbol: str, days: int = 30) -> Dict:
-        """Run complete backtest."""
+    def run(self, symbol: str, days: int = 30,
+            progress_cb: Optional[Callable[[dict], None]] = None) -> Dict:
+        """Run complete backtest. Optional progress_cb receives stage/bar events."""
         log.info("=" * 60)
         log.info("Backtest: %s (%d days)", symbol, days)
         log.info("=" * 60)
-        
+
+        def _emit(payload: dict) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(payload)
+                except Exception:
+                    pass
+
         try:
+            _emit({"type": "stage", "symbol": symbol, "stage": "fetching_data"})
             # Fetch data
             df = self.fetch_data(symbol, days=days)
             if df is None or len(df) < 50:
                 log.error("Could not fetch sufficient data for %s", symbol)
                 return {"error": f"Insufficient data for {symbol}", "symbol": symbol}
-            
+
             self.candle_history[symbol] = df
-            
+
+            _emit({"type": "stage", "symbol": symbol, "stage": "generating_signals"})
             # Generate signals
-            signals = self.generate_signals(symbol, df)
+            signals = self.generate_signals(symbol, df, progress_cb=progress_cb)
             if not signals:
                 log.warning("No signals generated for %s", symbol)
                 return {
@@ -612,23 +668,174 @@ class AI_ProBacktester:
                     "total_trades": 0,
                     "error": "No signals generated",
                 }
-            
+
             self.signals.extend(signals)
-            
+
+            _emit({"type": "stage", "symbol": symbol, "stage": "simulating_trades"})
             # Simulate trades
-            trades = self.simulate_trades(symbol, signals, df)
+            trades = self.simulate_trades(symbol, signals, df, progress_cb=progress_cb)
             self.trades.extend(trades)
-            
+
+            _emit({"type": "stage", "symbol": symbol, "stage": "analyzing"})
             # Analyze
             results = self.analyze_results(trades)
             results["symbol"] = symbol
             results["period"] = f"{df.iloc[0]['time'].date()} to {df.iloc[-1]['time'].date()}"
-            
+
+            # ML diagnostic: feature importance on the trades we just closed
+            fi = self.compute_feature_importance(trades)
+            if fi is not None:
+                results["feature_importance"] = fi
+
             return results
-        
+
         except Exception as e:
             log.exception("Backtest error: %s", e)
             return {"error": str(e), "symbol": symbol}
+
+    # ---------------------------------------------------------------- #
+    # Feature-importance diagnostic (sklearn — optional)               #
+    # ---------------------------------------------------------------- #
+    def compute_feature_importance(self, trades: List[Trade]) -> Optional[Dict[str, Any]]:
+        """
+        Train a RandomForest on trade-level features and return feature
+        importances. Purely diagnostic — does NOT feed back into live
+        trading. Returns None if sklearn is unavailable or the dataset is
+        too thin to be meaningful.
+
+        Features are derived from fields that actually vary per trade:
+        setup one-hots (CHoCH vs Continuation, level anchored to PDH/PDL),
+        hour/day of entry, confidence, risk-reward ratio, risk size in
+        pips. Metric is balanced accuracy (robust to class imbalance).
+        """
+        if not HAS_SKLEARN:
+            return {"error": "sklearn not installed (pip install scikit-learn)"}
+
+        decided = [t for t in trades if t.outcome in ("WIN", "LOSS")]
+        if len(decided) < 20:
+            return {"error": f"Not enough decided trades for ML ({len(decided)}<20)"}
+
+        FEATURES = [
+            "confidence",
+            "rr_ratio",
+            "risk_pips",
+            "is_buy",
+            "is_choch",
+            "is_continuation",
+            "anchor_pdh",
+            "anchor_pdl",
+            "hour_of_day",
+            "dow",
+            "is_jpy",
+        ]
+
+        X: List[List[float]] = []
+        y: List[int] = []
+        for t in decided:
+            src = str(t.signal.source or "").upper()
+            pip = get_pip_value(t.signal.symbol)
+            risk_pips = abs(t.signal.entry_price - t.signal.stop_loss) / pip if pip else 0.0
+            ts = t.entry_time or t.signal.ts
+            hour = int(ts.hour) if ts is not None else 0
+            dow  = int(ts.weekday()) if ts is not None else 0
+
+            row = [
+                float(t.signal.confidence or 0.0),
+                float(t.signal.rr_ratio or 0.0),
+                float(risk_pips),
+                1.0 if str(t.signal.signal).upper() == "BUY" else 0.0,
+                1.0 if "CHOCH" in src else 0.0,
+                1.0 if "CONTINUATION" in src else 0.0,
+                1.0 if src.endswith("@PDH") else 0.0,
+                1.0 if src.endswith("@PDL") else 0.0,
+                float(hour),
+                float(dow),
+                1.0 if "JPY" in str(t.signal.symbol).upper() else 0.0,
+            ]
+            X.append(row)
+            y.append(1 if t.outcome == "WIN" else 0)
+
+        X_arr = np.array(X, dtype=float)
+        y_arr = np.array(y, dtype=int)
+
+        if len(set(y_arr.tolist())) < 2:
+            only = "WIN" if y_arr[0] == 1 else "LOSS"
+            return {"error": f"All trades ended in {only} — cannot fit classifier"}
+
+        # Drop zero-variance columns so they don't clutter the chart with 0.000
+        variances = X_arr.var(axis=0)
+        keep_idx = [i for i, v in enumerate(variances) if v > 0]
+        if len(keep_idx) < 2:
+            return {"error": "Fewer than 2 features have variance — nothing to learn."}
+        X_arr = X_arr[:, keep_idx]
+        active_features = [FEATURES[i] for i in keep_idx]
+
+        try:
+            clf = RandomForestClassifier(
+                n_estimators=300,
+                max_depth=5,
+                min_samples_leaf=3,
+                random_state=42,
+                oob_score=True,
+                bootstrap=True,
+                class_weight="balanced",
+                n_jobs=1,
+            )
+            clf.fit(X_arr, y_arr)
+
+            # Build per-feature importance list
+            importances = [
+                {"feature": name, "importance": round(float(imp), 4)}
+                for name, imp in zip(active_features, clf.feature_importances_)
+            ]
+            importances.sort(key=lambda r: r["importance"], reverse=True)
+
+            baseline_wr = float(y_arr.mean())
+
+            # Balanced accuracy via OOB predictions (robust to class imbalance).
+            # oob_decision_function_ gives per-sample class probabilities for
+            # out-of-bag trees; pick argmax to get predicted class.
+            balanced = None
+            win_precision = None
+            win_recall = None
+            try:
+                from sklearn.metrics import balanced_accuracy_score, precision_score, recall_score
+                oob_proba = getattr(clf, "oob_decision_function_", None)
+                if oob_proba is not None:
+                    valid = ~np.isnan(oob_proba).any(axis=1)
+                    if valid.sum() >= 10:
+                        y_pred = oob_proba[valid].argmax(axis=1)
+                        y_true = y_arr[valid]
+                        balanced = float(balanced_accuracy_score(y_true, y_pred))
+                        # Precision / recall for the WIN class (label=1)
+                        if (y_pred == 1).any():
+                            win_precision = float(precision_score(y_true, y_pred, pos_label=1, zero_division=0))
+                        win_recall = float(recall_score(y_true, y_pred, pos_label=1, zero_division=0))
+            except Exception:
+                pass
+
+            raw_oob = float(getattr(clf, "oob_score_", float("nan")))
+
+            return {
+                "n_trades": len(decided),
+                "baseline_win_rate": round(baseline_wr, 4),
+                "balanced_accuracy": round(balanced, 4) if balanced is not None else None,
+                "win_precision": round(win_precision, 4) if win_precision is not None else None,
+                "win_recall": round(win_recall, 4) if win_recall is not None else None,
+                # lift: how much better than random guessing on a balanced dataset.
+                # 0.5 = coin flip. Positive means the model has real signal.
+                "lift_vs_random": round(balanced - 0.5, 4) if balanced is not None else None,
+                # Keep these for backwards-compat with older clients that read them
+                "oob_accuracy": round(raw_oob, 4) if not np.isnan(raw_oob) else None,
+                "lift_vs_baseline": None,  # deprecated — was misleading on imbalanced data
+                "importances": importances,
+                "model": "RandomForestClassifier(n=300, depth=5, class_weight=balanced)",
+                "note": "Features derived from signal source + timing + confidence; "
+                        "zero-variance features dropped.",
+            }
+        except Exception as exc:
+            log.exception("feature-importance training failed")
+            return {"error": f"sklearn training failed: {exc}"}
     
     def print_results(self, results: Dict) -> None:
         """Pretty-print backtest results."""

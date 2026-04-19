@@ -1,0 +1,14 @@
+[
+  {
+    "ts": "2026-04-15T13:57:28.499737+00:00",
+    "symbol": "EURJPY",
+    "direction": "BUY",
+    "source": "strategy_exit",
+    "entry": 187.571,
+    "exit": 187.484,
+    "volume": 0.5,
+    "pnl": -30.38,
+    "outcome": "LOSS",
+    "ai_reason": ""
+  }
+]

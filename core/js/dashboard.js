@@ -1038,3 +1038,417 @@ function _esc(str) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
 }
+
+// ── Backtest tab ────────────────────────────────────────────────────────────
+//
+// Posts to /api/backtest/run with the inputs from the tab and renders the
+// aggregate KPIs and per-pair breakdown from the response.
+
+function _btSetStatus(text, isError) {
+    const el = document.getElementById('bt-status');
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.color = isError ? 'var(--red, #ff6b6b)' : 'var(--txt3)';
+}
+
+function _btClearResults() {
+    ['bt-total-trades', 'bt-win-rate', 'bt-total-pnl', 'bt-avg-pnl']
+        .forEach(id => { const el = document.getElementById(id); if (el) el.textContent = '—'; });
+    const body = document.getElementById('bt-pairs-body');
+    if (body) body.innerHTML = '<div style="color:var(--txt3);padding:8px;grid-column:1/-1">Running…</div>';
+    const chart = document.getElementById('bt-pnl-chart');
+    if (chart) chart.innerHTML = '<div style="color:var(--txt3);padding:6px 0">Running…</div>';
+}
+
+function _btMoney(v) {
+    const n = Number(v || 0);
+    const s = n >= 0 ? '+' : '-';
+    return s + '$' + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function _btMoneyShort(v) {
+    const n = Number(v || 0);
+    const abs = Math.abs(n);
+    const s = n >= 0 ? '+' : '-';
+    if (abs >= 1000) return s + '$' + (abs / 1000).toFixed(1) + 'k';
+    return s + '$' + abs.toFixed(0);
+}
+
+function _btRenderPnlChart(per, totalPnl) {
+    const chart = document.getElementById('bt-pnl-chart');
+    if (!chart) return;
+    const rows = (per || []).filter(r => !r.error);
+    if (!rows.length) {
+        chart.innerHTML = '<div style="color:var(--txt3);padding:6px 0">No per-pair P&L to visualise.</div>';
+        return;
+    }
+    const maxAbs = Math.max(1, ...rows.map(r => Math.abs(Number(r.total_pnl || 0))));
+    const totalAbs = rows.reduce((a, r) => a + Math.abs(Number(r.total_pnl || 0)), 0) || 1;
+
+    chart.innerHTML = rows.map(r => {
+        const pnl = Number(r.total_pnl || 0);
+        const pct = (Math.abs(pnl) / maxAbs) * 100;
+        const share = (Math.abs(pnl) / totalAbs) * 100;
+        const colour = pnl >= 0 ? 'var(--green,#2ecc71)' : 'var(--red,#ff6b6b)';
+        const bg = pnl >= 0 ? 'rgba(46,204,113,0.15)' : 'rgba(255,107,107,0.15)';
+        return `
+          <div style="display:grid;grid-template-columns:80px 1fr 110px 70px;align-items:center;gap:10px">
+            <div style="color:var(--txt2)">${_esc(r.symbol)}</div>
+            <div style="position:relative;height:16px;background:var(--bg1);border-radius:4px;overflow:hidden">
+              <div style="position:absolute;left:0;top:0;bottom:0;width:${pct.toFixed(1)}%;background:${bg};border-right:2px solid ${colour};transition:width .25s"></div>
+            </div>
+            <div style="text-align:right;color:${colour}">${_esc(r.pnl_label || _btMoney(pnl))}</div>
+            <div style="text-align:right;color:var(--txt3)">${share.toFixed(1)}%</div>
+          </div>`;
+    }).join('');
+}
+
+function _btRenderPairCards(per) {
+    const body = document.getElementById('bt-pairs-body');
+    if (!body) return;
+    const rows = per || [];
+    if (!rows.length) {
+        body.innerHTML = '<div style="color:var(--txt3);padding:8px">No per-pair results returned.</div>';
+        return;
+    }
+
+    body.innerHTML = rows.map(r => {
+        if (r.error) {
+            return `
+              <div style="background:var(--bg1);padding:12px;border-radius:6px;border-left:3px solid var(--red,#ff6b6b)">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                  <div style="font-weight:600;color:var(--txt)">${_esc(r.symbol)}</div>
+                  <div style="font-size:10px;color:var(--red,#ff6b6b)">FAILED</div>
+                </div>
+                <div style="font-size:10px;color:var(--txt3)">${_esc(r.error)}</div>
+              </div>`;
+        }
+
+        const pnl      = Number(r.total_pnl || 0);
+        const pnlColor = pnl >= 0 ? 'var(--green)' : 'var(--red,#ff6b6b)';
+        const wrPct    = Math.max(0, Math.min(100, Number(r.win_rate || 0) * 100));
+        const wrLabel  = r.win_rate_label || (wrPct.toFixed(1) + '%');
+        const pnlLabel = r.pnl_label || _btMoney(pnl);
+        const pf       = Number(r.profit_factor || 0);
+        const pfLabel  = pf > 0 ? pf.toFixed(2) + 'x' : '—';
+        const rr       = Number(r.avg_rr || 0);
+        const rrLabel  = rr > 0 ? rr.toFixed(2) : '—';
+        const trades   = Number(r.trades || 0);
+        const wins     = Number(r.wins || 0);
+        const losses   = Number(r.losses || 0);
+        const barColor = wrPct >= 55 ? 'var(--green)' : (wrPct >= 45 ? 'var(--amber,#f5a623)' : 'var(--red,#ff6b6b)');
+
+        return `
+          <div style="background:var(--bg1);padding:12px;border-radius:6px;border-left:3px solid ${pnlColor}">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+              <div style="font-weight:600;color:var(--txt);font-size:12px">${_esc(r.symbol)}</div>
+              <div style="color:${pnlColor};font-weight:600">${_esc(pnlLabel)}</div>
+            </div>
+
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--txt3);margin-bottom:4px">
+              <span>Win Rate</span>
+              <span style="color:var(--txt2)">${_esc(wrLabel)} · ${wins}W / ${losses}L</span>
+            </div>
+            <div style="height:6px;background:var(--bg0);border-radius:3px;overflow:hidden;margin-bottom:10px">
+              <div style="height:100%;width:${wrPct.toFixed(1)}%;background:${barColor};transition:width .25s"></div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:10px;color:var(--txt3)">
+              <div>
+                <div>Trades</div>
+                <div style="color:var(--txt);font-size:11px">${trades.toLocaleString()}</div>
+              </div>
+              <div>
+                <div>Profit Factor</div>
+                <div style="color:var(--txt);font-size:11px">${_esc(pfLabel)}</div>
+              </div>
+              <div>
+                <div>Avg R:R</div>
+                <div style="color:var(--txt);font-size:11px">${_esc(rrLabel)}</div>
+              </div>
+            </div>
+          </div>`;
+    }).join('');
+}
+
+function _btRenderResults(data) {
+    const agg = data.aggregate || {};
+    const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+
+    set('bt-total-trades', (agg.total_trades ?? 0).toLocaleString());
+    set('bt-win-rate',     agg.win_rate_label  || '0.0%');
+    set('bt-total-pnl',    agg.total_pnl_label || '$0.00');
+    set('bt-avg-pnl',      agg.avg_pnl_label   || '$0.00');
+
+    // KPI deco lines: quick context under the numbers
+    const wins = Number(agg.wins || 0), losses = Number(agg.losses || 0);
+    set('bt-total-trades-deco', wins || losses ? `${wins}W · ${losses}L` : 'backtest');
+    const pairCount = (data.per_pair || []).length;
+    set('bt-win-rate-deco', pairCount ? `across ${pairCount} pair${pairCount > 1 ? 's' : ''}` : 'aggregate');
+
+    const lot = Number(data.lot_size || 0).toFixed(2);
+    const lotEl = document.getElementById('bt-lot-label');
+    if (lotEl) lotEl.textContent = `at ${lot} lot`;
+    const lotEl2 = document.getElementById('bt-lot-label-2');
+    if (lotEl2) lotEl2.textContent = `(${lot} lot)`;
+
+    const sub = document.getElementById('bt-subtitle');
+    if (sub) {
+        const period = data.period ? ` — ${data.period}` : '';
+        sub.textContent = `${data.days || 7}-day historical validation (${lot} lot)${period}`;
+    }
+
+    // Summary banner
+    const banner = document.getElementById('bt-summary-banner');
+    if (banner) {
+        banner.style.display = 'flex';
+        set('bt-last-run',     new Date().toLocaleString());
+        set('bt-period',       data.period || '—');
+        set('bt-duration',     (data.duration_s != null) ? `${data.duration_s}s` : '—');
+        set('bt-lot-summary',  lot);
+    }
+
+    _btRenderPnlChart(data.per_pair || [], Number(agg.total_pnl || 0));
+    _btRenderPairCards(data.per_pair || []);
+}
+
+// Normalise a per-pair payload coming off the wire so the existing card
+// renderer finds the field names it expects.
+function _btNormalisePair(r) {
+    if (!r) return r;
+    const pnl = Number(r.total_pnl || 0);
+    return {
+        symbol:        r.symbol,
+        error:         r.error,
+        total_pnl:     pnl,
+        pnl_label:     _btMoney(pnl),
+        win_rate:      Number(r.win_rate || 0),
+        win_rate_label: ((Number(r.win_rate || 0)) * 100).toFixed(1) + '%',
+        trades:        Number(r.total_trades || 0),
+        wins:          Number(r.wins || 0),
+        losses:        Number(r.losses || 0),
+        profit_factor: Number(r.profit_factor || 0),
+        avg_rr:        Number(r.avg_rr_achieved || 0),
+        avg_win_pips:  Number(r.avg_win_pips || 0),
+        avg_loss_pips: Number(r.avg_loss_pips || 0),
+        feature_importance: r.feature_importance || null,
+    };
+}
+
+// Render feature-importance (sklearn) insights beneath the per-pair cards.
+function _btRenderMLInsights(perPair) {
+    let host = document.getElementById('bt-ml-insights');
+    if (!host) {
+        // Inject a container after the pairs grid if the HTML doesn't have one
+        const body = document.getElementById('bt-pairs-body');
+        if (!body || !body.parentNode) return;
+        host = document.createElement('div');
+        host.id = 'bt-ml-insights';
+        host.style.cssText = 'margin-top:16px;border:1px solid var(--bd,#2a2f3a);padding:14px;border-radius:8px;background:var(--bg0)';
+        body.parentNode.parentNode.appendChild(host);
+    }
+
+    const withFI = (perPair || []).filter(p => p && p.feature_importance);
+    if (!withFI.length) {
+        host.innerHTML = '<div style="color:var(--txt3);font-size:11px">🧠 ML Insights (sklearn) — no trained model (pip install scikit-learn, or too few decided trades).</div>';
+        return;
+    }
+
+    const card = (p) => {
+        const fi = p.feature_importance || {};
+        if (fi.error) {
+            return `
+              <div style="background:var(--bg1);padding:10px;border-radius:6px;border-left:3px solid var(--amber,#f5a623)">
+                <div style="font-weight:600;color:var(--txt);font-size:12px;margin-bottom:4px">${_esc(p.symbol)}</div>
+                <div style="font-size:10px;color:var(--txt3)">${_esc(fi.error)}</div>
+              </div>`;
+        }
+        const imps = Array.isArray(fi.importances) ? fi.importances.slice(0, 8) : [];
+        const maxImp = Math.max(0.0001, ...imps.map(r => Number(r.importance || 0)));
+        const rows = imps.map(r => {
+            const v = Number(r.importance || 0);
+            const pct = (v / maxImp) * 100;
+            return `
+              <div style="display:grid;grid-template-columns:130px 1fr 50px;gap:8px;align-items:center;font-size:10px;margin-bottom:4px">
+                <div style="color:var(--txt2)">${_esc(r.feature)}</div>
+                <div style="height:10px;background:var(--bg0);border-radius:3px;overflow:hidden">
+                  <div style="height:100%;width:${pct.toFixed(1)}%;background:var(--accent,#5ac8fa)"></div>
+                </div>
+                <div style="text-align:right;color:var(--txt3)">${v.toFixed(3)}</div>
+              </div>`;
+        }).join('');
+
+        // Prefer balanced accuracy (robust to class imbalance) + lift vs random.
+        // Fall back to old fields for back-compat with older server responses.
+        const bal = (fi.balanced_accuracy != null) ? fi.balanced_accuracy : null;
+        const lift = (fi.lift_vs_random != null) ? fi.lift_vs_random : null;
+        const liftLabel = (lift != null) ? ((lift >= 0 ? '+' : '') + (lift * 100).toFixed(1) + '%') : '—';
+        const liftColour = (lift != null && lift > 0.02) ? 'var(--green)' : (lift != null && lift < -0.02 ? 'var(--red,#ff6b6b)' : 'var(--txt3)');
+        const baseline = fi.baseline_win_rate != null ? (fi.baseline_win_rate * 100).toFixed(1) + '%' : '—';
+        const balLabel = bal != null ? (bal * 100).toFixed(1) + '%' : '—';
+        const prec = fi.win_precision != null ? (fi.win_precision * 100).toFixed(1) + '%' : '—';
+        const rec  = fi.win_recall    != null ? (fi.win_recall    * 100).toFixed(1) + '%' : '—';
+
+        return `
+          <div style="background:var(--bg1);padding:12px;border-radius:6px">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+              <div style="font-weight:600;color:var(--txt);font-size:12px">${_esc(p.symbol)}</div>
+              <div style="font-size:10px;color:var(--txt3)">n=${fi.n_trades}</div>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;font-size:10px;color:var(--txt3);margin-bottom:10px">
+              <div title="Share of trades that were WINS in this period">
+                <div>Baseline WR</div><div style="color:var(--txt);font-size:11px">${baseline}</div>
+              </div>
+              <div title="Average of WIN-recall and LOSS-recall from out-of-bag predictions. 50% = coin flip.">
+                <div>Balanced Acc</div><div style="color:var(--txt);font-size:11px">${balLabel}</div>
+              </div>
+              <div title="When the model predicts WIN, how often is it right?">
+                <div>Win Precision</div><div style="color:var(--txt);font-size:11px">${prec}</div>
+              </div>
+              <div title="Of all actual WINs, how many did the model catch?">
+                <div>Win Recall</div><div style="color:var(--txt);font-size:11px">${rec}</div>
+              </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;font-size:10px;color:var(--txt3)">
+              <span>Lift vs. random guess</span>
+              <span style="color:${liftColour};font-weight:600">${liftLabel}</span>
+            </div>
+            ${rows || '<div style="color:var(--txt3);font-size:10px">No importances returned.</div>'}
+          </div>`;
+    };
+
+    host.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <div style="font-weight:600;color:var(--txt)">🧠 ML Insights</div>
+        <div style="font-size:10px;color:var(--txt3)">(sklearn · RandomForest feature importance per pair)</div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px">
+        ${withFI.map(card).join('')}
+      </div>
+    `;
+}
+
+// Stream backtest progress via Server-Sent Events. EventSource is GET-only,
+// so we pass pairs/days/lot_size as query params.
+function runBacktest() {
+    const btn = document.getElementById('bt-run');
+    const daysEl = document.getElementById('bt-days');
+    const lotEl = document.getElementById('bt-lot');
+    const days = Math.max(1, Math.min(60, Number((daysEl && daysEl.value) || 7)));
+    const lot = Math.max(0.01, Number((lotEl && lotEl.value) || 0.5));
+    const pairs = Array.from(document.querySelectorAll('.bt-pair'))
+        .filter(c => c.checked).map(c => c.value);
+
+    if (!pairs.length) {
+        _btSetStatus('Select at least one pair to backtest.', true);
+        return;
+    }
+
+    if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
+    _btClearResults();
+    _btSetStatus(`Backtesting ${pairs.length} pair${pairs.length > 1 ? 's' : ''} over ${days} day${days > 1 ? 's' : ''}…`);
+
+    // Progressive state — fills in as pair_done events arrive
+    const perPair = [];
+    const pairIndex = {}; // symbol → index in perPair
+    const qs = new URLSearchParams({
+        pairs: pairs.join(','),
+        days: String(days),
+        lot_size: String(lot),
+    });
+
+    // Close any previous stream cleanly
+    if (window.__btSSE) { try { window.__btSSE.close(); } catch (_) {} }
+    const es = new EventSource('/api/backtest/stream?' + qs.toString());
+    window.__btSSE = es;
+
+    const cleanup = () => {
+        try { es.close(); } catch (_) {}
+        if (btn) { btn.disabled = false; btn.textContent = 'Run Backtest'; }
+        if (window.__btSSE === es) window.__btSSE = null;
+    };
+
+    es.addEventListener('hello', () => {
+        _btSetStatus(`Connected — starting ${pairs.length} pair${pairs.length > 1 ? 's' : ''}…`);
+    });
+
+    es.addEventListener('start', (e) => {
+        try { JSON.parse(e.data); } catch (_) {}
+    });
+
+    es.addEventListener('pair_start', (e) => {
+        try {
+            const p = JSON.parse(e.data);
+            _btSetStatus(`[${p.symbol}] starting…`);
+        } catch (_) {}
+    });
+
+    es.addEventListener('progress', (e) => {
+        try {
+            const p = JSON.parse(e.data);
+            const sym = p.symbol || '';
+            if (p.type === 'stage') {
+                _btSetStatus(`[${sym}] ${p.stage.replace(/_/g, ' ')}…`);
+            } else if (p.type === 'bar') {
+                const pct = p.total ? Math.round((p.bar / p.total) * 100) : 0;
+                _btSetStatus(`[${sym}] signal gen ${p.bar}/${p.total} (${pct}%) · ${p.signals_so_far || 0} signals`);
+            } else if (p.type === 'sim_progress') {
+                const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+                _btSetStatus(`[${sym}] simulating trades ${p.done}/${p.total} (${pct}%)`);
+            } else if (p.type === 'signals_done') {
+                _btSetStatus(`[${sym}] ${p.signals} signals generated`);
+            } else if (p.type === 'sim_done') {
+                _btSetStatus(`[${sym}] ${p.trades} trades simulated`);
+            }
+        } catch (_) {}
+    });
+
+    es.addEventListener('pair_done', (e) => {
+        try {
+            const p = JSON.parse(e.data);
+            const norm = _btNormalisePair(p);
+            if (pairIndex[norm.symbol] != null) {
+                perPair[pairIndex[norm.symbol]] = norm;
+            } else {
+                pairIndex[norm.symbol] = perPair.length;
+                perPair.push(norm);
+            }
+            // Progressive render
+            _btRenderPairCards(perPair);
+            _btRenderPnlChart(perPair, perPair.reduce((a, r) => a + Number(r.total_pnl || 0), 0));
+        } catch (_) {}
+    });
+
+    es.addEventListener('done', (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            data.per_pair = (data.per_pair || []).map(_btNormalisePair);
+            _btRenderResults(data);
+            _btRenderMLInsights(data.per_pair);
+            const dur = data.duration_s != null ? ` in ${data.duration_s}s` : '';
+            _btSetStatus(`Done${dur}.`);
+        } catch (err) {
+            _btSetStatus('Stream ended but payload was unreadable.', true);
+        } finally {
+            cleanup();
+        }
+    });
+
+    es.addEventListener('error', (e) => {
+        // EventSource fires 'error' both for HTTP errors and on close. Treat
+        // it as fatal only if the connection is not OPEN.
+        let msg = 'stream error';
+        try {
+            if (e && e.data) msg = (JSON.parse(e.data).error || msg);
+        } catch (_) {}
+        if (es.readyState === EventSource.CLOSED) {
+            _btSetStatus('Backtest failed: ' + msg, true);
+            cleanup();
+        } else if (es.readyState === EventSource.CONNECTING) {
+            // transient — let the browser reconnect silently
+        } else {
+            _btSetStatus('Backtest failed: ' + msg, true);
+            cleanup();
+        }
+    });
+}

@@ -6,7 +6,7 @@
 <title>FORTIS AI Pro</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/core/css/dashboard.css">
+<link rel="stylesheet" href="/core/css/dashboard.css?v=20260415c">
 </head>
 <body>
 
@@ -47,7 +47,7 @@
             font-family="'Arial Black', 'Helvetica Neue', sans-serif"
             font-size="48" font-weight="900"
             fill="#1976D2" letter-spacing="-2"
-            filter="url(#glow)">AI PRO</text>
+            filter="url(#glow)">AGENT ZER0</text>
 
       <!-- Slogan -->
       <text x="12" y="80" text-anchor="start"
@@ -456,66 +456,98 @@
 
     <!-- BACKTEST RESULTS -->
     <div class="tab-panel" id="tab-backtest">
-      <div style="padding:20px;text-align:center;color:var(--txt2)">
-        <div style="font-size:14px;margin-bottom:10px">📊 Backtest Results</div>
-        <div style="font-size:12px;margin-bottom:20px">7-day historical validation (0.50 lot)</div>
-        
+      <div style="padding:20px;color:var(--txt2)">
+
+        <div style="text-align:center">
+          <div style="font-size:14px;margin-bottom:6px">📊 Backtest Results</div>
+          <div style="font-size:12px;margin-bottom:14px" id="bt-subtitle">Historical validation against MT5 M15 data</div>
+        </div>
+
+        <!-- Controls -->
+        <div style="display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;margin-bottom:16px;font-family:var(--mono);font-size:11px">
+          <label style="display:flex;align-items:center;gap:6px">
+            <span style="color:var(--txt3)">Days</span>
+            <input type="number" id="bt-days" min="1" max="60" value="7"
+                   style="width:60px;background:var(--bg1);border:1px solid var(--line);border-radius:4px;padding:4px 6px;color:var(--txt);font-family:inherit">
+          </label>
+          <label style="display:flex;align-items:center;gap:6px">
+            <span style="color:var(--txt3)">Lot</span>
+            <input type="number" id="bt-lot" min="0.01" step="0.01" value="0.50"
+                   style="width:70px;background:var(--bg1);border:1px solid var(--line);border-radius:4px;padding:4px 6px;color:var(--txt);font-family:inherit">
+          </label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" class="bt-pair" value="GBPJPY" checked> GBPJPY</label>
+            <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" class="bt-pair" value="EURJPY" checked> EURJPY</label>
+            <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" class="bt-pair" value="GBPUSD" checked> GBPUSD</label>
+            <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" class="bt-pair" value="EURUSD" checked> EURUSD</label>
+          </div>
+          <button class="btn start" id="bt-run" onclick="runBacktest()"
+                  style="padding:6px 14px">Run Backtest</button>
+        </div>
+
+        <!-- Status / error strip -->
+        <div id="bt-status" style="text-align:center;font-size:11px;color:var(--txt3);min-height:16px;margin-bottom:10px"></div>
+
+        <!-- Last-run summary banner (hidden until a run completes) -->
+        <div id="bt-summary-banner"
+             style="display:none;margin:0 0 14px;padding:10px 14px;border-radius:8px;
+                    background:linear-gradient(90deg,rgba(30,144,255,0.08),rgba(30,144,255,0.02));
+                    border:1px solid rgba(30,144,255,0.25);font-family:var(--mono);
+                    font-size:11px;color:var(--txt2);display:flex;gap:16px;flex-wrap:wrap;
+                    align-items:center;justify-content:center">
+          <span>🕒 Last run: <span id="bt-last-run" style="color:var(--txt)">—</span></span>
+          <span style="color:var(--txt3)">·</span>
+          <span>📅 Period: <span id="bt-period" style="color:var(--txt)">—</span></span>
+          <span style="color:var(--txt3)">·</span>
+          <span>⏱ Duration: <span id="bt-duration" style="color:var(--txt)">—</span></span>
+          <span style="color:var(--txt3)">·</span>
+          <span>🪙 Lot: <span id="bt-lot-summary" style="color:var(--txt)">—</span></span>
+        </div>
+
+        <!-- KPI grid -->
         <div class="kpi-grid">
           <div class="kpi-card">
             <div class="kpi-label">Total Trades</div>
-            <div class="kpi-value">468</div>
-            <div class="kpi-deco">backtest</div>
+            <div class="kpi-value" id="bt-total-trades">—</div>
+            <div class="kpi-deco" id="bt-total-trades-deco">backtest</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-label">Win Rate</div>
-            <div class="kpi-value">63.6%</div>
-            <div class="kpi-deco">aggregate</div>
+            <div class="kpi-value" id="bt-win-rate">—</div>
+            <div class="kpi-deco" id="bt-win-rate-deco">aggregate</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-label">Total P&L</div>
-            <div class="kpi-value">+$46,221</div>
-            <div class="kpi-deco">at 0.50 lot</div>
+            <div class="kpi-value" id="bt-total-pnl">—</div>
+            <div class="kpi-deco" id="bt-lot-label">at 0.50 lot</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-label">Avg/Trade</div>
-            <div class="kpi-value">+$98.76</div>
+            <div class="kpi-value" id="bt-avg-pnl">—</div>
             <div class="kpi-deco">profit per trade</div>
           </div>
         </div>
 
-        <div style="margin-top:30px;padding:20px;background:var(--bg0);border:1px solid var(--line);border-radius:8px;text-align:left">
-          <div style="font-weight:600;margin-bottom:12px;font-size:12px;color:var(--txt)">📈 Per-Pair Breakdown (0.50 lot)</div>
-          <div style="display:grid;gap:8px;font-size:11px;font-family:var(--mono)">
-            <div style="display:grid;grid-template-columns:100px 80px 80px 100px;gap:10px">
-              <div style="font-weight:500;color:var(--txt3)">Pair</div>
-              <div style="font-weight:500;color:var(--txt3)">Trades</div>
-              <div style="font-weight:500;color:var(--txt3)">Win Rate</div>
-              <div style="font-weight:500;color:var(--txt3)">Profit</div>
-            </div>
-            <div style="background:var(--bg1);padding:8px;border-radius:4px;display:grid;grid-template-columns:100px 80px 80px 100px;gap:10px">
-              <div>GBPJPY</div>
-              <div>149</div>
-              <div style="color:var(--green)">79.9%</div>
-              <div style="color:var(--green)">+$25,721</div>
-            </div>
-            <div style="background:var(--bg1);padding:8px;border-radius:4px;display:grid;grid-template-columns:100px 80px 80px 100px;gap:10px">
-              <div>EURJPY</div>
-              <div>118</div>
-              <div style="color:var(--green)">56.8%</div>
-              <div style="color:var(--green)">+$6,339</div>
-            </div>
-            <div style="background:var(--bg1);padding:8px;border-radius:4px;display:grid;grid-template-columns:100px 80px 80px 100px;gap:10px">
-              <div>GBPUSD</div>
-              <div>88</div>
-              <div style="color:var(--green)">61.4%</div>
-              <div style="color:var(--green)">+$8,345</div>
-            </div>
-            <div style="background:var(--bg1);padding:8px;border-radius:4px;display:grid;grid-template-columns:100px 80px 80px 100px;gap:10px">
-              <div>EURUSD</div>
-              <div>113</div>
-              <div style="color:var(--green)">51.3%</div>
-              <div style="color:var(--green)">+$5,416</div>
-            </div>
+        <!-- P&L contribution chart -->
+        <div style="margin-top:24px;padding:16px 20px;background:var(--bg0);border:1px solid var(--line);border-radius:8px">
+          <div style="font-weight:600;margin-bottom:10px;font-size:12px;color:var(--txt);display:flex;align-items:center;gap:8px">
+            <span>💰</span> P&L Contribution by Pair
+            <span style="color:var(--txt3);font-weight:400;font-size:10px">(horizontal bars scale to the biggest absolute P&L)</span>
+          </div>
+          <div id="bt-pnl-chart" style="display:flex;flex-direction:column;gap:6px;font-family:var(--mono);font-size:11px">
+            <div style="color:var(--txt3);padding:6px 0">Run a backtest to see contribution.</div>
+          </div>
+        </div>
+
+        <!-- Per-pair detail cards -->
+        <div style="margin-top:20px;padding:16px 20px;background:var(--bg0);border:1px solid var(--line);border-radius:8px">
+          <div style="font-weight:600;margin-bottom:12px;font-size:12px;color:var(--txt);display:flex;align-items:center;gap:8px">
+            <span>📈</span> Per-Pair Breakdown
+            <span id="bt-lot-label-2" style="color:var(--txt3);font-weight:400">(0.50 lot)</span>
+          </div>
+          <div id="bt-pairs-body"
+               style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;font-family:var(--mono);font-size:11px">
+            <div style="color:var(--txt3);padding:8px">Run a backtest to see per-pair results.</div>
           </div>
         </div>
       </div>
@@ -573,6 +605,6 @@
 
   </div>
 </div>
-<script src="/core/js/dashboard.js"></script>
+<script src="/core/js/dashboard.js?v=20260415c"></script>
 </body>
 </html>
