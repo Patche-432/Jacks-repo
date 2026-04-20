@@ -198,17 +198,19 @@ def _coerce_float(v, default: float = 0.0) -> float:
 # ========================================================================== #
 
 ENTRY_SYSTEM_PROMPT = (
-    "You are a professional day trader who specialises in trading GBPUSD, "
-    "GBPJPY, EURUSD and EURJPY.\n\n"
-    "Your main goal is to MAXIMISE winners and MINIMISE losers through "
-    "effective trade management. You can also gauge daily bias and use it to "
-    "filter signals.\n\n"
+    "You are a PROFESSIONAL DAY TRADER who specialises in GBPUSD, GBPJPY, "
+    "EURUSD and EURJPY — these four pairs are your bread and butter, the "
+    "cleanest London/NY sessions, and where your edge is strongest. You can "
+    "still review signals on other symbols the strategy presents, but you "
+    "know the core four best and trust setups on them most.\n\n"
+    "Your ONE job on entry: filter each strategy signal by DAILY BIAS.\n\n"
     "Daily bias rule (price vs today's daily open):\n"
     "  • current_price > daily_open → BULLISH → approve BUY only.\n"
     "  • current_price < daily_open → BEARISH → approve SELL only.\n"
     "  • current_price = daily_open → NEUTRAL → reject.\n\n"
     "If the signal's side agrees with the daily bias, APPROVE; otherwise "
-    "REJECT.\n\n"
+    "REJECT. Do not second-guess the strategy's setup or SL/TP — only the "
+    "bias gate decides.\n\n"
     "Reply with a single JSON object on one line:\n"
     "  {\"approve\": <bool>, \"confidence\": <0.0-1.0>, \"reason\": \"<=20 words\"}"
 )
@@ -281,11 +283,16 @@ class EntryReviewAgent:
 # ========================================================================== #
 
 RISK_SYSTEM_PROMPT = (
-    "You are a professional day trader who specialises in trading GBPUSD, "
-    "GBPJPY, EURUSD and EURJPY.\n\n"
-    "Your main goal is to MAXIMISE winners and MINIMISE losers through "
-    "effective trade management. You can also gauge daily bias and use it to "
-    "filter signals.\n\n"
+    "You are a PROFESSIONAL DAY TRADER who specialises in GBPUSD, GBPJPY, "
+    "EURUSD and EURJPY — these four pairs are your core edge, where you "
+    "read structure and volatility with the most confidence. You also "
+    "manage positions on other symbols the strategy takes, but the core "
+    "four are your primary book.\n\n"
+    "Your job: MAXIMISE winners, MINIMISE losers through active trade "
+    "management. You can only TIGHTEN a stop (never loosen) or request an "
+    "EARLY close. The broker's hard SL remains authoritative.\n\n"
+    "Use the structural cues (trend_intact, structure_broken, "
+    "fresh_structure) plus unrealised/peak P&L to decide.\n\n"
     "Reply with a single JSON object on one line:\n"
     "  {\"action\":\"hold|tighten|close_early\", \"new_sl\": <float or null>, "
     "\"reason\":\"<=20 words\"}"
@@ -406,5 +413,49 @@ def get_risk_agent() -> RiskReviewAgent:
 
 
 def agent_backend_enabled() -> bool:
-    """True if AI_BACKEND env var selects the Ollama agent."""
-    return os.getenv("AI_BACKEND", "deepseek").strip().lower() in ("agent", "ollama")
+    """
+    True if the Ollama agent is the active AI backend.
+
+    The agent is now the DEFAULT — set AI_BACKEND=deepseek explicitly to
+    revert to the HuggingFace LocalLLM path. Anything else (or unset) selects
+    the agent.
+    """
+    return os.getenv("AI_BACKEND", "agent").strip().lower() in ("agent", "ollama", "")
+
+
+def ollama_health() -> dict:
+    """
+    Best-effort probe of the Ollama server. Returns a small dict that the
+    dashboard can render — never raises.
+
+    {
+      "reachable":  bool,        # TCP + HTTP reachable
+      "model_loaded": bool,      # configured model shows up in /api/tags
+      "url":        str,         # base URL we tried
+      "model":      str,         # model name we tried
+      "error":      str|None,    # last error message, if any
+    }
+    """
+    client = OllamaClient()
+    out = {
+        "reachable": False,
+        "model_loaded": False,
+        "url": client.url,
+        "model": client.model,
+        "error": None,
+    }
+    try:
+        r = requests.get(f"{client.url}/api/tags", timeout=min(3.0, client.timeout))
+        r.raise_for_status()
+        out["reachable"] = True
+        try:
+            tags = r.json().get("models") or []
+            wanted = client.model.split(":")[0].lower()
+            out["model_loaded"] = any(
+                wanted in str(m.get("name", "")).lower() for m in tags
+            )
+        except Exception as exc:
+            out["error"] = f"bad /api/tags payload: {exc}"
+    except Exception as exc:
+        out["error"] = str(exc)
+    return out

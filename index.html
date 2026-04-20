@@ -61,7 +61,7 @@
 
   <div class="hdr-center">
     <button class="tab-btn active" data-tab="signals" onclick="showTab('signals', this)">Signals</button>
-    <button class="tab-btn" data-tab="thoughts" onclick="showTab('thoughts', this)">AI Log</button>
+    <button class="tab-btn" data-tab="thoughts" onclick="showTab('thoughts', this)">Zero Log</button>
     <button class="tab-btn" data-tab="positions" onclick="showTab('positions', this)">Positions</button>
     <button class="tab-btn" data-tab="history" onclick="showTab('history', this)">History</button>
     <button class="tab-btn" data-tab="performance" onclick="showTab('performance', this)">Performance</button>
@@ -369,7 +369,7 @@
       </div>
     </div>
 
-    <!-- AI LOG -->
+    <!-- ZERO LOG (formerly AI Log) -->
     <div class="tab-panel" id="tab-thoughts">
       <div class="thoughts-bar">
         <span class="thoughts-count" id="thought-count">0 entries</span>
@@ -525,6 +525,11 @@
             <div class="kpi-label">Avg/Trade</div>
             <div class="kpi-value" id="bt-avg-pnl">—</div>
             <div class="kpi-deco">profit per trade</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Max Drawdown</div>
+            <div class="kpi-value" id="bt-max-dd">—</div>
+            <div class="kpi-deco" id="bt-max-dd-deco">peak to trough</div>
           </div>
         </div>
 

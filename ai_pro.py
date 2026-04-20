@@ -90,24 +90,32 @@ def _save_credentials(login, password, server, path) -> None:
 # ============================================================ #
 
 _RULES_YAML = """
-allowed_symbols:
-  - GBPJPY
-  - EURJPY
-  - GBPUSD
-  - EURUSD
+# allowed_symbols: empty list = NO restriction (any symbol is tradable).
+# The agent filters per signal by daily bias — no code-level pair whitelist.
+allowed_symbols: []
 
 sessions:
   always: [0, 24]
 
 risk:
-  max_risk_per_trade_pct:  1.0
-  max_open_positions:      2    # hard cap per symbol: original entry + 1 add-on max
-  max_spread_points:       30
+  max_risk_per_trade_pct:   1.0
+  # Per-symbol cap on simultaneous open positions. 0 = UNLIMITED.
+  # Default 5 is a soft brake so a misfiring strategy can't stack 100 trades
+  # on one symbol before the broker's margin check catches up.
+  max_open_positions:       5
+  # Account-wide cap on simultaneous open positions across all symbols.
+  # 0 = UNLIMITED. Provides a global ceiling on total exposure.
+  max_open_positions_total: 20
+  # Circuit breaker: halt new entries for the rest of today (UTC) once
+  # realised P&L for the day drops below -N% of the start-of-day balance.
+  # 0 = DISABLED. Existing positions keep being managed.
+  max_daily_loss_pct:       3.0
+  max_spread_points:        30
 
 entry:
   min_confluence_signals: 1
   allow_counter_trend:    false
-  allow_pyramiding:       true   # add-on allowed only when existing position is in profit + same direction
+  allow_pyramiding:       true   # no direction/profit guard; agent bias is the sole filter
 
 exit:
   trailing_stop_fraction:    0.50
@@ -384,7 +392,11 @@ class TradingRules:
 
         risk: dict = raw.get("risk") or {}
         self.max_risk_per_trade_pct: float         = float(risk.get("max_risk_per_trade_pct", 1.0))
-        self.max_open_positions: int               = int(risk.get("max_open_positions", 1))
+        # 0 = unlimited for both caps (per-symbol and account-wide).
+        self.max_open_positions: int               = int(risk.get("max_open_positions", 5))
+        self.max_open_positions_total: int         = int(risk.get("max_open_positions_total", 20))
+        # 0 = daily loss circuit breaker disabled.
+        self.max_daily_loss_pct: float             = float(risk.get("max_daily_loss_pct", 0.0))
         self.max_spread_points: int                = int(risk.get("max_spread_points", 30))
 
         entry: dict = raw.get("entry") or {}
@@ -1226,172 +1238,75 @@ class AI_Pro:
         else:
             fresh_struct = {"fresh_structure": False, "structure_type": None}
 
-        # ---------- Agent backend (Ollama; tighten/close_early only) ----------
-        if _AGENT_IMPORT_OK and _ai_agent and _ai_agent.agent_backend_enabled():
-            try:
-                log_thought(
-                    "ai_risk", symbol, "review_start",
-                    f"Asking Ollama agent about #{ticket} {direction} "
-                    f"({profit_pts:+.0f}pts, peak {peak:.0f}pts)",
-                    detail=(f"entry={entry:.5f} price={cur_price:.5f} "
-                            f"SL={cur_sl:.5f} TP={cur_tp:.5f}"),
-                )
-                ctx = _ai_agent.PositionContext(
-                    symbol=symbol, ticket=ticket, side=direction,
-                    entry=entry, cur_price=cur_price, cur_sl=cur_sl,
-                    cur_tp=cur_tp, profit_pts=profit_pts, peak_pts=peak,
-                    atr=atr, digits=digits,
-                    trend_intact=hh_ll_status.get("trend_intact"),
-                    structure_broken=structure_status.get("structure_broken"),
-                    fresh_structure=fresh_struct.get("fresh_structure"),
-                    notes=(f"trend_reason={hh_ll_status.get('reason','')} "
-                           f"struct_reason={structure_status.get('reason','')}"),
-                )
-                verdict = _ai_agent.get_risk_agent().review(ctx)
-                action  = str(verdict.get("action", "hold"))
-                reason  = str(verdict.get("reason", ""))[:120]
-
-                if action == "close":
-                    log_thought(
-                        "ai_risk", symbol, "close",
-                        f"#{ticket} — agent says CLOSE: {reason[:80]}",
-                        action="close",
-                    )
-                    return {"action": "close", "ticket": ticket,
-                            "reason": reason}
-
-                if action == "move_sl":
-                    new_sl = verdict.get("new_sl")
-                    log_thought(
-                        "ai_risk", symbol, "move_sl",
-                        f"#{ticket} {direction} — agent tighten: "
-                        f"SL -> {new_sl} | {reason[:60]}",
-                        action="move_sl",
-                    )
-                    return {"action": "move_sl", "ticket": ticket,
-                            "new_sl": new_sl, "reason": reason}
-
-                # hold (hard broker SL still fires — agent has no override)
-                log_thought(
-                    "ai_risk", symbol, "hold",
-                    f"#{ticket} agent holding — broker SL still active. {reason[:80]}",
-                    action="hold",
-                )
-                return None
-            except Exception as exc:
-                log_thought(
-                    "ai_risk", symbol, "error",
-                    f"#{ticket} agent error: {exc} — falling back to DeepSeek",
-                    action="hold",
-                )
-                # fall through to DeepSeek path below
-
-        prompt = f"""You are an AI risk manager for AI_Pro forex strategy.
-
-PRIMARY OBJECTIVE: Find and HOLD winning setups for maximum profit. Only tighten or close if
-the setup shows structural failure.
-
-POSITION:
-  Symbol:        {symbol}
-  Direction:     {direction}
-  Entry:         {entry:.5f}
-  Current price: {cur_price:.5f}
-  Current SL:    {cur_sl:.5f}
-  Current TP:    {cur_tp:.5f}
-  Profit (pts):  {profit_pts:.1f}
-  Peak profit:   {peak:.1f} pts
-  ATR (M15):     {atr:.5f}
-
-TREND ANALYSIS:
-  Trend intact (HH/LL):     {hh_ll_status["trend_intact"]} ({hh_ll_status["reason"]})
-  Structure broken:         {structure_status["structure_broken"]} ({structure_status["reason"]})
-  FRESH STRUCTURE:          {fresh_struct["fresh_structure"]} (Type: {fresh_struct["structure_type"]})
-
-YOUR JOB: Decide what to do with the STOP LOSS to maximise profit.
-Options: "hold" | "trail" | "tighten" | "close"
-Rules:
-- For BUY:  new_sl MUST be below current price {cur_price:.5f}
-- For SELL: new_sl MUST be above current price {cur_price:.5f}
-- new_sl must be BETTER than current SL {cur_sl:.5f}
-- HOLD is the default. ONLY recommend "close" if structure is broken.
-- **FRESH STRUCTURE = MOVE**: When FRESH_STRUCTURE is True (HH/HL/LL/LH formed), recommend "trail" immediately
-- If fresh structure detected AND profit > 3pts: "trail" to lock gains
-- If profit < 5 pts AND no fresh structure yet: "hold"
-- If trend intact (HH/LL pattern good): HOLD -- let it run
-- If trend broken (few HH or LL) AND no fresh structure: consider "tighten" ONLY if profit > 20pts
-- If structure broken AND profit < 5pts: still HOLD -- protect the winner
-- If profit > 15pts, HOLD through retracements UNLESS structure actually breaks
-
-Respond ONLY with JSON:
-{{"action":"hold","new_sl":null,"reason":"short reason"}}"""
-
-        log_thought("ai_risk", symbol, "review_start",
-                    f"Asking DeepSeek about #{ticket} {direction} "
-                    f"({profit_pts:+.0f}pts, peak {peak:.0f}pts)",
-                    detail=f"entry={entry:.5f} price={cur_price:.5f} "
-                           f"SL={cur_sl:.5f} TP={cur_tp:.5f}")
-        try:
-            raw    = self._get_llm().generate(prompt, max_new_tokens=1024)
-            parsed = _extract_json(raw, want_keys=("action",))
-            parse_source = "json"
-            if not isinstance(parsed, dict):
-                # Reasoning model never emitted clean JSON — keyword fallback
-                # always returns a verdict (defaults to hold), so we keep going.
-                parsed = _keyword_fallback_risk(raw)
-                parse_source = "keyword_fallback"
-                preview = (raw or "")[:300].replace("\n", " ")
-                log_thought("ai_risk", symbol, "parse_fallback",
-                            f"#{ticket} — used keyword fallback ({parsed.get('action','hold')})",
-                            detail=f"raw_preview={preview}")
-            if not isinstance(parsed, dict):
-                # Should be unreachable now, but guard anyway
-                log_thought("ai_risk", symbol, "parse_fail",
-                            f"#{ticket} — no verdict, holding")
-                return None
-
-            ai_action = str(parsed.get("action", "hold")).lower()
-            ai_sl     = parsed.get("new_sl")
-            ai_reason = str(parsed.get("reason", ""))
-
-            if ai_action == "close":
-                log_thought("ai_risk", symbol, "close",
-                            f"#{ticket} — AI says CLOSE: {ai_reason[:80]}",
-                            action="close")
-                return {"action": "close", "ticket": ticket,
-                        "reason": f"AI: {ai_reason}"}
-
-            if ai_action in ("trail", "tighten") and ai_sl is not None:
-                try:
-                    new_sl = round(float(ai_sl), digits)
-                    wrong_side = (
-                        (is_buy  and new_sl >= cur_price) or
-                        (not is_buy and new_sl <= cur_price)
-                    )
-                    not_better = (
-                        (is_buy  and new_sl <= cur_sl and cur_sl != 0) or
-                        (not is_buy and new_sl >= cur_sl and cur_sl != 0)
-                    )
-                    if wrong_side or not_better:
-                        return None
-                    log_thought("ai_risk", symbol, "move_sl",
-                                f"#{ticket} {direction} — AI {ai_action}: "
-                                f"SL -> {new_sl:.5f} | {ai_reason[:60]}",
-                                action="move_sl")
-                    return {"action": "move_sl", "ticket": ticket,
-                            "new_sl": new_sl,
-                            "reason": f"AI {ai_action}: {ai_reason}"}
-                except (TypeError, ValueError):
-                    pass
-
-            log_thought("ai_risk", symbol, "hold",
-                        f"#{ticket} holding ({parse_source}) — {ai_reason[:80]}",
-                        action="hold",
-                        detail=f"source={parse_source}")
+        # ---------- Single-path agent risk review ----------
+        # The Ollama agent is the sole risk manager. It can only TIGHTEN a
+        # stop or request an EARLY close — never loosen, never override the
+        # broker's hard SL. On any agent failure we HOLD (broker hard SL
+        # remains authoritative), we never guess with a fallback LLM.
+        if not (_AGENT_IMPORT_OK and _ai_agent is not None):
+            log_thought("ai_risk", symbol, "error",
+                        f"#{ticket} agent module unavailable — holding "
+                        f"(broker SL still active).",
+                        action="hold")
             return None
 
+        try:
+            log_thought(
+                "ai_risk", symbol, "review_start",
+                f"Asking Ollama agent about #{ticket} {direction} "
+                f"({profit_pts:+.0f}pts, peak {peak:.0f}pts)",
+                detail=(f"entry={entry:.5f} price={cur_price:.5f} "
+                        f"SL={cur_sl:.5f} TP={cur_tp:.5f}"),
+            )
+            ctx = _ai_agent.PositionContext(
+                symbol=symbol, ticket=ticket, side=direction,
+                entry=entry, cur_price=cur_price, cur_sl=cur_sl,
+                cur_tp=cur_tp, profit_pts=profit_pts, peak_pts=peak,
+                atr=atr, digits=digits,
+                trend_intact=hh_ll_status.get("trend_intact"),
+                structure_broken=structure_status.get("structure_broken"),
+                fresh_structure=fresh_struct.get("fresh_structure"),
+                notes=(f"trend_reason={hh_ll_status.get('reason','')} "
+                       f"struct_reason={structure_status.get('reason','')}"),
+            )
+            verdict = _ai_agent.get_risk_agent().review(ctx)
+            action  = str(verdict.get("action", "hold"))
+            reason  = str(verdict.get("reason", ""))[:120]
+
+            if action == "close":
+                log_thought(
+                    "ai_risk", symbol, "close",
+                    f"#{ticket} — agent says CLOSE: {reason[:80]}",
+                    action="close",
+                )
+                return {"action": "close", "ticket": ticket,
+                        "reason": reason}
+
+            if action == "move_sl":
+                new_sl = verdict.get("new_sl")
+                log_thought(
+                    "ai_risk", symbol, "move_sl",
+                    f"#{ticket} {direction} — agent tighten: "
+                    f"SL -> {new_sl} | {reason[:60]}",
+                    action="move_sl",
+                )
+                return {"action": "move_sl", "ticket": ticket,
+                        "new_sl": new_sl, "reason": reason}
+
+            # hold (hard broker SL still fires — agent has no override)
+            log_thought(
+                "ai_risk", symbol, "hold",
+                f"#{ticket} agent holding — broker SL still active. {reason[:80]}",
+                action="hold",
+            )
+            return None
         except Exception as exc:
-            log_thought("ai_risk", symbol, "error",
-                        f"#{ticket} AI error: {exc}", action="hold")
+            log_thought(
+                "ai_risk", symbol, "error",
+                f"#{ticket} agent error: {exc} — holding "
+                f"(broker SL still active).",
+                action="hold",
+            )
             return None
 
     def run_ai_risk_manager(self, symbol: str) -> list:
@@ -1863,138 +1778,58 @@ Respond ONLY with JSON:
     def _ai_review_signal(self, symbol: str, signal: dict,
                            df: pd.DataFrame) -> dict:
         """
-        Sends the AI Pro signal to the configured reviewer for approval.
-        Returns {"approve": bool, "reason": str, "confidence": float}.
+        Single-path entry review via the Ollama agent (ai_agent.py).
+        The agent filters each raw signal by DAILY BIAS and returns:
+          {"approve": bool, "reason": str, "confidence": float}
 
-        When AI_BACKEND=agent/ollama the review is delegated to the Ollama
-        agent in ai_agent.py, which applies a hard HTF bias gate before
-        asking the LLM anything.  On any failure we fall back to DeepSeek.
+        There is NO fallback LLM. If the agent module is missing or the
+        agent raises, we return a safe REJECT — never a default approve.
+        The broker-side hard SL remains authoritative regardless.
         """
-        # ---------- Agent backend (Ollama + HTF bias gate) ----------
-        if _AGENT_IMPORT_OK and _ai_agent and _ai_agent.agent_backend_enabled():
-            try:
-                direction = signal.get("signal", "")
-                env       = signal.get("signal_source", "unknown")
-                log_thought(
-                    "ai_entry", symbol, "review_start",
-                    f"Sending {direction} [{env}] to Ollama agent for review",
-                    detail=str(signal.get("reason", ""))[:120],
-                    action=direction.lower() if direction else None,
-                )
-                verdict = _ai_agent.get_entry_agent().review(symbol, signal, df)
-                approve = bool(verdict.get("approve", False))
-                reason  = str(verdict.get("reason", "")).strip() or "no reason"
-                ai_conf = float(verdict.get("confidence", 0.0) or 0.0)
-                gate    = verdict.get("gate", "?")
-                log_thought(
-                    "ai_entry", symbol, "verdict",
-                    f"Ollama agent {'APPROVED' if approve else 'REJECTED'} "
-                    f"({gate}): {reason[:80]}",
-                    detail=(f"{direction} [{env}] conf={ai_conf:.2f} | "
-                            f"htf={verdict.get('htf_detail','?')}"),
-                    action=direction.lower() if approve else "hold",
-                    confidence=ai_conf,
-                )
-                return {"approve": approve, "reason": reason, "confidence": ai_conf}
-            except Exception as exc:
-                log_thought(
-                    "ai_entry", symbol, "error",
-                    f"Ollama agent error: {exc} — falling back to DeepSeek",
-                )
-                # fall through to DeepSeek path below
+        direction = signal.get("signal", "")
+        env       = signal.get("signal_source", "unknown")
 
-        records      = _load_memory()
-        history      = _memory_summary(records)
-        env          = signal.get("signal_source", "unknown")
-        direction    = signal["signal"]
-        entry        = signal.get("entry_price", 0)
-        sl           = signal.get("stop_loss",   0)
-        tp           = signal.get("take_profit", 0)
-        confidence   = signal.get("confidence",  0)
-        reason_txt   = signal.get("reason",      "")
-        pdh          = signal.get("previous_day_high", 0)
-        pdl          = signal.get("previous_day_low",  0)
-        atr          = signal.get("atr", 0)
+        # Hard guard — agent module must be importable.
+        if not (_AGENT_IMPORT_OK and _ai_agent is not None):
+            log_thought(
+                "ai_entry", symbol, "error",
+                "Agent module unavailable — rejecting signal (no fallback LLM).",
+                action="hold", confidence=0.0,
+            )
+            return {"approve": False,
+                    "reason": "agent module unavailable — safe reject",
+                    "confidence": 0.0}
 
-        prompt = f"""You are reviewing a AI_Pro trade signal.
-
-SIGNAL:
-  Symbol:      {symbol}
-  Direction:   {direction}
-  Environment: {env}
-  Confidence:  {confidence}%
-  Reason:      {reason_txt[:200]}
-
-LEVELS:
-  Entry:           {entry:.5f}
-  Stop Loss:       {sl:.5f}
-  Take Profit:     {tp:.5f}
-  Prev Day High:   {pdh:.5f}
-  Prev Day Low:    {pdl:.5f}
-  ATR:             {atr}
-
-RECENT TRADE HISTORY: {history}
-
-DECISION: Should this AI Pro signal be taken?
-Consider: is price genuinely near the key level?
-
-Reply ONLY with JSON:
-{{"approve":true,"reason":"brief reason","confidence":0.0}}"""
-
-        log_thought("ai_entry", symbol, "review_start",
-                    f"Sending {direction} [{env}] to DeepSeek-R1 for review",
-                    detail=reason_txt[:120], action=direction.lower())
         try:
-            raw    = self._get_llm().generate(prompt, max_new_tokens=1024)
-            parsed = _extract_json(raw, want_keys=("approve",))
-            parse_source = "json"
-            if not isinstance(parsed, dict):
-                parsed = _keyword_fallback_entry(raw)
-                parse_source = "keyword_fallback"
-                preview = (raw or "")[:300].replace("\n", " ")
-                verdict_str = "APPROVE" if parsed.get("approve") else "REJECT"
-                log_thought("ai_entry", symbol, "parse_fallback",
-                            f"DeepSeek-R1 didn't emit clean JSON — keyword fallback says {verdict_str}",
-                            detail=f"raw_preview={preview}",
-                            action=direction.lower())
-            strategy_conf = _normalize_confidence(confidence, default=0.0)
-            llm_verdict   = _coerce_bool(parsed.get("approve", True), default=True)
-            ai_reason     = str(parsed.get("reason", "")).strip() or "No reason provided"
-            ai_conf       = _normalize_confidence(parsed.get("confidence", 0.6), default=0.6)
-            approve       = llm_verdict
-
-            if llm_verdict:
-                if ai_conf < self.CONFIDENCE_THRESHOLD:
-                    approve = strategy_conf >= self.CONFIDENCE_THRESHOLD
-                    if approve:
-                        ai_reason = (
-                            f"Low AI confidence ({ai_conf:.0%}), "
-                            "but strategy setup remains valid"
-                        )
-                    else:
-                        ai_reason = f"Confidence too low ({ai_conf:.0%})"
-            elif ai_conf < self.CONFIDENCE_THRESHOLD:
-                approve = True
-                ai_reason = (
-                    f"Weak AI rejection ({ai_conf:.0%}) overridden by "
-                    f"strategy confidence ({strategy_conf:.0%})"
-                )
-
+            log_thought(
+                "ai_entry", symbol, "review_start",
+                f"Sending {direction} [{env}] to Ollama agent for review",
+                detail=str(signal.get("reason", ""))[:120],
+                action=direction.lower() if direction else None,
+            )
+            verdict    = _ai_agent.get_entry_agent().review(symbol, signal, df)
+            approve    = bool(verdict.get("approve", False))
+            reason     = str(verdict.get("reason", "")).strip() or "no reason"
+            ai_conf    = float(verdict.get("confidence", 0.0) or 0.0)
+            htf_detail = str(verdict.get("htf_detail", "?"))
             log_thought(
                 "ai_entry", symbol, "verdict",
-                f"DeepSeek-R1 {'APPROVED' if approve else 'REJECTED'} ({parse_source}): {ai_reason[:80]}",
-                detail=f"{direction} [{env}] conf={ai_conf:.2f} | source={parse_source}",
+                f"Ollama agent {'APPROVED' if approve else 'REJECTED'}: {reason[:80]}",
+                detail=(f"{direction} [{env}] conf={ai_conf:.2f} | "
+                        f"htf={htf_detail}"),
                 action=direction.lower() if approve else "hold",
                 confidence=ai_conf,
             )
-            return {"approve": approve, "reason": ai_reason,
-                    "confidence": ai_conf}
-
+            return {"approve": approve, "reason": reason, "confidence": ai_conf}
         except Exception as exc:
-            log_thought("ai_entry", symbol, "error",
-                        f"DeepSeek-R1 error: {exc} — default approve")
-            return {"approve": True, "reason": f"DeepSeek-R1 error — default approve",
-                    "confidence": 0.6}
+            log_thought(
+                "ai_entry", symbol, "error",
+                f"Agent error: {exc} — rejecting signal (no fallback LLM).",
+                action="hold", confidence=0.0,
+            )
+            return {"approve": False,
+                    "reason": f"agent error: {exc!s} — safe reject",
+                    "confidence": 0.0}
 
     # ------------------------------------------------------------------ #
     # HTF bias detection                                                   #
@@ -2209,7 +2044,7 @@ Reply ONLY with JSON:
             return self._neutral(symbol, f"Low confidence ({signal['confidence']}% < {MIN_CONFIDENCE_THRESHOLD}%)")
 
         log_thought(
-            "ai_pro_signal", symbol, "signal",
+            "strategy", symbol, "signal",
             f"Signal: {signal['signal']} [{signal.get('signal_source','—')}] "
             f"conf={signal['confidence']}% "
             f"AI={'AI verified' if signal.get('ai_approved') else '✗' if signal.get('ai_approved') is False else '—'}",
@@ -2249,7 +2084,7 @@ Reply ONLY with JSON:
     # ------------------------------------------------------------------ #
 
     def execute_trade(self, symbol: str, signal: dict,
-                       lot_size: float = 0.01) -> dict:
+                       lot_size: float = 0.50) -> dict:
         import MetaTrader5 as mt5
         if not self._ensure_mt5():
             return {"success": False, "message": "MT5 not initialized"}
@@ -2284,18 +2119,9 @@ Reply ONLY with JSON:
         price      = tick.ask if is_buy else tick.bid
         sl         = round(signal["stop_loss"],   digits)
 
-        # Direction guard: if a position is already open on this symbol the new
-        # order MUST be in the same direction. This makes add-ons impossible to
-        # fire against an existing trade regardless of what the signal says.
-        existing_positions = mt5.positions_get(symbol=symbol) or []
-        for ep in existing_positions:
-            existing_dir = "BUY" if ep.type == mt5.ORDER_TYPE_BUY else "SELL"
-            if existing_dir != signal["signal"]:
-                log_thought("execution", symbol, "pyramid_blocked",
-                            f"Add-on blocked — existing {existing_dir} vs new signal {signal['signal']}",
-                            action="hold")
-                return {"success": False,
-                        "message": f"Pyramid blocked: existing {existing_dir} vs new {signal['signal']}"}
+        # No direction guard — raw signals approved by the agent's daily-bias
+        # filter execute regardless of any existing position's direction. The
+        # agent (not code) is the sole gate on whether a new trade opens.
         tp         = round(signal["take_profit"], digits)
         filling    = self._get_filling_mode(symbol)
 
@@ -2359,14 +2185,23 @@ Reply ONLY with JSON:
     # ------------------------------------------------------------------ #
 
     def run_strategy(self, symbol: str, auto_trade: bool = False,
-                     lot_size: float = 0.01) -> dict:
+                     lot_size: float = 0.50) -> dict:
         """
-        Full cycle:
-          1. Partial close + breakeven (AI Pro native)
-          2. AI risk manager (rule-based + Qwen)
-          3. AI Pro signal generation
-          4. AI signal review (Qwen gate)
-          5. Auto-execution if AI approved (confidence pre-filtered to >= 75)
+        Workflow: STRATEGY → AGENT → MARKET
+
+          STRATEGY (rule engine — untouched):
+            1. Partial close + breakeven management on existing positions
+            2. Generate fresh M15 signal via AI_Pro rules
+
+          AGENT (Ollama — gates + manages):
+            3. Risk review of open positions (tighten SL / close early only;
+               broker's hard SL remains authoritative)
+            4. Entry review — agent filters the signal by DAILY BIAS
+               (daily open vs current price) and approves or rejects
+
+          MARKET (broker):
+            5. Auto-execute approved signals via MT5 (no hard-coded symbol
+               whitelist — any configured symbol is tradable)
         """
         log.info("=" * 65)
         log.info("AI Pro — %s", symbol)
@@ -2466,6 +2301,95 @@ def _check_hard_rules(rules, symbol: str, positions,
     return None
 
 
+# ---------------------------------------------------------------- #
+# Daily loss circuit breaker                                        #
+# ---------------------------------------------------------------- #
+#
+# We cache the start-of-UTC-day equity the first time we're asked on a
+# given UTC date. Today's realised P&L is computed from MT5 closed deals
+# only (open positions' floating P&L is NOT counted — we don't want a
+# temporary drawdown on an open position to halt new entries).
+
+_daily_pnl_lock: threading.Lock = threading.Lock()
+_daily_pnl_state: dict          = {"date": None, "start_balance": None}
+
+
+def _utc_day_start():
+    """Return datetime at 00:00 UTC today."""
+    now = datetime.now(timezone.utc)
+    return datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+
+
+def _today_realised_pnl(mt5) -> float:
+    """Sum of closed-deal profit+swap+commission since UTC midnight."""
+    try:
+        deals = list(mt5.history_deals_get(_utc_day_start(),
+                                            datetime.now(timezone.utc)) or [])
+    except Exception:
+        return 0.0
+    pnl = 0.0
+    for d in deals:
+        pnl += float(getattr(d, "profit", 0.0) or 0.0)
+        pnl += float(getattr(d, "swap", 0.0) or 0.0)
+        pnl += float(getattr(d, "commission", 0.0) or 0.0)
+    return pnl
+
+
+def _daily_loss_breach(mt5, rules) -> Optional[str]:
+    """
+    If today's realised losses exceed max_daily_loss_pct of the
+    start-of-day balance, return a human-readable message.  Otherwise
+    return None.  Returns None immediately if the breaker is disabled
+    (max_daily_loss_pct == 0).
+    """
+    limit_pct = float(getattr(rules, "max_daily_loss_pct", 0.0) or 0.0)
+    if limit_pct <= 0:
+        return None
+
+    global _daily_pnl_state
+    today = _utc_day_start().date()
+    try:
+        acc = mt5.account_info()
+    except Exception:
+        return None
+    if acc is None:
+        return None
+    cur_balance = float(getattr(acc, "balance", 0.0) or 0.0)
+    if cur_balance <= 0:
+        return None
+
+    with _daily_pnl_lock:
+        if _daily_pnl_state["date"] != today:
+            # First call on a new UTC day — anchor start-of-day balance
+            # using balance MINUS any P&L already realised today (so it
+            # reflects the actual day-open balance even if the bot started
+            # mid-session).
+            realised = _today_realised_pnl(mt5)
+            _daily_pnl_state = {
+                "date": today,
+                "start_balance": cur_balance - realised,
+            }
+        start_balance = float(_daily_pnl_state["start_balance"] or 0.0)
+
+    if start_balance <= 0:
+        return None
+
+    pnl = _today_realised_pnl(mt5)
+    loss_pct = (-pnl / start_balance) * 100.0 if pnl < 0 else 0.0
+    if loss_pct >= limit_pct:
+        return (f"Daily loss {loss_pct:.2f}% ≥ limit {limit_pct:.2f}% "
+                f"(P&L={pnl:+.2f}, start-bal={start_balance:.2f}) — "
+                f"new entries paused until 00:00 UTC")
+    return None
+
+
+def _count_all_open_positions(mt5) -> int:
+    try:
+        return len(list(mt5.positions_get() or []))
+    except Exception:
+        return 0
+
+
 # ============================================================ #
 # SECTION 10 — BOT (multi-symbol trading loop)                 #
 # ============================================================ #
@@ -2474,7 +2398,7 @@ class Bot:
     def __init__(
         self,
         symbols:   list  = None,
-        volume:    float = 0.01,
+        volume:    float = 0.50,
         poll_secs: float = 300.0,
         auto_trade: bool = True,
         use_ai:    bool  = True,
@@ -2652,22 +2576,10 @@ class Bot:
                     self._results[symbol] = blocked_result
                 return
 
-            max_pos = rules.max_open_positions
-            if len(positions) >= max_pos:
-                # Hard cap hit — manage only, never add more.
-                log.info("[%s] At hard cap (%d positions)", symbol, max_pos)
-                try:
-                    self._strategy.check_partial_close_and_breakeven(symbol)
-                except Exception as exc:
-                    log.error("[%s] partial/BE check failed: %s", symbol, exc)
-                try:
-                    self._strategy.run_ai_risk_manager(symbol)
-                except Exception as exc:
-                    log.error("[%s] AI risk manager failed: %s", symbol, exc)
-                return
-
+            # ALWAYS manage existing positions first (partial close /
+            # breakeven / agent risk review). This runs regardless of any
+            # circuit breakers below — we never abandon open trades.
             if positions:
-                # 1 position open, under hard cap — always run managers first.
                 try:
                     self._strategy.check_partial_close_and_breakeven(symbol)
                 except Exception as exc:
@@ -2677,37 +2589,62 @@ class Bot:
                 except Exception as exc:
                     log.error("[%s] AI risk manager failed: %s", symbol, exc)
 
-                # Add-on only allowed when pyramiding is enabled AND the existing
-                # position is currently in profit (never average into a loser).
-                if not rules.allow_pyramiding:
-                    return
+            # ------------------------------------------------------------
+            # Circuit breakers — block NEW entries only (managers above
+            # keep running). Each check falls through to run_strategy with
+            # auto_trade=False so the UI still sees the signal but no
+            # order fires.
+            # ------------------------------------------------------------
+            auto_trade_effective = self.auto_trade
+            pause_reason: Optional[str] = None
 
+            # (a) Daily loss breaker
+            loss_msg = _daily_loss_breach(mt5, rules)
+            if loss_msg:
+                pause_reason = loss_msg
+
+            # (b) Per-symbol cap (0 = unlimited)
+            if pause_reason is None:
+                per_cap = int(getattr(rules, "max_open_positions", 0) or 0)
+                if per_cap > 0 and len(positions) >= per_cap:
+                    pause_reason = (f"Per-symbol cap reached "
+                                    f"({len(positions)}/{per_cap}) — managing only")
+
+            # (c) Account-wide cap (0 = unlimited)
+            if pause_reason is None:
+                total_cap = int(getattr(rules, "max_open_positions_total", 0) or 0)
+                if total_cap > 0:
+                    total_open = _count_all_open_positions(mt5)
+                    if total_open >= total_cap:
+                        pause_reason = (f"Account-wide cap reached "
+                                        f"({total_open}/{total_cap}) — managing only")
+
+            # (d) Ollama liveness — if the agent is the backend and Ollama
+            #     is unreachable, pause new entries (agent individually
+            #     rejects, but this gives us a clearer single log line and
+            #     avoids burning 30s timeouts per symbol).
+            if (pause_reason is None
+                    and _AGENT_IMPORT_OK
+                    and _ai_agent is not None
+                    and _ai_agent.agent_backend_enabled()):
                 try:
-                    pos      = positions[0]
-                    tick_    = mt5.symbol_info_tick(symbol)
-                    info_    = mt5.symbol_info(symbol)
-                    point_   = float(getattr(info_, "point", 1e-5) or 1e-5)
-                    if tick_ is None:
-                        return
-                    cur_price = float(tick_.bid if pos.type == mt5.ORDER_TYPE_BUY
-                                      else tick_.ask)
-                    profit_pts = ((cur_price - float(pos.price_open)) / point_
-                                  if pos.type == mt5.ORDER_TYPE_BUY
-                                  else (float(pos.price_open) - cur_price) / point_)
-                    if profit_pts <= 0:
-                        log.info("[%s] Add-on blocked — existing position not in profit (%.1f pts)",
-                                 symbol, profit_pts)
-                        return
-                    log.info("[%s] Position in profit (%.1f pts) — checking for add-on signal",
-                             symbol, profit_pts)
-                except Exception as exc:
-                    log.error("[%s] Pyramid profit check failed: %s", symbol, exc)
-                    return
-                # Fall through to run_strategy → execute_trade will enforce direction match
+                    health = _ai_agent.ollama_health()
+                    if not health.get("reachable"):
+                        pause_reason = (f"Ollama unreachable "
+                                        f"({health.get('error','?')[:80]}) — "
+                                        f"new entries paused")
+                except Exception:
+                    pass  # best-effort; don't block on a probe error
+
+            if pause_reason:
+                auto_trade_effective = False
+                log_thought("preflight", symbol, "paused",
+                            pause_reason, action="hold")
+                log.info("[%s] New entries paused: %s", symbol, pause_reason)
 
         result = self._strategy.run_strategy(
             symbol=symbol,
-            auto_trade=self.auto_trade,
+            auto_trade=auto_trade_effective if rules else self.auto_trade,
             lot_size=self.volume,
         )
 
@@ -2782,7 +2719,7 @@ _bot_thread: Optional[threading.Thread] = None
 _bot_last_error: Optional[str] = None
 _last_bot_config: dict = {
     "symbols":    ["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
-    "volume":     0.01,
+    "volume":     0.50,
     "poll_secs":  180.0,
 
     "auto_trade": True,
@@ -3133,6 +3070,29 @@ def bot_status():
                 "confidence": signal["confidence"] / 100,
                 "ai_reason":  signal.get("ai_reason"),
             }
+    # ---- Active AI backend + liveness summary ----
+    # Agent is the default. We report which backend is currently selected
+    # and, if it's the agent, whether the Ollama server is actually up so
+    # the dashboard can warn the user before a trade gets reviewed.
+    ai_backend = {
+        "active":       "deepseek",      # overwritten below when agent is on
+        "agent_import": bool(_AGENT_IMPORT_OK),
+    }
+    try:
+        if _AGENT_IMPORT_OK and _ai_agent:
+            if _ai_agent.agent_backend_enabled():
+                ai_backend["active"] = "agent"
+            health = _ai_agent.ollama_health()
+            ai_backend.update({
+                "ollama_reachable":   bool(health.get("reachable")),
+                "ollama_model":       health.get("model"),
+                "ollama_model_loaded": bool(health.get("model_loaded")),
+                "ollama_url":         health.get("url"),
+                "ollama_error":       health.get("error"),
+            })
+    except Exception as _exc:
+        ai_backend["error"] = str(_exc)
+
     return jsonify({
         "running": running,
         "bot": {
@@ -3147,7 +3107,35 @@ def bot_status():
         "bot_error": _bot_last_error,
         "all_decisions":  all_decisions,
         "open_positions": open_positions,
+        "ai_backend": ai_backend,
     })
+
+
+@app.route("/bot/ai_backend")
+def bot_ai_backend():
+    """
+    Lightweight probe for the dashboard to show which AI backend is live and
+    whether the Ollama server is actually reachable. Safe to poll.
+    """
+    out = {
+        "active":       "deepseek",
+        "agent_import": bool(_AGENT_IMPORT_OK),
+    }
+    try:
+        if _AGENT_IMPORT_OK and _ai_agent:
+            if _ai_agent.agent_backend_enabled():
+                out["active"] = "agent"
+            h = _ai_agent.ollama_health()
+            out.update({
+                "ollama_reachable":   bool(h.get("reachable")),
+                "ollama_model":       h.get("model"),
+                "ollama_model_loaded": bool(h.get("model_loaded")),
+                "ollama_url":         h.get("url"),
+                "ollama_error":       h.get("error"),
+            })
+    except Exception as exc:
+        out["error"] = str(exc)
+    return jsonify(out)
 
 
 @app.route("/bot/ai_thoughts")
@@ -3191,7 +3179,7 @@ def bot_start():
         symbols.append(s)
 
     try:
-        volume    = float(data.get("volume", 0.01))
+        volume    = float(data.get("volume", 0.50))
         poll_secs = float(data.get("poll_secs", 300.0))
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
@@ -3477,17 +3465,19 @@ def mt5_status_api():
 
 @app.route("/ai/init", methods=["POST"])
 def ai_init():
-    """Warm-start the LocalLLM in a background thread so it's ready before the bot starts."""
-    def _warm():
-        try:
-            llm = LocalLLM()
-            llm.generate("ping", max_new_tokens=1)
-            log.info("LocalLLM warm-up complete.")
-        except Exception as exc:
-            log.warning("LocalLLM warm-up failed: %s", exc)
-    t = threading.Thread(target=_warm, daemon=True, name="llm-warmup")
-    t.start()
-    return jsonify({"ok": True, "message": "AI initialisation started in background"})
+    """Probe the Ollama agent (the only supported backend)."""
+    if not (_AGENT_IMPORT_OK and _ai_agent is not None):
+        return jsonify({"ok": False,
+                        "message": "Agent module unavailable — check ai_agent.py import"}), 500
+    try:
+        health = _ai_agent.ollama_health()
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"Agent probe error: {exc}"}), 500
+    ok = bool(health.get("reachable") and health.get("model_loaded"))
+    log.info("Ollama agent probe: reachable=%s model_loaded=%s url=%s model=%s",
+             health.get("reachable"), health.get("model_loaded"),
+             health.get("url"), health.get("model"))
+    return jsonify({"ok": ok, "message": "Ollama agent probed", "health": health})
 
 
 @app.route("/bot/signal/<symbol>")
@@ -3507,10 +3497,11 @@ def manual_signal(symbol: str):
 
 if __name__ == "__main__":
     if "--run" in sys.argv:
-        # Headless bot mode — no Flask (always live trading)
+        # Headless bot mode — no Flask (always live trading).
+        # Volume defaults to 0.50 lot; override with BOT_AUTOSTART_VOLUME.
         bot = Bot(
             symbols=["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
-            volume=0.50,
+            volume=float(os.getenv("BOT_AUTOSTART_VOLUME", "0.50")),
             poll_secs=300,
             auto_trade=True,
             use_ai=True,
@@ -3519,6 +3510,33 @@ if __name__ == "__main__":
     else:
         # Load any previously saved MT5 credentials before Flask starts
         _load_saved_credentials()
+
+        # Announce the active AI backend at startup so there's zero
+        # ambiguity about which review path will fire for new trades.
+        def _announce_backend():
+            if _AGENT_IMPORT_OK and _ai_agent is not None:
+                try:
+                    h = _ai_agent.ollama_health()
+                    log.info(
+                        "AI backend: Ollama agent | url=%s | model=%s | "
+                        "reachable=%s | model_loaded=%s",
+                        h.get("url"), h.get("model"),
+                        h.get("reachable"), h.get("model_loaded"),
+                    )
+                    if not h.get("reachable"):
+                        log.warning(
+                            "Ollama is NOT reachable at startup — new entries "
+                            "will be paused until it comes back. Error: %s",
+                            h.get("error"),
+                        )
+                except Exception as exc:
+                    log.warning("Backend probe error at startup: %s", exc)
+            else:
+                log.error(
+                    "AI backend: UNAVAILABLE — ai_agent.py failed to import. "
+                    "No new trades will be approved until this is fixed."
+                )
+        _announce_backend()
 
         # Attempt MT5 auto-connect in the background so it's ready when the page loads
         def _auto_connect_mt5():
@@ -3534,21 +3552,27 @@ if __name__ == "__main__":
 
         threading.Thread(target=_auto_connect_mt5, daemon=True, name="mt5-autoconnect").start()
 
-        # Test trade on startup to confirm everything is working
+        # Optional startup test trade. DISABLED by default in production —
+        # set STARTUP_TEST_TRADE=1 to enable (useful for staging to verify
+        # MT5 plumbing). Never fires on a live account unless explicitly
+        # opted in.
         def _test_trade_on_startup():
             import time
             time.sleep(2)  # Wait for Flask to be ready
+            if os.getenv("STARTUP_TEST_TRADE", "0").strip() != "1":
+                log.info("Startup test trade disabled (set STARTUP_TEST_TRADE=1 to enable).")
+                return
             log.info(">>> Running startup test trade (0.001 lot EURUSD BUY)...")
             try:
                 # Reload credentials before test (in case they were just saved)
                 _load_saved_credentials()
-                
+
                 # Use or create shared connection for test trade
                 global _mt5_conn
                 if _mt5_conn is None:
                     _mt5_conn = MT5Connection(dict(MT5_CONFIG))
                     _mt5_conn.connect()
-                
+
                 if _mt5_conn and _mt5_conn.is_connected():
                     try:
                         result = _mt5_conn.place_test_trade(symbol="EURUSD", volume=0.001)
@@ -3579,9 +3603,12 @@ if __name__ == "__main__":
                     log.info("MT5 connected ✓ — auto-starting bot polling...")
                     # Use shared global connection for the bot
                     shared_conn = _ensure_shared_mt5_connection()
+                    # Auto-start volume — 0.50 lot default. Override via
+                    # BOT_AUTOSTART_VOLUME env var if you want smaller size
+                    # for staging/testing.
                     auto_bot = Bot(
                         symbols=["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
-                        volume=0.50,
+                        volume=float(os.getenv("BOT_AUTOSTART_VOLUME", "0.50")),
                         poll_secs=180,
                         auto_trade=True,
                         use_ai=True,

@@ -80,7 +80,7 @@ function showTab(tab, btn) {
     }
 }
 
-// Explicit helper so the AI Log tab can refresh on demand
+// Explicit helper so the Zero Log tab can refresh on demand
 function fetchThoughtsNow() {
     const url = lastThoughtTs
         ? '/bot/ai_thoughts?limit=60&since=' + encodeURIComponent(lastThoughtTs)
@@ -431,7 +431,7 @@ async function applyConfig() {
     }
 }
 
-// ── AI Log ────────────────────────────────────────────────────
+// ── Zero Log ──────────────────────────────────────────────────
 async function clearThoughts() {
     try { await fetch('/bot/thoughts/clear', { method: 'POST' }); } catch (_) {}
     thoughtsBuffer = [];
@@ -467,7 +467,13 @@ function displayThoughts(newThoughts) {
     }
 
     if (thoughtsBuffer.length === 0) {
-        container.innerHTML = '<div style="padding:40px;text-align:center;color:var(--txt3)">No AI thoughts yet — start the bot to see live reasoning.</div>';
+        container.innerHTML = `
+            <div style="padding:40px;text-align:center;color:var(--txt3)">
+                <div style="margin-bottom:10px">No entries yet — start the bot to see the live workflow.</div>
+                <div style="font-size:10px;letter-spacing:.05em;color:var(--txt3)">
+                    📊 STRATEGY &nbsp;→&nbsp; 🧠 AGENT &nbsp;→&nbsp; 📈 MARKET
+                </div>
+            </div>`;
         if (countEl) countEl.textContent = '0 entries';
         return;
     }
@@ -483,10 +489,17 @@ function displayThoughts(newThoughts) {
         const symbolHtml = t.symbol
             ? `<span style="background:rgba(33,150,243,0.15);color:#64B5F6;padding:2px 7px;border-radius:3px;font-weight:600;letter-spacing:.06em;margin-left:6px">${_esc(t.symbol)}</span>`
             : '';
+        // Stage-coloured pill so the strategy → agent → market workflow is
+        // visually distinguishable at a glance:
+        //   strategy  → blue   (signal generation)
+        //   agent     → purple (Ollama review/risk)
+        //   market    → green/red (broker execution)
+        const stage = _zeroLogStageBadge(t.source);
         return `
-        <div style="padding:12px 16px;border-bottom:1px solid var(--line);font-size:11px;transition:background 0.15s" onmouseover="this.style.background='rgba(255,255,255,0.02)'" onmouseout="this.style.background=''">
+        <div style="padding:12px 16px;border-bottom:1px solid var(--line);font-size:11px;border-left:3px solid ${stage.col};transition:background 0.15s" onmouseover="this.style.background='rgba(255,255,255,0.02)'" onmouseout="this.style.background=''">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;flex-wrap:wrap">
                 <div style="display:flex;align-items:center;gap:6px">
+                    <span style="background:${stage.bg};color:${stage.col};padding:2px 7px;border-radius:3px;font-weight:600;letter-spacing:.06em;font-size:10px">${stage.icon} ${stage.label}</span>
                     <strong style="color:var(--cyan)">${_esc(t.source || '—')}</strong>
                     <span style="background:var(--bg2);color:var(--txt2);padding:2px 6px;border-radius:3px">${_esc(t.stage || '')}</span>
                     ${symbolHtml}${confHtml}${actionHtml}
@@ -497,6 +510,23 @@ function displayThoughts(newThoughts) {
             ${t.detail ? `<div style="color:var(--txt3);font-size:10px;margin-top:2px;line-height:1.4">📋 ${_esc(t.detail)}</div>` : ''}
         </div>`;
     }).join('');
+}
+
+// Map a thought's `source` field to a workflow-stage badge so the Zero Log
+// shows the strategy → agent → market pipeline visually.
+function _zeroLogStageBadge(source) {
+    const s = String(source || '').toLowerCase();
+    // Order matters: 'ai_entry' / 'ai_risk' (agent) must match before 'strategy' / 'ai_pro_signal' (strategy).
+    if (s === 'execution' || s.includes('order') || s.includes('market')) {
+        return { label: 'MARKET',   icon: '📈', col: '#50d963', bg: 'rgba(80,217,99,0.15)' };
+    }
+    if (s === 'ai_entry' || s === 'ai_risk' || s.includes('agent') || s.includes('ollama')) {
+        return { label: 'AGENT',    icon: '🧠', col: '#c792ea', bg: 'rgba(199,146,234,0.15)' };
+    }
+    if (s.includes('signal') || s.includes('strategy') || s.includes('ai_pro')) {
+        return { label: 'STRATEGY', icon: '📊', col: '#5ac8fa', bg: 'rgba(90,200,250,0.15)' };
+    }
+    return { label: 'INFO', icon: 'ℹ', col: '#6a7280', bg: 'rgba(106,114,128,0.15)' };
 }
 
 // ── Signals tab ───────────────────────────────────────────────
@@ -789,17 +819,22 @@ function fetchPerformance() {
         .then(r => r.json())
         .then(data => {
             renderKPIs(data.kpis || {});
-            if (data.equity_curve && data.equity_curve.length > 0) {
-                equityData = data.equity_curve;
-                renderEquityCurve(equityData);
-            }
+            // Always call renderEquityCurve, even with [] — it draws an
+            // informative empty-state message instead of leaving a blank box.
+            equityData = (data.equity_curve && data.equity_curve.length) ? data.equity_curve : [];
+            renderEquityCurve(equityData, data.error || null);
         })
-        .catch(() => renderKPIs({}));
+        .catch(() => {
+            renderKPIs({});
+            renderEquityCurve([], 'Failed to reach /bot/performance');
+        });
 }
 
 function renderKPIs(kpis) {
     _setKPI('kpi-winrate',      (kpis.win_rate       || 0).toFixed(1) + '%');
-    _setKPI('kpi-profitfactor', (kpis.profit_factor  || 0).toFixed(2));
+    // Treat the 999 sentinel from the backtester/server as infinity (no losing trades).
+    const pfVal = Number(kpis.profit_factor || 0);
+    _setKPI('kpi-profitfactor', pfVal >= 999 ? '∞' : pfVal.toFixed(2));
     _setKPI('kpi-trades',       kpis.total_trades     || 0);
     _setKPI('kpi-return',       (kpis.equity_return  || 0).toFixed(2) + '%');
     _setKPI('kpi-drawdown',     (kpis.max_drawdown   || 0).toFixed(2) + '%');
@@ -810,66 +845,112 @@ function renderKPIs(kpis) {
     _setKPI('kpi-sortino',      (kpis.sortino        || 0).toFixed(2));
 }
 
-function renderEquityCurve(data) {
+function renderEquityCurve(data, errorMsg) {
     const canvas = document.getElementById('equityCanvas');
-    if (!canvas || !data || data.length < 2) return;
+    if (!canvas) return;
     const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
     const rect = canvas.getBoundingClientRect();
-    canvas.width  = (rect.width  || 600) * dpr;
-    canvas.height = (rect.height || 200) * dpr;
+    // Match CSS height (300px in dashboard.css). Fallback only if the canvas
+    // is in a hidden tab and getBoundingClientRect returns 0.
+    const cssW = rect.width  || 600;
+    const cssH = rect.height || 300;
+    canvas.width  = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    // Reset any prior transform before scaling so DPR changes (e.g. moving
+    // window between monitors) don't compound the scale.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.scale(dpr, dpr);
-    const W = canvas.width  / dpr;
-    const H = canvas.height / dpr;
-    const pad = { top: 20, right: 20, bottom: 28, left: 52 };
-    const plotW = W - pad.left - pad.right;
-    const plotH = H - pad.top  - pad.bottom;
-    const min = Math.min(...data);
-    const max = Math.max(...data);
-    const range = max - min || 1;
+    const W = cssW;
+    const H = cssH;
 
+    // Background — always paint so the panel never looks broken.
     ctx.fillStyle = '#0a0e14';
     ctx.fillRect(0, 0, W, H);
 
+    // Empty / error state — draw a centred message and bail out.
+    if (errorMsg || !data || data.length < 1) {
+        ctx.fillStyle = errorMsg ? '#ff6b6b' : '#6a7280';
+        ctx.font = '12px "IBM Plex Mono",monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const msg = errorMsg
+            ? `⚠ ${errorMsg}`
+            : 'No closed trades in the last 90 days — equity curve will appear once trades start closing.';
+        // Soft word-wrap at ~70 chars
+        const lines = _wrapText(msg, 70);
+        const lineH = 16;
+        const startY = H / 2 - ((lines.length - 1) * lineH) / 2;
+        lines.forEach((ln, i) => ctx.fillText(ln, W / 2, startY + i * lineH));
+        return;
+    }
+
+    // Single-trade case — render a flat baseline + label so the user knows
+    // the panel is alive but there isn't enough data for a curve yet.
+    if (data.length < 2) {
+        ctx.fillStyle = '#6a7280';
+        ctx.font = '12px "IBM Plex Mono",monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`Only 1 closed trade so far (P&L $${Number(data[0]).toFixed(2)}).`, W / 2, H / 2);
+        return;
+    }
+
+    // Anchor the series at 0 so the chart visually starts at break-even
+    // rather than the first trade's P&L. Avoid duplicating a leading 0.
+    const series = (Number(data[0]) === 0) ? data.slice() : [0, ...data];
+
+    const pad = { top: 20, right: 20, bottom: 28, left: 56 };
+    const plotW = W - pad.left - pad.right;
+    const plotH = H - pad.top  - pad.bottom;
+    const min = Math.min(...series);
+    const max = Math.max(...series);
+    const range = (max - min) || 1;
+
+    // Gridlines + Y-axis labels
     ctx.strokeStyle = 'rgba(42,58,82,0.6)';
     ctx.lineWidth = 0.5;
+    ctx.font = '9px "IBM Plex Mono",monospace';
     for (let i = 0; i <= 4; i++) {
         const y = pad.top + (plotH * i / 4);
         ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
         const val = max - (range * i / 4);
         ctx.fillStyle = '#6a7280';
-        ctx.font = '9px "IBM Plex Mono",monospace';
         ctx.textAlign = 'right';
-        ctx.fillText((val >= 0 ? '+' : '') + val.toFixed(0), pad.left - 4, y + 3);
+        ctx.textBaseline = 'middle';
+        ctx.fillText((val >= 0 ? '+$' : '-$') + Math.abs(val).toFixed(0), pad.left - 6, y);
     }
 
-    const lastVal = data[data.length - 1];
+    const lastVal = series[series.length - 1];
     const lineCol = lastVal >= 0 ? '#50d963' : '#ff6b6b';
     const grad = ctx.createLinearGradient(0, pad.top, 0, H - pad.bottom);
     grad.addColorStop(0, lastVal >= 0 ? 'rgba(80,217,99,0.35)' : 'rgba(255,107,107,0.35)');
     grad.addColorStop(1, 'rgba(10,14,20,0)');
 
-    const xStep = plotW / (data.length - 1);
+    const xStep = plotW / (series.length - 1);
     const xAt = i => pad.left + i * xStep;
     const yAt = v => pad.top + plotH - ((v - min) / range) * plotH;
 
+    // Filled area under the curve
     ctx.beginPath();
-    ctx.moveTo(xAt(0), yAt(data[0]));
-    for (let i = 1; i < data.length; i++) ctx.lineTo(xAt(i), yAt(data[i]));
-    ctx.lineTo(xAt(data.length - 1), H - pad.bottom);
+    ctx.moveTo(xAt(0), yAt(series[0]));
+    for (let i = 1; i < series.length; i++) ctx.lineTo(xAt(i), yAt(series[i]));
+    ctx.lineTo(xAt(series.length - 1), H - pad.bottom);
     ctx.lineTo(xAt(0), H - pad.bottom);
     ctx.closePath();
     ctx.fillStyle = grad;
     ctx.fill();
 
+    // Curve line
     ctx.beginPath();
-    ctx.moveTo(xAt(0), yAt(data[0]));
-    for (let i = 1; i < data.length; i++) ctx.lineTo(xAt(i), yAt(data[i]));
+    ctx.moveTo(xAt(0), yAt(series[0]));
+    for (let i = 1; i < series.length; i++) ctx.lineTo(xAt(i), yAt(series[i]));
     ctx.strokeStyle = lineCol;
     ctx.lineWidth = 1.5;
     ctx.lineJoin = 'round';
     ctx.stroke();
 
+    // Zero baseline (only if it's actually inside the visible range)
     if (min < 0 && max > 0) {
         const y0 = yAt(0);
         ctx.beginPath(); ctx.moveTo(pad.left, y0); ctx.lineTo(W - pad.right, y0);
@@ -877,13 +958,51 @@ function renderEquityCurve(data) {
         ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]);
     }
 
+    // X-axis labels
     ctx.fillStyle = '#6a7280';
     ctx.font = '9px "IBM Plex Mono",monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('start', pad.left, H - 6);
-    ctx.fillText('mid', pad.left + plotW / 2, H - 6);
-    ctx.fillText('now', W - pad.right, H - 6);
+    ctx.textBaseline = 'top';
+    ctx.fillText('start', pad.left, H - pad.bottom + 8);
+    ctx.fillText('mid',   pad.left + plotW / 2, H - pad.bottom + 8);
+    ctx.fillText('now',   W - pad.right, H - pad.bottom + 8);
+
+    // Last-value pill in the top-right
+    const lvLabel = (lastVal >= 0 ? '+$' : '-$') + Math.abs(lastVal).toFixed(2);
+    ctx.fillStyle = lineCol;
+    ctx.font = 'bold 11px "IBM Plex Mono",monospace';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    ctx.fillText(lvLabel, W - pad.right, pad.top - 14);
 }
+
+// Simple word-wrap helper for short status / error messages drawn into the
+// equity-curve canvas.
+function _wrapText(text, maxChars) {
+    const words = String(text).split(/\s+/);
+    const lines = [];
+    let cur = '';
+    for (const w of words) {
+        if (!cur) { cur = w; continue; }
+        if ((cur + ' ' + w).length > maxChars) { lines.push(cur); cur = w; }
+        else cur += ' ' + w;
+    }
+    if (cur) lines.push(cur);
+    return lines;
+}
+
+// Re-render the equity curve when the window resizes, so it stays sharp.
+// Debounced to avoid thrashing during drag-resize.
+let _equityResizeTimer = null;
+window.addEventListener('resize', () => {
+    if (_equityResizeTimer) clearTimeout(_equityResizeTimer);
+    _equityResizeTimer = setTimeout(() => {
+        const perfTab = document.getElementById('tab-performance');
+        if (perfTab && perfTab.classList.contains('active')) {
+            renderEquityCurve(equityData || []);
+        }
+    }, 150);
+});
 
 // ── Market Watch (Snapshot) tab ───────────────────────────────
 function fetchBotSnapshot() {
@@ -1052,7 +1171,7 @@ function _btSetStatus(text, isError) {
 }
 
 function _btClearResults() {
-    ['bt-total-trades', 'bt-win-rate', 'bt-total-pnl', 'bt-avg-pnl']
+    ['bt-total-trades', 'bt-win-rate', 'bt-total-pnl', 'bt-avg-pnl', 'bt-max-dd']
         .forEach(id => { const el = document.getElementById(id); if (el) el.textContent = '—'; });
     const body = document.getElementById('bt-pairs-body');
     if (body) body.innerHTML = '<div style="color:var(--txt3);padding:8px;grid-column:1/-1">Running…</div>';
@@ -1136,6 +1255,8 @@ function _btRenderPairCards(per) {
         const trades   = Number(r.trades || 0);
         const wins     = Number(r.wins || 0);
         const losses   = Number(r.losses || 0);
+        const mdd      = Number(r.max_drawdown || 0);
+        const mddLabel = mdd > 0 ? ('-$' + mdd.toFixed(0)) : '—';
         const barColor = wrPct >= 55 ? 'var(--green)' : (wrPct >= 45 ? 'var(--amber,#f5a623)' : 'var(--red,#ff6b6b)');
 
         return `
@@ -1153,7 +1274,7 @@ function _btRenderPairCards(per) {
               <div style="height:100%;width:${wrPct.toFixed(1)}%;background:${barColor};transition:width .25s"></div>
             </div>
 
-            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:10px;color:var(--txt3)">
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;font-size:10px;color:var(--txt3)">
               <div>
                 <div>Trades</div>
                 <div style="color:var(--txt);font-size:11px">${trades.toLocaleString()}</div>
@@ -1165,6 +1286,10 @@ function _btRenderPairCards(per) {
               <div>
                 <div>Avg R:R</div>
                 <div style="color:var(--txt);font-size:11px">${_esc(rrLabel)}</div>
+              </div>
+              <div title="Peak-to-trough drawdown on this pair's equity curve">
+                <div>Max DD</div>
+                <div style="color:${mdd > 0 ? 'var(--red,#ff6b6b)' : 'var(--txt)'};font-size:11px">${_esc(mddLabel)}</div>
               </div>
             </div>
           </div>`;
@@ -1179,6 +1304,18 @@ function _btRenderResults(data) {
     set('bt-win-rate',     agg.win_rate_label  || '0.0%');
     set('bt-total-pnl',    agg.total_pnl_label || '$0.00');
     set('bt-avg-pnl',      agg.avg_pnl_label   || '$0.00');
+
+    // Max drawdown — peak-to-trough on the merged cross-pair equity
+    // curve. Shown as a loss-style "-$X" with a % -of-peak deco line.
+    const mddVal   = Number(agg.max_drawdown || 0);
+    const mddLabel = agg.max_drawdown_label || (mddVal > 0 ? ('-$' + mddVal.toFixed(2)) : '$0.00');
+    set('bt-max-dd', mddLabel);
+    const ddEl = document.getElementById('bt-max-dd');
+    if (ddEl) ddEl.style.color = mddVal > 0 ? 'var(--red,#ff6b6b)' : '';
+    const mddPct = Number(agg.max_drawdown_pct || 0);
+    set('bt-max-dd-deco', mddPct > 0
+        ? `${mddPct.toFixed(1)}% of peak`
+        : 'peak to trough');
 
     // KPI deco lines: quick context under the numbers
     const wins = Number(agg.wins || 0), losses = Number(agg.losses || 0);
@@ -1195,7 +1332,9 @@ function _btRenderResults(data) {
     const sub = document.getElementById('bt-subtitle');
     if (sub) {
         const period = data.period ? ` — ${data.period}` : '';
-        sub.textContent = `${data.days || 7}-day historical validation (${lot} lot)${period}`;
+        // Show raw-strategy mode explicitly — these numbers measure signal
+        // quality, not the management overlay the live bot applies.
+        sub.textContent = `${data.days || 7}-day raw-strategy validation (${lot} lot, single SL/TP exit)${period}`;
     }
 
     // Summary banner
@@ -1232,7 +1371,391 @@ function _btNormalisePair(r) {
         avg_win_pips:  Number(r.avg_win_pips || 0),
         avg_loss_pips: Number(r.avg_loss_pips || 0),
         feature_importance: r.feature_importance || null,
+        assumptions:   r.assumptions || null,
+        max_drawdown:      Number(r.max_drawdown || 0),
+        max_drawdown_pct:  Number(r.max_drawdown_pct || 0),
+        equity_curve:      r.equity_curve || [],
+        // Win/loss correlation breakdowns — rendered in the correlation
+        // panel beneath the per-pair cards.
+        by_env:                 r.by_env                 || {},
+        by_side:                r.by_side                || {},
+        by_hour:                r.by_hour                || {},
+        by_dow:                 r.by_dow                 || {},
+        confidence_buckets:     r.confidence_buckets     || {},
+        pnl_distribution:       r.pnl_distribution       || {},
+        component_correlations: r.component_correlations || {},
+        by_quality:             r.by_quality             || {},
+        by_exit_reason:         r.by_exit_reason         || {},
     };
+}
+
+// Render modelling-assumptions footer so the user can see what every P&L
+// number is built on (entry fill model, spread, intrabar policy, etc).
+function _btRenderAssumptions(perPair) {
+    let host = document.getElementById('bt-assumptions');
+    if (!host) {
+        const body = document.getElementById('bt-pairs-body');
+        if (!body || !body.parentNode) return;
+        host = document.createElement('div');
+        host.id = 'bt-assumptions';
+        host.style.cssText = 'margin-top:12px;padding:10px 12px;border:1px dashed var(--bd,#2a2f3a);border-radius:6px;background:var(--bg0);font-size:10px;color:var(--txt3);line-height:1.5';
+        body.parentNode.parentNode.appendChild(host);
+    }
+    const first = (perPair || []).find(p => p && p.assumptions);
+    if (!first) { host.innerHTML = ''; return; }
+    const a = first.assumptions || {};
+    const spread = (a.spread_pips == null) ? 'default per-pair (1.0 majors / 2.0 JPY)' : (a.spread_pips + ' pips (override)');
+    // Trade-management line gets its own colour so the "raw strategy"
+    // mode is visually unmissable — this is the signal-quality number,
+    // not the live-bot simulation.
+    const tmRaw = /raw/i.test(String(a.trade_management || ''));
+    const tmColour = tmRaw ? 'var(--accent,#5ac8fa)' : 'var(--txt2)';
+    host.innerHTML = `
+      <div style="font-weight:600;color:var(--txt2);margin-bottom:4px">📐 Modelling assumptions</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:4px 16px">
+        <div><b>Trade management:</b> <span style="color:${tmColour}">${_esc(a.trade_management || '—')}</span></div>
+        <div><b>Lot size:</b> ${_esc(String(a.lot_size))}</div>
+        <div><b>Spread on entry:</b> ${_esc(spread)}</div>
+        <div><b>Intrabar TP/SL:</b> ${_esc(a.intrabar_policy || '—')}</div>
+        <div><b>Entry fill:</b> ${_esc(a.entry_fill || '—')}</div>
+        <div><b>Pip→USD model:</b> ${_esc(a.pip_usd_model || '—')}</div>
+        <div><b>Commission:</b> ${_esc(a.commission || '—')}</div>
+        <div><b>Swap:</b> ${_esc(a.swap || '—')}</div>
+        <div><b>Lookahead:</b> ${_esc(a.lookahead || '—')}</div>
+      </div>`;
+}
+
+// ── Win/Loss correlation visualisations ─────────────────────────────
+//
+// Builds a cluster of small multi-pair-aware charts that answer: "what
+// correlated with my winning vs losing trades this period?" Drives off
+// the breakdowns added to analyze_results (`by_env`, `by_hour`, `by_dow`,
+// `by_side`, `confidence_buckets`, `pnl_distribution`, and the existing
+// `component_correlations` / `by_quality` / `by_exit_reason`).
+//
+// Every chart is SVG-free so it renders fast and respects the dashboard's
+// CSS variables. Win rate bars are green/amber/red-tinted based on the
+// same thresholds the per-pair cards use, and count bars show relative
+// volume so a rare-but-profitable bucket is visually distinguishable
+// from a dominant one.
+
+function _btColourForWR(wr) {
+    // wr ∈ [0,1]
+    if (wr >= 0.55) return 'var(--green,#2ecc71)';
+    if (wr >= 0.45) return 'var(--amber,#f5a623)';
+    return 'var(--red,#ff6b6b)';
+}
+
+function _btAggregateBuckets(perPair, field) {
+    // Merge per-pair dicts of bucket → {count, wins, losses, total_pnl}
+    // into a single aggregated dict the chart can read. Preserves input
+    // order by walking pairs in order and using an array for keys.
+    const out = {}; // key → stats
+    const order = [];
+    (perPair || []).forEach(p => {
+        const b = (p && p[field]) || {};
+        Object.keys(b).forEach(k => {
+            const s = b[k] || {};
+            if (!out[k]) {
+                out[k] = {count: 0, wins: 0, losses: 0, total_pnl: 0, pips_sum: 0};
+                order.push(k);
+            }
+            const n = Number(s.count || 0);
+            out[k].count     += n;
+            out[k].wins      += Number(s.wins || 0);
+            out[k].losses    += Number(s.losses || 0);
+            out[k].total_pnl += Number(s.total_pnl || 0);
+            out[k].pips_sum  += Number(s.avg_pips || 0) * n;
+        });
+    });
+    // Finalise derived fields
+    order.forEach(k => {
+        const s = out[k];
+        s.win_rate = s.count > 0 ? s.wins / s.count : 0;
+        s.avg_pips = s.count > 0 ? s.pips_sum / s.count : 0;
+    });
+    return {order, data: out};
+}
+
+// Render a horizontal bar chart where each row shows: label · win-rate
+// bar (width = count share, colour = win-rate), numeric win-rate, and
+// count label. Used by env/side/hour/dow/confidence breakdowns.
+function _btBucketBarsHTML(agg, opts) {
+    opts = opts || {};
+    const order = opts.orderOverride || agg.order;
+    if (!order || !order.length) {
+        return '<div style="color:var(--txt3);font-size:10px;padding:6px 0">No data in this window.</div>';
+    }
+    const maxCount = Math.max(1, ...order.map(k => Number((agg.data[k] || {}).count || 0)));
+    const labelFmt = opts.labelFmt || (k => k);
+    return order.map(k => {
+        const s = agg.data[k] || {};
+        const n = Number(s.count || 0);
+        if (!n) return '';
+        const wr = Number(s.win_rate || 0);
+        const wrLabel = (wr * 100).toFixed(0) + '%';
+        const share = (n / maxCount) * 100;
+        const colour = _btColourForWR(wr);
+        const pnl = Number(s.total_pnl || 0);
+        const pnlLabel = pnl >= 0 ? ('+$' + pnl.toFixed(0)) : ('-$' + Math.abs(pnl).toFixed(0));
+        const pnlColor = pnl >= 0 ? 'var(--green,#2ecc71)' : 'var(--red,#ff6b6b)';
+        return `
+          <div style="display:grid;grid-template-columns:110px 1fr 48px 60px 64px;gap:8px;align-items:center;font-size:10px;margin-bottom:3px" title="${_esc(String(k))} · ${n} trade${n===1?'':'s'} · ${s.wins||0}W/${s.losses||0}L · avg ${(Number(s.avg_pips||0)).toFixed(1)}p">
+            <div style="color:var(--txt2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${_esc(labelFmt(k))}</div>
+            <div style="height:12px;background:var(--bg0);border-radius:3px;overflow:hidden;position:relative">
+              <div style="position:absolute;left:0;top:0;bottom:0;width:${share.toFixed(1)}%;background:${colour};opacity:.85"></div>
+              <div style="position:absolute;left:0;right:0;top:0;bottom:0;background:linear-gradient(to right, rgba(0,0,0,0) ${(wr*100).toFixed(1)}%, rgba(0,0,0,.35) ${(wr*100).toFixed(1)}%)"></div>
+            </div>
+            <div style="text-align:right;color:${colour};font-weight:600">${wrLabel}</div>
+            <div style="text-align:right;color:var(--txt3)">${n}t</div>
+            <div style="text-align:right;color:${pnlColor}">${pnlLabel}</div>
+          </div>`;
+    }).join('');
+}
+
+// Hour-of-day is 24 buckets so we want them in 0..23 order even if some
+// hours are missing — fill gaps with zeros so the chart reads like a
+// proper session map.
+function _btHourBucketsHTML(perPair) {
+    const agg = _btAggregateBuckets(perPair, 'by_hour');
+    const hours = Array.from({length: 24}, (_, i) => String(i));
+    hours.forEach(h => {
+        if (!agg.data[h]) {
+            agg.data[h] = {count: 0, wins: 0, losses: 0, total_pnl: 0, win_rate: 0, avg_pips: 0};
+        }
+    });
+    return _btBucketBarsHTML({order: hours, data: agg.data}, {
+        labelFmt: h => String(h).padStart(2, '0') + ':00',
+    });
+}
+
+function _btDowBucketsHTML(perPair) {
+    const agg = _btAggregateBuckets(perPair, 'by_dow');
+    const order = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        .filter(d => agg.data[d]);
+    return _btBucketBarsHTML({order, data: agg.data});
+}
+
+function _btConfidenceBucketsHTML(perPair) {
+    const agg = _btAggregateBuckets(perPair, 'confidence_buckets');
+    const order = ['<50', '50-60', '60-70', '70-80', '80-90', '90-100']
+        .filter(k => agg.data[k]);
+    return _btBucketBarsHTML({order, data: agg.data}, {
+        labelFmt: k => k + '%',
+    });
+}
+
+function _btEnvBucketsHTML(perPair) {
+    const agg = _btAggregateBuckets(perPair, 'by_env');
+    // Sort by trade count descending so the dominant setup is on top
+    const order = agg.order.slice().sort((a, b) => {
+        return Number((agg.data[b] || {}).count || 0) - Number((agg.data[a] || {}).count || 0);
+    });
+    return _btBucketBarsHTML({order, data: agg.data});
+}
+
+function _btSideBucketsHTML(perPair) {
+    const agg = _btAggregateBuckets(perPair, 'by_side');
+    const order = ['BUY', 'SELL'].filter(k => agg.data[k]);
+    return _btBucketBarsHTML({order, data: agg.data});
+}
+
+function _btExitReasonBucketsHTML(perPair) {
+    const agg = _btAggregateBuckets(perPair, 'by_exit_reason');
+    const order = ['tp', 'sl', 'timeout', 'partial+tp', 'partial+be', 'partial+timeout', 'be+tp', 'be+sl']
+        .filter(k => agg.data[k])
+        .concat(agg.order.filter(k => !['tp','sl','timeout','partial+tp','partial+be','partial+timeout','be+tp','be+sl'].includes(k)));
+    return _btBucketBarsHTML({order, data: agg.data}, {
+        labelFmt: k => ({
+            'tp': 'Take Profit',
+            'sl': 'Stop Loss',
+            'timeout': 'Timeout',
+            'partial+tp': 'Partial + TP',
+            'partial+be': 'Partial + BE',
+            'partial+timeout': 'Partial + Timeout',
+            'be+tp': 'Runner TP',
+            'be+sl': 'Runner BE',
+        }[k] || k),
+    });
+}
+
+function _btQualityBucketsHTML(perPair) {
+    const agg = _btAggregateBuckets(perPair, 'by_quality');
+    const order = ['strong', 'good', 'fair', 'weak'].filter(k => agg.data[k]);
+    return _btBucketBarsHTML({order, data: agg.data}, {
+        labelFmt: k => k.charAt(0).toUpperCase() + k.slice(1),
+    });
+}
+
+// P&L distribution — stacked histogram where each bin is coloured by
+// whether it represents a winning / losing outcome. Uses the first pair
+// with data (aggregating histograms across pairs would require re-binning;
+// instead we render one per pair side-by-side).
+function _btPnlDistributionHTML(perPair) {
+    const pairs = (perPair || []).filter(p => p && p.pnl_distribution && (p.pnl_distribution.bins || []).length);
+    if (!pairs.length) return '<div style="color:var(--txt3);font-size:10px;padding:6px 0">No P&amp;L distribution to plot.</div>';
+
+    return pairs.map(p => {
+        const pd = p.pnl_distribution || {};
+        const bins = pd.bins || [];
+        const maxC = Math.max(1, ...bins.map(b => Number(b.count || 0)));
+        const bars = bins.map(b => {
+            const h = (Number(b.count || 0) / maxC) * 100;
+            const col = b.sign === 'win' ? 'var(--green,#2ecc71)' : (b.sign === 'loss' ? 'var(--red,#ff6b6b)' : 'var(--txt3)');
+            const midStr = b.mid >= 0 ? ('+' + Number(b.mid).toFixed(0)) : Number(b.mid).toFixed(0);
+            return `
+              <div style="flex:1;display:flex;flex-direction:column;align-items:center;min-width:0" title="${midStr}p · ${b.count} trade${b.count===1?'':'s'} (${Number(b.x0).toFixed(1)} → ${Number(b.x1).toFixed(1)})">
+                <div style="width:100%;height:70px;display:flex;align-items:flex-end;justify-content:center">
+                  <div style="width:70%;height:${h.toFixed(1)}%;background:${col};border-radius:2px 2px 0 0;min-height:${b.count>0?'2px':'0'}"></div>
+                </div>
+                <div style="font-size:9px;color:var(--txt3);margin-top:2px">${midStr}</div>
+              </div>`;
+        }).join('');
+        return `
+          <div style="background:var(--bg1);padding:10px;border-radius:6px;margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;font-size:10px;color:var(--txt3)">
+              <span style="color:var(--txt);font-weight:600">${_esc(p.symbol)}</span>
+              <span>n=${pd.n || 0} · median ${Number(pd.median || 0).toFixed(1)}p</span>
+            </div>
+            <div style="display:flex;gap:2px;align-items:flex-end;padding:0 4px">${bars}</div>
+          </div>`;
+    }).join('');
+}
+
+// Component-score correlations. Each component's coefficient is in
+// [-1, 1] — positive means higher score → higher win probability.
+function _btCorrelationsHTML(perPair) {
+    // Average coefficients across pairs (weighted by trade count).
+    const acc = {}; // component → {sum, weight}
+    (perPair || []).forEach(p => {
+        const cc = (p && p.component_correlations) || {};
+        const w  = Number(p.trades || 0);
+        Object.keys(cc).forEach(k => {
+            const v = Number(cc[k] || 0);
+            if (!isFinite(v)) return;
+            if (!acc[k]) acc[k] = {sum: 0, weight: 0};
+            acc[k].sum    += v * w;
+            acc[k].weight += w;
+        });
+    });
+    const keys = Object.keys(acc);
+    if (!keys.length) return '<div style="color:var(--txt3);font-size:10px;padding:6px 0">No component correlations available (per-trade score breakdown not reported).</div>';
+
+    const items = keys.map(k => ({
+        component: k,
+        coef: acc[k].weight > 0 ? acc[k].sum / acc[k].weight : 0,
+    })).sort((a, b) => Math.abs(b.coef) - Math.abs(a.coef));
+
+    return items.map(it => {
+        // −1..+1 → 0..100 offset on a symmetric bar (centre at 50%).
+        const centred = 50 + (it.coef * 50);
+        const sign = it.coef >= 0 ? '+' : '-';
+        const coefLabel = sign + Math.abs(it.coef).toFixed(2);
+        const colour = it.coef > 0.15 ? 'var(--green,#2ecc71)'
+                     : it.coef < -0.15 ? 'var(--red,#ff6b6b)'
+                     : 'var(--amber,#f5a623)';
+        const barLeft = it.coef >= 0 ? '50%' : centred.toFixed(1) + '%';
+        const barWidth = Math.abs(it.coef * 50).toFixed(1) + '%';
+        return `
+          <div style="display:grid;grid-template-columns:160px 1fr 56px;gap:8px;align-items:center;font-size:10px;margin-bottom:3px">
+            <div style="color:var(--txt2)">${_esc(it.component)}</div>
+            <div style="height:12px;background:var(--bg0);border-radius:3px;position:relative">
+              <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--bd,#2a2f3a)"></div>
+              <div style="position:absolute;left:${barLeft};top:0;bottom:0;width:${barWidth};background:${colour};opacity:.85;border-radius:2px"></div>
+            </div>
+            <div style="text-align:right;color:${colour};font-weight:600">${coefLabel}</div>
+          </div>`;
+    }).join('');
+}
+
+// Top-level correlation panel. Lays out: env, side, hour, dow,
+// confidence, exit reason, quality, component correlations, and P&L
+// distribution in a responsive grid beneath the per-pair cards.
+function _btRenderCorrelations(perPair) {
+    let host = document.getElementById('bt-correlations');
+    if (!host) {
+        const body = document.getElementById('bt-pairs-body');
+        if (!body || !body.parentNode) return;
+        host = document.createElement('div');
+        host.id = 'bt-correlations';
+        host.style.cssText = 'margin-top:16px;border:1px solid var(--bd,#2a2f3a);padding:14px;border-radius:8px;background:var(--bg0)';
+        // Inject after the pairs grid but *before* the ML insights panel
+        // if that already exists, so the flow reads: cards → correlations → ML.
+        const mlHost = document.getElementById('bt-ml-insights');
+        if (mlHost && mlHost.parentNode) {
+            mlHost.parentNode.insertBefore(host, mlHost);
+        } else {
+            body.parentNode.parentNode.appendChild(host);
+        }
+    }
+
+    const withData = (perPair || []).filter(p => p && !p.error);
+    if (!withData.length) {
+        host.innerHTML = '<div style="color:var(--txt3);font-size:11px">📊 Win/Loss Correlations — no trades in this window.</div>';
+        return;
+    }
+
+    // Diagnostic: we have pairs, but do they actually include the
+    // breakdown fields? If every single pair is missing them AND has
+    // trades, the server is running old Python code without the
+    // forwarding — tell the user instead of showing eight empty panels.
+    const totalTrades = withData.reduce((a, p) => a + Number(p.trades || 0), 0);
+    const anyEnv   = withData.some(p => p.by_env  && Object.keys(p.by_env).length);
+    const anyHour  = withData.some(p => p.by_hour && Object.keys(p.by_hour).length);
+    const anySide  = withData.some(p => p.by_side && Object.keys(p.by_side).length);
+    const hasAnyBreakdown = anyEnv || anyHour || anySide;
+    if (totalTrades > 0 && !hasAnyBreakdown) {
+        host.innerHTML = `
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+            <div style="font-weight:600;color:var(--txt)">📊 Win / Loss Correlations</div>
+          </div>
+          <div style="padding:12px;background:var(--bg1);border-left:3px solid var(--amber,#f5a623);border-radius:4px;font-size:11px;color:var(--txt2);line-height:1.6">
+            <b>Data pipeline mismatch.</b> The backtest returned ${totalTrades.toLocaleString()} trade${totalTrades===1?'':'s'}, but none of the per-bucket breakdowns
+            (by environment, hour, confidence, etc.) came through. The Flask server is almost certainly
+            running older Python code that doesn't yet emit these fields.
+            <div style="margin-top:8px;color:var(--txt3);font-size:10px">Fix: restart the Flask server so <code>core/server.py</code> and <code>odl/backtest.py</code> reload, then run the backtest again.</div>
+          </div>`;
+        return;
+    }
+
+    const panel = (title, subtitle, bodyHTML) => `
+      <div style="background:var(--bg1);padding:12px;border-radius:6px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+          <div style="font-weight:600;color:var(--txt);font-size:11px">${_esc(title)}</div>
+          <div style="font-size:9px;color:var(--txt3)">${_esc(subtitle || '')}</div>
+        </div>
+        ${bodyHTML}
+      </div>`;
+
+    const legend = `
+      <div style="display:flex;gap:12px;font-size:9px;color:var(--txt3);margin-bottom:10px;flex-wrap:wrap">
+        <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:10px;height:10px;background:var(--green,#2ecc71);border-radius:2px;display:inline-block"></span>WR ≥ 55%</span>
+        <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:10px;height:10px;background:var(--amber,#f5a623);border-radius:2px;display:inline-block"></span>45–55%</span>
+        <span style="display:inline-flex;align-items:center;gap:4px"><span style="width:10px;height:10px;background:var(--red,#ff6b6b);border-radius:2px;display:inline-block"></span>&lt; 45%</span>
+        <span style="margin-left:auto">bar width = trade volume · number = win rate · right col = total P&amp;L</span>
+      </div>`;
+
+    host.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <div style="font-weight:600;color:var(--txt)">📊 Win / Loss Correlations</div>
+        <div style="font-size:10px;color:var(--txt3)">what tends to win — and lose — in this window</div>
+      </div>
+      ${legend}
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px">
+        ${panel('By Environment',  'CHoCH-BUY@PDL, Continuation-SELL@PDH, …', _btEnvBucketsHTML(withData))}
+        ${panel('By Side',         'BUY vs SELL',                              _btSideBucketsHTML(withData))}
+        ${panel('By Signal Quality','weak / fair / good / strong',              _btQualityBucketsHTML(withData))}
+        ${panel('By Exit Reason',  'how trades closed',                         _btExitReasonBucketsHTML(withData))}
+        ${panel('By Confidence',   'model-assigned confidence bucket',          _btConfidenceBucketsHTML(withData))}
+        ${panel('By Day of Week',  'entry day (UTC)',                           _btDowBucketsHTML(withData))}
+        ${panel('By Hour of Day',  'entry hour, UTC — 00–23',                   _btHourBucketsHTML(withData))}
+        ${panel('Component Correlations', 'structure / level / momentum / spread / env — +1 = wins, −1 = losses', _btCorrelationsHTML(withData))}
+      </div>
+      <div style="margin-top:12px">
+        <div style="font-weight:600;color:var(--txt);font-size:11px;margin-bottom:6px">P&amp;L Distribution (pips, per pair)</div>
+        ${_btPnlDistributionHTML(withData)}
+      </div>
+    `;
 }
 
 // Render feature-importance (sklearn) insights beneath the per-pair cards.
@@ -1416,6 +1939,8 @@ function runBacktest() {
             // Progressive render
             _btRenderPairCards(perPair);
             _btRenderPnlChart(perPair, perPair.reduce((a, r) => a + Number(r.total_pnl || 0), 0));
+            _btRenderCorrelations(perPair);
+            _btRenderAssumptions(perPair);
         } catch (_) {}
     });
 
@@ -1424,7 +1949,9 @@ function runBacktest() {
             const data = JSON.parse(e.data);
             data.per_pair = (data.per_pair || []).map(_btNormalisePair);
             _btRenderResults(data);
+            _btRenderCorrelations(data.per_pair);
             _btRenderMLInsights(data.per_pair);
+            _btRenderAssumptions(data.per_pair);
             const dur = data.duration_s != null ? ` in ${data.duration_s}s` : '';
             _btSetStatus(`Done${dur}.`);
         } catch (err) {
@@ -1442,8 +1969,31 @@ function runBacktest() {
             if (e && e.data) msg = (JSON.parse(e.data).error || msg);
         } catch (_) {}
         if (es.readyState === EventSource.CLOSED) {
-            _btSetStatus('Backtest failed: ' + msg, true);
-            cleanup();
+            // Connection is dead — probe the endpoint to find out WHY.
+            // EventSource swallows HTTP status codes so we re-fetch to expose
+            // 404 / 409 / 500 / server-not-restarted scenarios to the user.
+            fetch('/api/backtest/stream?' + qs.toString(), { method: 'GET' })
+                .then(async (r) => {
+                    if (r.status === 404) {
+                        _btSetStatus(
+                            'Backtest failed: server does not know /api/backtest/stream — restart the Flask server so the new code loads.',
+                            true);
+                    } else if (r.status === 409) {
+                        _btSetStatus('Backtest failed: another backtest is still running.', true);
+                    } else if (r.status >= 500) {
+                        let body = '';
+                        try { body = (await r.text()).slice(0, 300); } catch (_) {}
+                        _btSetStatus(`Backtest failed: server error ${r.status}. ${body}`, true);
+                    } else if (!r.ok) {
+                        _btSetStatus(`Backtest failed: HTTP ${r.status}.`, true);
+                    } else {
+                        _btSetStatus('Backtest failed: ' + msg + ' (stream closed before any events).', true);
+                    }
+                })
+                .catch((err) => {
+                    _btSetStatus('Backtest failed: cannot reach server (' + String(err).slice(0, 120) + ').', true);
+                })
+                .finally(() => cleanup());
         } else if (es.readyState === EventSource.CONNECTING) {
             // transient — let the browser reconnect silently
         } else {

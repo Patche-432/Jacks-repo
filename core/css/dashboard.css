@@ -720,6 +720,7 @@ input[type=range]:focus{outline:none}
   }
 }
 
+.thought[data-src="strategy"]{border-left-color:var(--cyan)}
 .thought[data-src="ai_pro_signal"]{border-left-color:var(--cyan)}
 .thought[data-src="ai_entry"]{border-left-color:var(--purple)}
 .thought[data-src="ai_risk"]{border-left-color:var(--amber)}

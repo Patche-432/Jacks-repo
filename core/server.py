@@ -438,10 +438,10 @@ def bot_status():
                         last_signal = f"{sym} {m.group(1).upper()}"
                 if last_signal:
                     break
-        # Most recent ai_pro_signal or ai_entry with a BUY/SELL action → bias
+        # Most recent strategy or ai_entry with a BUY/SELL action → bias
         for t in reversed(recent):
             src = t.get('source', '')
-            if src in ('ai_pro_signal', 'ai_entry') and t.get('action') in ('buy', 'sell'):
+            if src in ('strategy', 'ai_pro_signal', 'ai_entry') and t.get('action') in ('buy', 'sell'):
                 market_bias  = t['action'].upper()
                 confidence   = t.get('confidence')
                 break
@@ -719,6 +719,13 @@ def bot_performance():
         if not closed:
             return jsonify({'ok': True, 'kpis': _empty_kpis(), 'equity_curve': []})
 
+        # mt5.history_deals_get does NOT guarantee chronological order; sort
+        # explicitly so the cumulative equity curve is monotonic-in-time.
+        try:
+            closed.sort(key=lambda d: getattr(d, 'time', 0))
+        except Exception:
+            pass
+
         profits = [d.profit + d.swap + d.commission for d in closed]
         wins = [p for p in profits if p > 0]
         losses = [p for p in profits if p < 0]
@@ -767,7 +774,10 @@ def bot_performance():
         avg_win = (sum(wins) / len(wins)) if wins else 0.0
         avg_loss = (abs(sum(losses)) / len(losses)) if losses else 0.0
         avg_ratio = (avg_win / avg_loss) if avg_loss > 0 else (999.0 if avg_win > 0 else 0.0)
-        recovery = (abs(running) / max_dd) if max_dd > 0 else 0.0
+        # Recovery factor = net P&L / max drawdown. Keep the sign so a
+        # net-losing strategy shows a negative (or zero) recovery, not a
+        # misleading positive number.
+        recovery = (running / max_dd) if max_dd > 0 else 0.0
 
         kpis = {
             'win_rate': round(win_rate, 1),
@@ -902,7 +912,11 @@ def api_backtest_run():
         for symbol in pairs:
             log.info("[BACKTEST] %s days=%d lot=%.2f", symbol, days, lot_size)
             try:
-                bt = AI_ProBacktester(lot_size=lot_size)
+                # Pure strategy validation — no 1R partial close, no BE
+                # trail. Whole position exits at first SL/TP/timeout so
+                # we're measuring the signal, not the management overlay.
+                bt = AI_ProBacktester(lot_size=lot_size,
+                                      enable_trade_management=False)
                 result = bt.run(symbol, days=days)
             except Exception as exc:
                 log.exception("backtest failed for %s", symbol)
@@ -1068,7 +1082,12 @@ def api_backtest_stream():
                 _push({"__event__": "pair_start", "symbol": symbol})
 
                 try:
-                    bt = AI_ProBacktester(lot_size=lot_size)
+                    # Pure strategy validation — no 1R partial close, no
+                    # BE trail. The whole position exits at the first
+                    # SL/TP/timeout so the numbers measure the signal
+                    # itself, not the management overlay.
+                    bt = AI_ProBacktester(lot_size=lot_size,
+                                          enable_trade_management=False)
                     result = bt.run(
                         symbol,
                         days=days,
@@ -1132,6 +1151,28 @@ def api_backtest_stream():
                     "avg_win_pips": float(result.get("avg_win_pips", 0.0) or 0.0),
                     "avg_loss_pips": float(result.get("avg_loss_pips", 0.0) or 0.0),
                     "feature_importance": result.get("feature_importance"),
+                    # Modelling assumptions used for this pair (entry fill,
+                    # spread, intrabar policy, pip-USD model, etc).
+                    "assumptions": result.get("assumptions"),
+                    # Win/loss correlation breakdowns — plotted in the
+                    # BACKTEST tab so the user can see which environment,
+                    # hour, weekday, and confidence band correlated with
+                    # winning vs losing trades.
+                    "by_env":              result.get("by_env") or {},
+                    "by_side":             result.get("by_side") or {},
+                    "by_hour":             result.get("by_hour") or {},
+                    "by_dow":              result.get("by_dow") or {},
+                    "confidence_buckets":  result.get("confidence_buckets") or {},
+                    "pnl_distribution":    result.get("pnl_distribution") or {},
+                    "component_correlations": result.get("component_correlations") or {},
+                    "by_quality":          result.get("by_quality") or {},
+                    "by_exit_reason":      result.get("by_exit_reason") or {},
+                    # Max drawdown (peak-to-trough) for this pair, plus
+                    # the trade-by-trade cum-P&L stream so the aggregate
+                    # can be recomputed correctly across pairs.
+                    "max_drawdown":        float(result.get("max_drawdown", 0.0) or 0.0),
+                    "max_drawdown_pct":    float(result.get("max_drawdown_pct", 0.0) or 0.0),
+                    "equity_curve":        result.get("equity_curve") or [],
                 }
                 per_pair.append(pair_entry)
                 _push({"__event__": "pair_done", **pair_entry})
@@ -1157,6 +1198,29 @@ def api_backtest_stream():
 
             aggregate_win_rate = (total_wins / total_trades) if total_trades else 0.0
             aggregate_avg = (total_pnl / total_trades) if total_trades else 0.0
+
+            # ── Portfolio max drawdown ────────────────────────────
+            # Summing per-pair MDDs overstates the damage because pair
+            # drawdowns don't occur simultaneously. The honest way is to
+            # merge every pair's trade P&L stream in chronological order
+            # and run one equity curve on the combined flow.
+            agg_stream: list[tuple[str, float]] = []
+            for p in per_pair:
+                for pt in (p.get("equity_curve") or []):
+                    agg_stream.append((pt.get("t", ""), float(pt.get("pnl", 0.0))))
+            agg_stream.sort(key=lambda x: x[0])
+            agg_running = 0.0
+            agg_peak    = 0.0
+            agg_mdd     = 0.0
+            for _, pnl in agg_stream:
+                agg_running += pnl
+                if agg_running > agg_peak:
+                    agg_peak = agg_running
+                dd = agg_peak - agg_running
+                if dd > agg_mdd:
+                    agg_mdd = dd
+            agg_mdd_pct = ((agg_mdd / agg_peak) * 100.0) if agg_peak > 1e-9 else 0.0
+
             _push({
                 "__event__": "done",
                 "ok": True,
@@ -1175,6 +1239,12 @@ def api_backtest_stream():
                     "total_pnl_label": _fmt_money(total_pnl),
                     "avg_pnl_per_trade": round(aggregate_avg, 2),
                     "avg_pnl_label": _fmt_money(aggregate_avg),
+                    # MDD is reported as a non-negative magnitude; the
+                    # label prefixes "-" so the card reads like a loss.
+                    "max_drawdown":       round(agg_mdd, 2),
+                    "max_drawdown_label": (f"-${agg_mdd:,.2f}"
+                                           if agg_mdd > 0 else "$0.00"),
+                    "max_drawdown_pct":   round(agg_mdd_pct, 2),
                 },
                 "per_pair": per_pair,
             })

@@ -69,6 +69,45 @@ def get_pip_value(symbol: str) -> float:
         return 0.01  # JPY pairs: 2 decimal places
     return 0.0001   # Standard pairs: 4 decimal places
 
+
+def get_pip_usd_value(symbol: str, lot_size: float = 1.0,
+                      jpy_quote_rate: float = 150.0) -> float:
+    """
+    USD value of one pip for `lot_size` lots.
+
+    For pairs quoted in USD (xxx/USD): exactly $10 per pip per 1.0 lot.
+    For pairs quoted in JPY (xxx/JPY): ~1000 JPY per pip per 1.0 lot, then
+    converted to USD by dividing by the USD/JPY rate. We use a fixed
+    `jpy_quote_rate` (default ~150) for repeatability — exact value moves
+    with the market but ~$6.67/pip is a far better approximation than the
+    flat $10 used previously.
+
+    For other quote currencies, this is still approximate; extend as
+    needed.
+    """
+    sym = symbol.upper()
+    # Standard contract size for forex = 100,000 units of base currency
+    contract = 100_000.0 * lot_size
+    if sym.endswith("JPY"):
+        pip_in_quote = contract * 0.01           # 1000 JPY per pip per lot
+        return pip_in_quote / max(1.0, jpy_quote_rate)
+    if sym.endswith("USD"):
+        return contract * 0.0001                  # $10 per pip per lot
+    # Fallback for cross pairs we don't model (CHF, AUD, etc.) — keep the
+    # historical $10 default but make it explicit so the caller can override.
+    return 10.0 * lot_size
+
+
+def default_spread_pips(symbol: str) -> float:
+    """Typical retail-broker spread for the major pairs we trade.
+
+    Used as a cost on entry. Override via AI_ProBacktester(spread_pips=...).
+    """
+    sym = symbol.upper()
+    if "JPY" in sym:
+        return 2.0   # GBPJPY / EURJPY are wider
+    return 1.0       # EURUSD / GBPUSD are typically <=1 pip on majors
+
 # ============================================================ #
 # DATA STRUCTURE                                               #
 # ============================================================ #
@@ -114,19 +153,21 @@ class Trade:
         self.exit_price = exit_price
         self.exit_time = exit_time
         self.exit_reason = reason
-        
-        # Determine pip value based on symbol (JPY pairs use 0.01, others use 0.0001)
-        pip_value = get_pip_value(self.signal.symbol)
-        
+
+        # Determine pip size based on symbol (JPY pairs use 0.01, others use 0.0001)
+        pip_size = get_pip_value(self.signal.symbol)
+
         if self.signal.signal == "BUY":
-            self.profit_pips = (exit_price - self.entry_price) / pip_value
-            risk_pips = (self.entry_price - self.signal.stop_loss) / pip_value
+            self.profit_pips = (exit_price - self.entry_price) / pip_size
+            risk_pips = (self.entry_price - self.signal.stop_loss) / pip_size
         else:  # SELL
-            self.profit_pips = (self.entry_price - exit_price) / pip_value
-            risk_pips = (self.signal.stop_loss - self.entry_price) / pip_value
-        
-        # Calculate profit based on lot size: $10 per pip per 1.0 lot
-        self.profit = self.profit_pips * (10.0 * lot_size)
+            self.profit_pips = (self.entry_price - exit_price) / pip_size
+            risk_pips = (self.signal.stop_loss - self.entry_price) / pip_size
+
+        # Per-pip USD value (handles JPY quote pairs correctly — was previously
+        # a flat $10 which overstated JPY P&L by ~50%).
+        usd_per_pip = get_pip_usd_value(self.signal.symbol, lot_size=lot_size)
+        self.profit = self.profit_pips * usd_per_pip
         
         self.duration_minutes = int((exit_time - self.entry_time).total_seconds() / 60)
         
@@ -169,12 +210,38 @@ class AI_ProBacktester:
         max_trade_duration_bars: int = 96,  # 24 hours on M15
         risk_per_trade_pips: float = 50.0,  # How many pips SL represents
         lot_size: float = 1.0,  # Lot size (0.50, 1.0, etc.)
+        # ── Accuracy knobs ────────────────────────────────────────────
+        # Typical broker spread charged on entry (in pips). None = use
+        # default_spread_pips(symbol). Set to 0.0 to disable.
+        spread_pips: Optional[float] = None,
+        # When both TP and SL are touched in the same candle we can't
+        # tell from OHLC which hit first. "conservative" assumes SL
+        # (worst realistic outcome), "optimistic" assumes TP (old
+        # behaviour), "neutral" splits 50/50.
+        intrabar_policy: str = "conservative",
+        # ── Trade management (matches live bot) ───────────────────────
+        # When True, simulate the live 50% partial close at 1R plus
+        # stop-loss trailed to breakeven (+ buffer). When False, runs
+        # the raw strategy to first SL/TP — useful for pure signal
+        # quality validation, but will NOT match live P&L.
+        enable_trade_management: bool = True,
+        partial_close_ratio: float    = 0.5,
+        partial_close_rr:    float    = 1.0,
+        breakeven_buffer_pips: float  = 1.0,
     ):
         self.symbols = symbols or ["EURUSD"]
         self.lookback_bars = lookback_bars
         self.max_trade_duration_bars = max_trade_duration_bars
         self.risk_per_trade_pips = risk_per_trade_pips
         self.lot_size = lot_size
+        self.spread_pips_override = spread_pips
+        self.intrabar_policy = intrabar_policy if intrabar_policy in {
+            "conservative", "optimistic", "neutral"
+        } else "conservative"
+        self.enable_trade_management = bool(enable_trade_management)
+        self.partial_close_ratio     = float(partial_close_ratio)
+        self.partial_close_rr        = float(partial_close_rr)
+        self.breakeven_buffer_pips   = float(breakeven_buffer_pips)
         
         # Import AI_Pro lazily to avoid MT5 requirement if just analyzing
         self._strategy = None
@@ -215,89 +282,140 @@ class AI_ProBacktester:
             log.error("Failed to initialize MT5/AI_Pro: %s", e)
     
     def fetch_data(self, symbol: str, days: int = 30) -> Optional[pd.DataFrame]:
-        """Fetch M15 historical data for specified number of days."""
+        """
+        Fetch M15 historical data covering the **most recent `days`
+        calendar days**, ending at the current UTC moment.
+
+        Uses `copy_rates_range(start, end)` so the window rolls forward
+        with real time — every run gets fresh data ending now. We pull
+        two extra days of warm-up so the strategy has 50+ bars of
+        swing-point context before the first backtested bar.
+
+        Falls back to `copy_rates_from_pos(0, N)` if the range query
+        returns nothing (some broker feeds balk on narrow ranges over
+        weekends).
+        """
         self._ensure_mt5()
-        
+
         if self._mt5 is None:
             log.warning("MT5 not available; cannot fetch live data")
             return None
-        
+
         try:
-            # Calculate bars needed: ~96 bars per trading day (24h * 60min / 15min)
-            # But use higher multiplier to account for market hours only
-            bars_needed = max(self.lookback_bars, days * 96)
-            
-            rates = self._mt5.copy_rates_from_pos(
-                symbol, self._mt5.TIMEFRAME_M15, 0, bars_needed
+            now_utc   = datetime.now(timezone.utc)
+            warmup_d  = 2  # ~192 M15 bars → plenty of lookback for ENV logic
+            start_utc = now_utc - timedelta(days=int(days) + warmup_d)
+
+            rates = self._mt5.copy_rates_range(
+                symbol, self._mt5.TIMEFRAME_M15, start_utc, now_utc
             )
-            if rates is None or len(rates) < 10:
-                log.warning("Not enough data for %s (requested %d bars)", symbol, bars_needed)
+            if rates is None or len(rates) < 50:
+                # Broker returned nothing meaningful — fall back to the
+                # bar-count query. Over-request slightly to cover the
+                # weekend-gap shortfall vs. `days * 96`.
+                bars_needed = max(self.lookback_bars,
+                                  int((int(days) + warmup_d) * 96))
+                log.info(
+                    "copy_rates_range returned %s; falling back to "
+                    "copy_rates_from_pos(0, %d) for %s",
+                    "None" if rates is None else f"{len(rates)} bars",
+                    bars_needed, symbol,
+                )
+                rates = self._mt5.copy_rates_from_pos(
+                    symbol, self._mt5.TIMEFRAME_M15, 0, bars_needed
+                )
+
+            if rates is None or len(rates) < 50:
+                log.warning("Not enough data for %s (need 50+ M15 bars)", symbol)
                 return None
-            
+
             df = pd.DataFrame(rates)
             df["time"] = pd.to_datetime(df["time"], unit="s")
             df = df.sort_values("time").reset_index(drop=True)
-            
-            log.info("Fetched %d M15 candles for %s (covering ~%d days)", len(df), symbol, len(df) // 96)
+
+            first_ts = df.iloc[0]["time"]
+            last_ts  = df.iloc[-1]["time"]
+            log.info(
+                "Fetched %d M15 bars for %s  window=[%s → %s]  (rolling "
+                "%d-day request + %d-day warm-up)",
+                len(df), symbol, first_ts, last_ts, int(days), warmup_d,
+            )
             return df
-        
+
         except Exception as e:
             log.error("Data fetch error [%s]: %s", symbol, e)
             return None
     
     def _fetch_daily(self, symbol: str, bars: int = 90) -> pd.DataFrame:
-        """Fetch daily historical data for the backtest period."""
+        """Fetch daily candles ending NOW. `bars` is treated as the
+        calendar-day lookback (we always over-fetch a bit to be safe).
+        """
         if self._mt5 is None:
             log.warning("MT5 not available; cannot fetch daily data")
             return pd.DataFrame()
-        
+
         try:
+            # Always fetch at least 90 days of D1 context — the strategy
+            # only ever reads previous days, so extra history is free.
+            count = max(int(bars), 90)
             rates = self._mt5.copy_rates_from_pos(
-                symbol, self._mt5.TIMEFRAME_D1, 0, bars
+                symbol, self._mt5.TIMEFRAME_D1, 0, count
             )
             if rates is None or len(rates) < 1:
                 log.warning("Not enough daily data for %s", symbol)
                 return pd.DataFrame()
-            
+
             df = pd.DataFrame(rates)
             df["time"] = pd.to_datetime(df["time"], unit="s")
             df = df.sort_values("time").reset_index(drop=True)
-            
-            log.info("Fetched %d daily candles for %s", len(df), symbol)
+
+            log.info("Fetched %d daily candles for %s (ending %s)",
+                     len(df), symbol, df.iloc[-1]["time"])
             return df
-        
+
         except Exception as e:
             log.error("Daily data fetch error [%s]: %s", symbol, e)
             return pd.DataFrame()
-    
+
     def _fetch_weekly(self, symbol: str, bars: int = 52) -> pd.DataFrame:
-        """Fetch weekly historical data for the backtest period."""
+        """Fetch weekly candles ending NOW."""
         if self._mt5 is None:
             log.warning("MT5 not available; cannot fetch weekly data")
             return pd.DataFrame()
-        
+
         try:
+            count = max(int(bars), 52)
             rates = self._mt5.copy_rates_from_pos(
-                symbol, self._mt5.TIMEFRAME_W1, 0, bars
+                symbol, self._mt5.TIMEFRAME_W1, 0, count
             )
             if rates is None or len(rates) < 1:
                 log.warning("Not enough weekly data for %s", symbol)
                 return pd.DataFrame()
-            
+
             df = pd.DataFrame(rates)
             df["time"] = pd.to_datetime(df["time"], unit="s")
             df = df.sort_values("time").reset_index(drop=True)
-            
-            log.info("Fetched %d weekly candles for %s", len(df), symbol)
+
+            log.info("Fetched %d weekly candles for %s (ending %s)",
+                     len(df), symbol, df.iloc[-1]["time"])
             return df
-        
+
         except Exception as e:
             log.error("Weekly data fetch error [%s]: %s", symbol, e)
             return pd.DataFrame()
     
     def generate_signals(self, symbol: str, df: pd.DataFrame,
-                         progress_cb: Optional[Callable[[dict], None]] = None) -> List[Signal]:
-        """Generate signals for each candle in history."""
+                         progress_cb: Optional[Callable[[dict], None]] = None,
+                         window_start: Optional[datetime] = None) -> List[Signal]:
+        """
+        Generate signals for each candle in history.
+
+        If `window_start` is provided, only bars at or after that UTC
+        timestamp are evaluated as signal candidates — earlier bars are
+        treated as warm-up context for the strategy's swing detection
+        (which needs at least 50 prior bars). This keeps the reported
+        backtest window tight to what the user asked for.
+        """
         self._ensure_mt5()
 
         if self._strategy is None:
@@ -323,17 +441,38 @@ class AI_ProBacktester:
             df_weekly = None
         
         signals = []
-        total_bars = max(1, len(df) - 50)
+        # Skip the very last bar — MT5 includes the currently-forming
+        # candle whose close is a partial tick. Stop one bar early so
+        # every bar we evaluate is fully closed (lookahead safety).
+        last_closed_idx = len(df) - 1  # exclusive upper bound below
+
+        # Find the first bar inside the user's requested window. Earlier
+        # bars serve as warm-up for the strategy (need 50+ swing points),
+        # but they don't contribute signals. This keeps the reported
+        # period honest: if the user asks for "7 days", signals come
+        # from the last 7 days, not the 9-day fetch window.
+        if window_start is not None:
+            # df["time"] is naive UTC; strip tzinfo on window_start to compare
+            ws = (window_start.replace(tzinfo=None)
+                  if window_start.tzinfo is not None else window_start)
+            mask = df["time"] >= ws
+            first_in_window = int(mask.values.argmax()) if mask.any() else last_closed_idx
+        else:
+            first_in_window = 50
+        start_idx = max(50, first_in_window)
+
+        total_bars = max(1, last_closed_idx - start_idx)
         _emit({"type": "signals_begin", "symbol": symbol, "total_bars": total_bars})
 
         # Simulate walking through history
-        for i in range(50, len(df)):  # Start after 50 candles (need lookback)
+        for i in range(start_idx, last_closed_idx):  # warm-up is [0..start_idx)
             # Emit progress every ~5% of the run so the UI can update live
-            if (i - 50) > 0 and (i - 50) % max(1, total_bars // 20) == 0:
+            bars_done = i - start_idx
+            if bars_done > 0 and bars_done % max(1, total_bars // 20) == 0:
                 _emit({
                     "type": "bar",
                     "symbol": symbol,
-                    "bar": i - 50,
+                    "bar": bars_done,
                     "total": total_bars,
                     "signals_so_far": len(signals),
                 })
@@ -371,31 +510,74 @@ class AI_ProBacktester:
                             "range": float(prev_week["high"]) - float(prev_week["low"]),
                         }
                 
-                # Temporarily override the strategy's fetch methods
+                # Temporarily override the strategy's fetch methods. We must
+                # also override _get_daily_trend_bias because the live version
+                # calls mt5.copy_rates_from_pos directly — which would leak the
+                # CURRENT daily trend into every replayed bar (lookahead bias).
                 original_fetch = self._strategy._fetch_m15
                 original_levels = self._strategy.get_previous_day_levels
-                
+                original_daily_bias = getattr(
+                    self._strategy, "_get_daily_trend_bias", None
+                )
+
                 def mock_fetch(sym):
                     return df_slice
-                
+
                 def mock_levels(sym):
                     if correct_levels:
                         return correct_levels
                     return {"date": bar_date, "high": 0.0, "low": 0.0, "range": 0.0}
-                
+
+                # Compute the historically-correct daily trend at bar_time:
+                # use today's daily candle's open vs the current M15 close
+                # (the bar we're replaying). Falls back to "neutral" if no
+                # daily data is available.
+                def mock_daily_trend(sym):
+                    try:
+                        if df_daily is None or len(df_daily) == 0:
+                            return "neutral"
+                        today_rows = df_daily[df_daily["time"].dt.date == bar_date]
+                        if len(today_rows) == 0:
+                            # Fall back to last completed daily candle
+                            prev = df_daily[df_daily["time"].dt.date < bar_date]
+                            if len(prev) == 0:
+                                return "neutral"
+                            row = prev.iloc[-1]
+                            return ("bullish" if row["close"] > row["open"]
+                                    else "bearish" if row["close"] < row["open"]
+                                    else "neutral")
+                        today_open = float(today_rows.iloc[0]["open"])
+                        cur_close  = float(df_slice.iloc[-1]["close"])
+                        if cur_close > today_open:
+                            return "bullish"
+                        if cur_close < today_open:
+                            return "bearish"
+                        return "neutral"
+                    except Exception:
+                        return "neutral"
+
                 self._strategy._fetch_m15 = mock_fetch
                 self._strategy.get_previous_day_levels = mock_levels
-                
-                # Also set these directly as a safety net
+                if original_daily_bias is not None:
+                    self._strategy._get_daily_trend_bias = mock_daily_trend
+
+                # Also set these directly as a safety net. Always assign
+                # (even when levels are missing) so a stale value from a
+                # previous iteration can't leak into the current bar.
                 if correct_levels:
                     self._strategy.previous_day_high = correct_levels["high"]
-                    self._strategy.previous_day_low = correct_levels["low"]
-                
-                # Set weekly levels as attributes if available
+                    self._strategy.previous_day_low  = correct_levels["low"]
+                else:
+                    self._strategy.previous_day_high = None
+                    self._strategy.previous_day_low  = None
+
                 if correct_weekly:
                     self._strategy.previous_week_high = correct_weekly["high"]
-                    self._strategy.previous_week_low = correct_weekly["low"]
-                
+                    self._strategy.previous_week_low  = correct_weekly["low"]
+                else:
+                    self._strategy.previous_week_high = None
+                    self._strategy.previous_week_low  = None
+
                 try:
                     # Generate signal at this point
                     raw_signal = self._strategy.generate_trade_signal(symbol)
@@ -421,6 +603,8 @@ class AI_ProBacktester:
                     # Restore original methods
                     self._strategy._fetch_m15 = original_fetch
                     self._strategy.get_previous_day_levels = original_levels
+                    if original_daily_bias is not None:
+                        self._strategy._get_daily_trend_bias = original_daily_bias
             
             except Exception as e:
                 log.error("Signal gen error at bar %d: %s", i, str(e)[:200])
@@ -436,8 +620,50 @@ class AI_ProBacktester:
     def simulate_trades(self, symbol: str, signals: List[Signal],
                         df: pd.DataFrame,
                         progress_cb: Optional[Callable[[dict], None]] = None) -> List[Trade]:
-        """Simulate trade execution and exit."""
-        trades = []
+        """
+        Simulate trade execution and exit with realistic assumptions.
+
+        Entry model
+        -----------
+        Signal fires at close of bar i; order fills at open of bar i+1.
+        MT5 OHLC is BID-priced, so:
+            BUY  fills at open + full spread   (ask fill)
+            SELL fills at open                 (bid fill)
+        This matches the round-trip cost a retail account pays.
+
+        Exit model
+        ----------
+        Two modes (`enable_trade_management`):
+
+        A) FULL MANAGEMENT (default, matches live bot):
+             Phase 1 ("full"):   whole position open at initial SL.
+                - SL hit            → full loss, exit.
+                - 1R target hit     → close `partial_close_ratio` (50%) at
+                                      1R, trail SL to BE + buffer, switch
+                                      to runner phase.
+                - TP hit first      → rare (rr>1) but supported: full TP.
+             Phase 2 ("runner"): (1 − ratio) of size open, SL at BE.
+                - BE SL hit         → runner exits at BE (small gain from
+                                      the buffer).
+                - TP hit            → runner exits at TP.
+                - Timeout           → runner exits at last bar's close.
+
+             Total P&L = ratio * partial_pips + (1 − ratio) * runner_pips
+             (both scaled by lot_size when converting to USD).
+
+        B) RAW (enable_trade_management=False):
+             Single-exit model — whole position exits at first SL/TP/timeout.
+             Useful for signal-quality testing; will NOT match live P&L.
+
+        Intrabar collisions
+        -------------------
+        When both TP and SL are touched in the same candle we can't tell
+        which hit first from OHLC. Controlled by `intrabar_policy`:
+            "conservative" (default): SL wins — worst realistic outcome
+            "optimistic":              TP wins — old behaviour
+            "neutral":                 whichever is closer to OPEN
+        """
+        trades: List[Trade] = []
 
         def _emit(payload: dict) -> None:
             if progress_cb is not None:
@@ -449,6 +675,27 @@ class AI_ProBacktester:
         total_sigs = max(1, len(signals))
         _emit({"type": "sim_begin", "symbol": symbol, "total_signals": total_sigs})
 
+        times = df["time"].to_list()
+        pip_size = get_pip_value(symbol)
+        spread_pips = (self.spread_pips_override
+                       if self.spread_pips_override is not None
+                       else default_spread_pips(symbol))
+        spread_price = spread_pips * pip_size
+        usd_per_pip  = get_pip_usd_value(symbol, lot_size=self.lot_size)
+
+        import bisect
+        times_sorted = times  # df already sorted by time
+
+        def _resolve_intrabar(c_open: float, tp: float, sl: float,
+                              sl_price: float, tp_price: float) -> Tuple[float, str]:
+            """Return (exit_price, reason) for a same-bar TP+SL collision."""
+            if self.intrabar_policy == "optimistic":
+                return tp_price, "tp"
+            if self.intrabar_policy == "neutral":
+                return (tp_price, "tp") if abs(tp - c_open) < abs(sl - c_open) \
+                    else (sl_price, "sl")
+            return sl_price, "sl"  # conservative (default)
+
         for idx, sig in enumerate(signals):
             if idx > 0 and idx % max(1, total_sigs // 10) == 0:
                 _emit({
@@ -457,72 +704,252 @@ class AI_ProBacktester:
                     "done": idx,
                     "total": total_sigs,
                 })
-            # Find candle index closest to signal time
-            entry_idx = None
-            for i, row in df.iterrows():
-                if row["time"] >= sig.ts:
-                    entry_idx = i
+
+            # Find the first bar whose time >= sig.ts; entry is the next bar.
+            pos = bisect.bisect_left(times_sorted, sig.ts)
+            if pos >= len(df) - 1:
+                continue
+
+            entry_idx  = pos + 1
+            entry_row  = df.iloc[entry_idx]
+            entry_open = float(entry_row["open"])
+            entry_time = entry_row["time"]
+            side       = str(sig.signal).upper()
+
+            # MT5 OHLC is bid-priced → BUY fills at ask (+full spread),
+            # SELL fills at bid (no adjust). Charges spread once per round
+            # trip in the correct direction.
+            if side == "BUY":
+                entry_price = entry_open + spread_price
+            elif side == "SELL":
+                entry_price = entry_open
+            else:
+                continue
+
+            sl_price = float(sig.stop_loss)
+            tp_price = float(sig.take_profit)
+
+            # Validate SL is on the correct side of entry (defensive —
+            # bad signals otherwise create negative risk_pips / huge P&L).
+            if side == "BUY" and sl_price >= entry_price:
+                continue
+            if side == "SELL" and sl_price <= entry_price:
+                continue
+
+            # Risk distance and 1R / BE targets
+            if side == "BUY":
+                risk_abs     = entry_price - sl_price
+                one_r_target = entry_price + risk_abs * self.partial_close_rr
+                be_sl        = entry_price + self.breakeven_buffer_pips * pip_size
+            else:
+                risk_abs     = sl_price - entry_price
+                one_r_target = entry_price - risk_abs * self.partial_close_rr
+                be_sl        = entry_price - self.breakeven_buffer_pips * pip_size
+
+            if risk_abs <= 0:
+                continue
+
+            trade = Trade(signal=sig, entry_price=entry_price, entry_time=entry_time)
+
+            max_exit_idx = min(entry_idx + self.max_trade_duration_bars,
+                               len(df) - 1)
+
+            # ── RAW mode ─────────────────────────────────────────────
+            if not self.enable_trade_management:
+                resolved = False
+                for j in range(entry_idx, max_exit_idx + 1):
+                    c = df.iloc[j]
+                    c_high = float(c["high"]); c_low = float(c["low"])
+                    c_time = c["time"]
+
+                    if side == "BUY":
+                        tp_hit = c_high >= tp_price
+                        sl_hit = c_low  <= sl_price
+                    else:
+                        tp_hit = c_low  <= tp_price
+                        sl_hit = c_high >= sl_price
+
+                    if tp_hit and sl_hit:
+                        exit_price, reason = _resolve_intrabar(
+                            float(c["open"]), tp_price, sl_price, sl_price, tp_price)
+                        trade.calculate_exit(exit_price, c_time, reason, self.lot_size)
+                        resolved = True; break
+                    if tp_hit:
+                        trade.calculate_exit(tp_price, c_time, "tp", self.lot_size)
+                        resolved = True; break
+                    if sl_hit:
+                        trade.calculate_exit(sl_price, c_time, "sl", self.lot_size)
+                        resolved = True; break
+
+                if not resolved:
+                    close_candle = df.iloc[max_exit_idx]
+                    exit_price = float(close_candle.get("close", entry_price))
+                    trade.calculate_exit(exit_price, close_candle["time"],
+                                         "timeout", self.lot_size)
+                trades.append(trade)
+                continue
+
+            # ── FULL MANAGEMENT mode (default) ───────────────────────
+            ratio          = self.partial_close_ratio
+            phase          = "full"
+            current_sl     = sl_price
+            partial_hit    = False  # True once 1R partial-close has fired
+            partial_pips   = 0.0    # pips realised from the partial leg
+            exit_price     = None
+            exit_time      = None
+            exit_reason    = None
+            runner_pips    = 0.0
+
+            for j in range(entry_idx, max_exit_idx + 1):
+                c = df.iloc[j]
+                c_high = float(c["high"]); c_low = float(c["low"])
+                c_open = float(c["open"]); c_time = c["time"]
+
+                if phase == "full":
+                    if side == "BUY":
+                        sl_hit = c_low  <= current_sl
+                        r1_hit = c_high >= one_r_target
+                        tp_hit = c_high >= tp_price
+                    else:
+                        sl_hit = c_high >= current_sl
+                        r1_hit = c_low  <= one_r_target
+                        tp_hit = c_low  <= tp_price
+
+                    # Initial-SL vs 1R collision → conservative SL
+                    if sl_hit and r1_hit:
+                        if side == "BUY":
+                            runner_pips = (current_sl - entry_price) / pip_size
+                        else:
+                            runner_pips = (entry_price - current_sl) / pip_size
+                        exit_price, exit_time, exit_reason = current_sl, c_time, "sl"
+                        break
+
+                    if sl_hit:
+                        if side == "BUY":
+                            runner_pips = (current_sl - entry_price) / pip_size
+                        else:
+                            runner_pips = (entry_price - current_sl) / pip_size
+                        exit_price, exit_time, exit_reason = current_sl, c_time, "sl"
+                        break
+
+                    # TP before 1R is only possible if rr < 1 (unusual).
+                    # Close the whole position at TP.
+                    if tp_hit and not r1_hit:
+                        if side == "BUY":
+                            runner_pips = (tp_price - entry_price) / pip_size
+                        else:
+                            runner_pips = (entry_price - tp_price) / pip_size
+                        exit_price, exit_time, exit_reason = tp_price, c_time, "tp"
+                        break
+
+                    if r1_hit:
+                        # 50% closes at 1R, SL trails to BE, runner continues.
+                        if side == "BUY":
+                            partial_pips = (one_r_target - entry_price) / pip_size
+                        else:
+                            partial_pips = (entry_price - one_r_target) / pip_size
+                        partial_hit = True
+                        phase       = "runner"
+                        current_sl  = be_sl
+                        # Intentionally do NOT re-check runner exits on the
+                        # trigger bar — we can't resolve post-1R intrabar
+                        # order from OHLC. Resume next bar.
+                        continue
+
+                    # Nothing hit → next bar
+                    continue
+
+                # phase == "runner"
+                if side == "BUY":
+                    sl_hit = c_low  <= current_sl
+                    tp_hit = c_high >= tp_price
+                else:
+                    sl_hit = c_high >= current_sl
+                    tp_hit = c_low  <= tp_price
+
+                if sl_hit and tp_hit:
+                    xp, xr = _resolve_intrabar(c_open, tp_price, current_sl,
+                                               current_sl, tp_price)
+                    if side == "BUY":
+                        runner_pips = (xp - entry_price) / pip_size
+                    else:
+                        runner_pips = (entry_price - xp) / pip_size
+                    exit_price, exit_time, exit_reason = xp, c_time, "be+" + xr
                     break
-            
-            if entry_idx is None or entry_idx >= len(df) - 1:
-                continue  # Can't simulate trade
-            
-            # Simulate trade execution on next candle
-            entry_candle = df.iloc[entry_idx]
-            entry_time = entry_candle["time"]
-            entry_price = entry_candle.get("close", sig.entry_price)
-            
-            trade = Trade(
-                signal=sig,
-                entry_price=entry_price,
-                entry_time=entry_time,
-            )
-            
-            # Look for exit (TP, SL, or timeout)
-            max_exit_idx = min(entry_idx + self.max_trade_duration_bars, len(df) - 1)
-            
-            for j in range(entry_idx + 1, max_exit_idx + 1):
-                candle = df.iloc[j]
-                candle_high = candle["high"]
-                candle_low = candle["low"]
-                candle_time = candle["time"]
-                
-                # Check TP hit
-                if sig.signal == "BUY" and candle_high >= sig.take_profit:
-                    trade.calculate_exit(sig.take_profit, candle_time, "tp", self.lot_size)
+
+                if tp_hit:
+                    if side == "BUY":
+                        runner_pips = (tp_price - entry_price) / pip_size
+                    else:
+                        runner_pips = (entry_price - tp_price) / pip_size
+                    exit_price, exit_time, exit_reason = tp_price, c_time, "partial+tp"
                     break
-                elif sig.signal == "SELL" and candle_low <= sig.take_profit:
-                    trade.calculate_exit(sig.take_profit, candle_time, "tp", self.lot_size)
+
+                if sl_hit:
+                    if side == "BUY":
+                        runner_pips = (current_sl - entry_price) / pip_size
+                    else:
+                        runner_pips = (entry_price - current_sl) / pip_size
+                    exit_price, exit_time, exit_reason = current_sl, c_time, "partial+be"
                     break
-                
-                # Check SL hit
-                if sig.signal == "BUY" and candle_low <= sig.stop_loss:
-                    trade.calculate_exit(sig.stop_loss, candle_time, "sl", self.lot_size)
-                    break
-                elif sig.signal == "SELL" and candle_high >= sig.stop_loss:
-                    trade.calculate_exit(sig.stop_loss, candle_time, "sl", self.lot_size)
-                    break
-            
-            # If no exit, close at timeout
-            if trade.outcome == "open":
+
+            # Timeout branch — close remainder at final bar's close
+            if exit_price is None:
                 close_candle = df.iloc[max_exit_idx]
-                exit_price = close_candle.get("close", entry_price)
-                trade.calculate_exit(exit_price, close_candle["time"], "timeout", self.lot_size)
-            
-            # Log large losses for investigation
+                cx = float(close_candle.get("close", entry_price))
+                if side == "BUY":
+                    runner_pips = (cx - entry_price) / pip_size
+                else:
+                    runner_pips = (entry_price - cx) / pip_size
+                exit_price  = cx
+                exit_time   = close_candle["time"]
+                exit_reason = ("partial+timeout" if phase == "runner"
+                               else "timeout")
+
+            # Compose the trade's final numbers. If the partial close
+            # never fired (exit happened in "full" phase), the whole
+            # position exits at runner_pips — no ratio weighting.
+            if partial_hit:
+                total_pips = ratio * partial_pips + (1.0 - ratio) * runner_pips
+            else:
+                total_pips = runner_pips
+            trade.exit_price      = exit_price
+            trade.exit_time       = exit_time
+            trade.exit_reason     = exit_reason
+            trade.profit_pips     = total_pips
+            trade.profit          = total_pips * usd_per_pip
+            trade.duration_minutes = int(
+                (exit_time - entry_time).total_seconds() / 60)
+            if trade.profit > 0:
+                trade.outcome = "WIN"
+            elif trade.profit < 0:
+                trade.outcome = "LOSS"
+            else:
+                trade.outcome = "BE"
+            # RR achieved relative to initial full-position risk
+            if risk_abs > 0:
+                risk_pips = risk_abs / pip_size
+                trade.rr_achieved = abs(total_pips) / risk_pips
+            else:
+                trade.rr_achieved = 0.0
+
             if trade.profit_pips <= -20:
                 log.warning(
-                    "LARGE LOSS DETECTED: %s %s | Entry: %.5f | SL: %.5f | TP: %.5f | "
-                    "Exit: %.5f at %s | P&L: %+.0f pips | Reason: %s | Env: %s",
-                    sig.signal, symbol, entry_price, sig.stop_loss, sig.take_profit,
-                    trade.exit_price, trade.exit_time, trade.profit_pips, trade.exit_reason,
+                    "LARGE LOSS: %s %s | Entry: %.5f | SL: %.5f | TP: %.5f | "
+                    "Exit: %.5f at %s | P&L: %+.1f pips | Reason: %s | Env: %s",
+                    side, symbol, entry_price, sl_price, tp_price,
+                    exit_price, exit_time, total_pips, exit_reason,
                     sig.environment
                 )
-            
+
             trades.append(trade)
-        
-        log.info("Simulated %d trades, closed %d", len(trades),
-                 len([t for t in trades if t.outcome != "open"]))
+
+        log.info("Simulated %d trades, closed %d  (spread=%.1fp, intrabar=%s, "
+                 "management=%s)",
+                 len(trades),
+                 len([t for t in trades if t.outcome != "open"]),
+                 spread_pips, self.intrabar_policy,
+                 "on" if self.enable_trade_management else "off")
         _emit({"type": "sim_done", "symbol": symbol, "trades": len(trades)})
         return trades
     
@@ -614,7 +1041,175 @@ class AI_ProBacktester:
                     "win_rate": r_wins / len(r_trades),
                     "avg_pnl": sum(t.profit for t in r_trades) / len(r_trades),
                 }
-        
+
+        # ── Max drawdown (equity-curve based) ──────────────────────
+        # Sort trades chronologically by exit_time (that's when P&L
+        # lands). Walk the cumulative curve, track running peak, and
+        # record the deepest peak-to-trough gap. MDD is reported as a
+        # positive magnitude (dollar amount lost from peak) — the UI
+        # formats it as a negative for visual consistency with a loss.
+        #
+        # We also emit `equity_curve` as a lightweight list of
+        # {t, pnl, cum} points so the server can aggregate across pairs
+        # into a portfolio-level drawdown (simple sum of per-pair MDDs
+        # would over-count because pair drawdowns don't occur at the
+        # same time in reality).
+        sorted_trades = sorted(
+            [t for t in trades if t.exit_time is not None],
+            key=lambda t: t.exit_time,
+        )
+        running_pnl  = 0.0
+        peak_pnl     = 0.0
+        max_dd       = 0.0
+        dd_trough_at = None  # timestamp of the worst drawdown point
+        equity_curve: List[Dict[str, Any]] = []
+        for t in sorted_trades:
+            running_pnl += float(t.profit or 0.0)
+            if running_pnl > peak_pnl:
+                peak_pnl = running_pnl
+            dd = peak_pnl - running_pnl
+            if dd > max_dd:
+                max_dd = dd
+                dd_trough_at = t.exit_time
+            # Represent timestamp as ISO so JSON round-trip is safe.
+            try:
+                ts_iso = t.exit_time.isoformat()
+            except Exception:
+                ts_iso = str(t.exit_time)
+            equity_curve.append({
+                "t":   ts_iso,
+                "pnl": round(float(t.profit or 0.0), 2),
+                "cum": round(running_pnl, 2),
+            })
+
+        max_drawdown     = round(max_dd, 2)
+        max_drawdown_pct = (round((max_dd / peak_pnl) * 100.0, 2)
+                            if peak_pnl > 1e-9 else 0.0)
+
+        # ── Correlation-with-outcome breakdowns (for the UI charts) ─
+        # These are the “what correlated with winning vs losing” surfaces.
+        # Each dict is { bucket_label: {count, wins, losses, win_rate,
+        # avg_pips, total_pnl} }. The UI plots them as bar charts.
+        def _bucket_stats(group: List[Trade]) -> Dict[str, float]:
+            n       = len(group)
+            wins_   = sum(1 for t in group if t.outcome == "WIN")
+            losses_ = sum(1 for t in group if t.outcome == "LOSS")
+            pips    = [t.profit_pips for t in group]
+            pnl     = sum(t.profit for t in group)
+            return {
+                "count":     n,
+                "wins":      wins_,
+                "losses":    losses_,
+                "win_rate":  (wins_ / n) if n else 0.0,
+                "avg_pips":  round(float(np.mean(pips)), 2) if pips else 0.0,
+                "total_pnl": round(float(pnl), 2),
+            }
+
+        # BY ENVIRONMENT  (CHoCH-BUY@PDL, Continuation-SELL@PDH, …)
+        # signal.source is free-form so we normalise here rather than in
+        # the hot loop — stripping whitespace, upper-casing trailing "@XXX".
+        def _env_key(src: str) -> str:
+            if not src:
+                return "?"
+            s = str(src).strip()
+            # Collapse variants like "CHoCH-BUY@PDL (aligned)" to the head
+            head = s.split(" ")[0]
+            return head or "?"
+
+        env_groups: Dict[str, List[Trade]] = {}
+        for t in trades:
+            env_groups.setdefault(_env_key(t.signal.source), []).append(t)
+        by_env = {k: _bucket_stats(g) for k, g in env_groups.items()}
+
+        # BY SIDE (BUY vs SELL)
+        by_side: Dict[str, Dict[str, float]] = {}
+        for side in ("BUY", "SELL"):
+            grp = [t for t in trades
+                   if str(t.signal.signal).upper() == side]
+            if grp:
+                by_side[side] = _bucket_stats(grp)
+
+        # BY HOUR OF DAY (UTC, entry time → 0..23)
+        # Empty hours are omitted — the UI handles missing keys.
+        hour_groups: Dict[int, List[Trade]] = {}
+        for t in trades:
+            et = t.entry_time
+            if et is None:
+                continue
+            try:
+                h = int(et.hour)
+            except Exception:
+                continue
+            hour_groups.setdefault(h, []).append(t)
+        by_hour = {str(h): _bucket_stats(g)
+                   for h, g in sorted(hour_groups.items())}
+
+        # BY DAY OF WEEK (Mon=0 .. Fri=4 in practice; FX closes Sat/Sun)
+        dow_groups: Dict[int, List[Trade]] = {}
+        for t in trades:
+            et = t.entry_time
+            if et is None:
+                continue
+            try:
+                d = int(et.weekday())
+            except Exception:
+                continue
+            dow_groups.setdefault(d, []).append(t)
+        DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        by_dow = {DOW_NAMES[d]: _bucket_stats(g)
+                  for d, g in sorted(dow_groups.items())
+                  if 0 <= d < 7}
+
+        # CONFIDENCE BUCKETS — fixed 10-percentile edges so two runs are
+        # directly comparable even if one has a narrower confidence
+        # distribution. Edges are on the 0–1 scale (signal.confidence).
+        conf_edges = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01]
+        conf_labels = ["<50", "50-60", "60-70", "70-80", "80-90", "90-100"]
+        conf_groups: Dict[str, List[Trade]] = {lbl: [] for lbl in conf_labels}
+        for t in trades:
+            c = float(t.signal.confidence or 0.0)
+            for i in range(len(conf_labels)):
+                if conf_edges[i] <= c < conf_edges[i + 1]:
+                    conf_groups[conf_labels[i]].append(t)
+                    break
+        confidence_buckets = {lbl: _bucket_stats(g)
+                              for lbl, g in conf_groups.items() if g}
+
+        # P&L DISTRIBUTION — histogram of profit_pips.
+        # Bins are anchored to the observed range so wide runs don't end
+        # up with one massive bin. We cap at 12 bins so the chart stays
+        # legible; fewer if the dataset is thin.
+        pnl_distribution: Dict[str, Any] = {}
+        pip_values = [float(t.profit_pips) for t in trades
+                      if t.profit_pips is not None]
+        if pip_values:
+            lo = min(pip_values); hi = max(pip_values)
+            # Pad so boundaries aren't on extreme samples
+            if hi - lo < 1e-6:
+                lo -= 1.0; hi += 1.0
+            pad = (hi - lo) * 0.05
+            lo -= pad; hi += pad
+            nbins = max(5, min(12, len(pip_values) // 5 or 5))
+            counts, edges = np.histogram(pip_values, bins=nbins, range=(lo, hi))
+            bins_out = []
+            for i in range(nbins):
+                e0 = float(edges[i]); e1 = float(edges[i + 1])
+                mid = (e0 + e1) / 2.0
+                bins_out.append({
+                    "x0":    round(e0, 2),
+                    "x1":    round(e1, 2),
+                    "mid":   round(mid, 2),
+                    "count": int(counts[i]),
+                    "sign":  "win" if mid > 0 else ("loss" if mid < 0 else "be"),
+                })
+            pnl_distribution = {
+                "bins":   bins_out,
+                "min":    round(lo, 2),
+                "max":    round(hi, 2),
+                "n":      len(pip_values),
+                "median": round(float(np.median(pip_values)), 2),
+            }
+
         return {
             "total_trades": len(trades),
             "wins": wins,
@@ -624,13 +1219,47 @@ class AI_ProBacktester:
             "avg_pnl_per_trade": round(avg_pnl, 2),
             "avg_win_pips": round(avg_win, 1),
             "avg_loss_pips": round(avg_loss, 1),
-            "profit_factor": round(abs(win_pips / loss_pips), 2) if loss_pips != 0 else 0,
+            # Profit factor: gross win pips / |gross loss pips|. When there
+            # are no losses, conventional reporting uses "infinity"; we send
+            # a high sentinel (999) which the UI renders as "∞".
+            "profit_factor": (round(abs(win_pips / loss_pips), 2)
+                              if loss_pips != 0
+                              else (999.0 if win_pips > 0 else 0.0)),
             "avg_rr_achieved": round(np.mean([t.rr_achieved for t in trades if t.rr_achieved > 0]), 2),
             "avg_duration_minutes": round(avg_duration, 1),
+            "max_drawdown":     max_drawdown,
+            "max_drawdown_pct": max_drawdown_pct,
+            "equity_curve":     equity_curve,
             "component_correlations": correlations,
             "by_quality": by_quality,
             "by_exit_reason": by_exit_reason,
+            "by_env": by_env,
+            "by_side": by_side,
+            "by_hour": by_hour,
+            "by_dow": by_dow,
+            "confidence_buckets": confidence_buckets,
+            "pnl_distribution": pnl_distribution,
             "early_exits": early_exits,
+            # Make modelling assumptions explicit so the UI / consumer
+            # can show what the numbers actually represent.
+            "assumptions": {
+                "lot_size":            self.lot_size,
+                "spread_pips":         (self.spread_pips_override
+                                        if self.spread_pips_override is not None
+                                        else None),
+                "intrabar_policy":     self.intrabar_policy,
+                "entry_fill":          ("bid-based OHLC: BUY pays full spread, "
+                                        "SELL fills at open"),
+                "trade_management":    ("1R partial close "
+                                        f"({int(self.partial_close_ratio*100)}%) "
+                                        f"+ SL→BE ({self.breakeven_buffer_pips}p)"
+                                        if self.enable_trade_management
+                                        else "raw (single SL/TP exit)"),
+                "pip_usd_model":       "JPY pairs converted at ~150 USDJPY",
+                "commission":          "not modelled",
+                "swap":                "not modelled",
+                "lookahead":           "last-forming bar skipped",
+            },
         }
     
     def run(self, symbol: str, days: int = 30,
@@ -648,8 +1277,14 @@ class AI_ProBacktester:
                     pass
 
         try:
+            # Anchor point for "the last N days" — computed ONCE so every
+            # stage (data fetch, window clip, reporting) agrees on the
+            # same "now". Any drift here would show up as 1-bar off-by-one
+            # errors between the fetched window and the reported period.
+            now_utc      = datetime.now(timezone.utc)
+            window_start = now_utc - timedelta(days=int(days))
+
             _emit({"type": "stage", "symbol": symbol, "stage": "fetching_data"})
-            # Fetch data
             df = self.fetch_data(symbol, days=days)
             if df is None or len(df) < 50:
                 log.error("Could not fetch sufficient data for %s", symbol)
@@ -658,13 +1293,18 @@ class AI_ProBacktester:
             self.candle_history[symbol] = df
 
             _emit({"type": "stage", "symbol": symbol, "stage": "generating_signals"})
-            # Generate signals
-            signals = self.generate_signals(symbol, df, progress_cb=progress_cb)
+            # Generate signals, clipping evaluation to bars inside the
+            # rolling window. Warm-up bars (2 days of prefix) still feed
+            # into the strategy's lookback but do not produce signals.
+            signals = self.generate_signals(symbol, df,
+                                            progress_cb=progress_cb,
+                                            window_start=window_start)
             if not signals:
                 log.warning("No signals generated for %s", symbol)
                 return {
                     "symbol": symbol,
-                    "period": f"{df.iloc[0]['time'].date()} to {df.iloc[-1]['time'].date()}",
+                    "period": (f"{window_start.date()} to "
+                               f"{now_utc.date()}"),
                     "total_trades": 0,
                     "error": "No signals generated",
                 }
@@ -672,7 +1312,6 @@ class AI_ProBacktester:
             self.signals.extend(signals)
 
             _emit({"type": "stage", "symbol": symbol, "stage": "simulating_trades"})
-            # Simulate trades
             trades = self.simulate_trades(symbol, signals, df, progress_cb=progress_cb)
             self.trades.extend(trades)
 
@@ -680,7 +1319,13 @@ class AI_ProBacktester:
             # Analyze
             results = self.analyze_results(trades)
             results["symbol"] = symbol
-            results["period"] = f"{df.iloc[0]['time'].date()} to {df.iloc[-1]['time'].date()}"
+            # Report the rolling window the user actually requested, not
+            # the wider fetched slice (which includes 2-day warm-up).
+            results["period"] = (f"{window_start.date()} to "
+                                 f"{now_utc.date()}")
+            results["window_start_utc"] = window_start.isoformat()
+            results["window_end_utc"]   = now_utc.isoformat()
+            results["requested_days"]   = int(days)
 
             # ML diagnostic: feature importance on the trades we just closed
             fi = self.compute_feature_importance(trades)
@@ -762,9 +1407,10 @@ class AI_ProBacktester:
             only = "WIN" if y_arr[0] == 1 else "LOSS"
             return {"error": f"All trades ended in {only} — cannot fit classifier"}
 
-        # Drop zero-variance columns so they don't clutter the chart with 0.000
+        # Drop zero-variance columns so they don't clutter the chart with 0.000.
+        # Use a small epsilon to also drop near-constant columns from float noise.
         variances = X_arr.var(axis=0)
-        keep_idx = [i for i, v in enumerate(variances) if v > 0]
+        keep_idx = [i for i, v in enumerate(variances) if v > 1e-9]
         if len(keep_idx) < 2:
             return {"error": "Fewer than 2 features have variance — nothing to learn."}
         X_arr = X_arr[:, keep_idx]
