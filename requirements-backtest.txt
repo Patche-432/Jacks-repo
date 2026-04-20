@@ -1,0 +1,5 @@
+# Backtesting / plotting dependencies (odl/backtest.py)
+-r requirements.txt
+
+matplotlib>=3.8
+scikit-learn>=1.4

@@ -1,0 +1,15 @@
+# Core runtime dependencies for Jack's trading repo
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# Optional extras:
+#   pip install -r requirements-llm.txt
+#   pip install -r requirements-backtest.txt
+
+Flask>=2.3
+flask-cors>=4.0
+numpy>=1.24
+pandas>=2.0
+requests>=2.31
+MetaTrader5>=5.0

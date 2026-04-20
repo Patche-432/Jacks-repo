@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+*.venv
 core/.mt5_key
 core/mt5_credentials_config.json
 
