@@ -1,23 +1,32 @@
 """
-ai_agent.py — Local Ollama agent replacing DeepSeek-R1 for entry review and
-in-flight risk management.
+ai_agent.py — Agent Zero, the single local-Ollama trader in the pipeline.
 
 Design principles:
 
-  1. HARD SL ALWAYS FIRES (code-enforced).  The risk agent can only TIGHTEN
-     a stop or request an EARLY close.  It cannot override the broker's
-     hard stop — that authority has been removed.
+  1. HARD SL ALWAYS FIRES (code-enforced).  While a trade is live, Agent
+     Zero can only TIGHTEN a stop or request an EARLY close.  He cannot
+     override the broker's hard stop — that authority has been removed.
 
-  2. DAILY BIAS is the agent's filter and is initiated ONLY via the prompt.
-     This module does not classify or gate on bias; it only fetches raw
-     daily_open and current_price and hands them to the agent. The LLM
+  2. DAILY BIAS is Agent Zero's entry filter and is initiated ONLY via the
+     prompt.  This module does not classify or gate on bias; it only fetches
+     raw daily_open and current_price and hands them to the agent.  The LLM
      applies the filter per its system prompt.
 
-The module exposes two classes used by ai_pro.py:
-  • EntryReviewAgent.review(symbol, signal, df)  -> dict
-  • RiskReviewAgent.review(symbol, pos_ctx)      -> dict
+  3. ONE AGENT, ONE PERSONA.  The pipeline has exactly one AI persona —
+     Agent Zero — a professional day trader who runs every trade end-to-end:
+     he filters fresh signals by the daily-bias gate and then actively
+     manages the live position.  One system prompt, one Ollama client, one
+     public method.
 
-Both classes lazily create a shared OllamaClient.  Configuration via env:
+Public surface used by ai_pro.py:
+
+  • get_agent_zero().review(signal_dict, symbol=..., df=...) -> dict
+  • get_agent_zero().review(position_ctx)                    -> dict
+
+No shims, no aliases, no second opinion — the pipeline cannot disagree
+with itself.
+
+Configuration via env:
   OLLAMA_URL      (default http://localhost:11434)
   OLLAMA_MODEL    (default qwen2.5:14b-instruct)
   AGENT_TIMEOUT_S (default 30)
@@ -27,10 +36,9 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import requests
@@ -194,41 +202,131 @@ def _coerce_float(v, default: float = 0.0) -> float:
 
 
 # ========================================================================== #
-# Entry review agent                                                          #
+# Position context dataclass — the shape Agent Zero reads for a live trade   #
 # ========================================================================== #
 
-ENTRY_SYSTEM_PROMPT = (
-    "You are a PROFESSIONAL DAY TRADER who specialises in GBPUSD, GBPJPY, "
-    "EURUSD and EURJPY — these four pairs are your bread and butter, the "
-    "cleanest London/NY sessions, and where your edge is strongest. You can "
-    "still review signals on other symbols the strategy presents, but you "
-    "know the core four best and trust setups on them most.\n\n"
-    "Your ONE job on entry: filter each strategy signal by DAILY BIAS.\n\n"
-    "Daily bias rule (price vs today's daily open):\n"
-    "  • current_price > daily_open → BULLISH → approve BUY only.\n"
-    "  • current_price < daily_open → BEARISH → approve SELL only.\n"
-    "  • current_price = daily_open → NEUTRAL → reject.\n\n"
-    "If the signal's side agrees with the daily bias, APPROVE; otherwise "
-    "REJECT. Do not second-guess the strategy's setup or SL/TP — only the "
-    "bias gate decides.\n\n"
-    "Reply with a single JSON object on one line:\n"
-    "  {\"approve\": <bool>, \"confidence\": <0.0-1.0>, \"reason\": \"<=20 words\"}"
+@dataclass
+class PositionContext:
+    symbol: str
+    ticket: int
+    side: str                 # BUY or SELL
+    entry: float
+    cur_price: float
+    cur_sl: float
+    cur_tp: float
+    profit_pts: float
+    peak_pts: float
+    atr: float
+    digits: int
+    trend_intact: Optional[bool] = None
+    structure_broken: Optional[bool] = None
+    fresh_structure: Optional[bool] = None
+    notes: str = ""
+
+
+# ========================================================================== #
+# Agent Zero — the ONE agent in the entire pipeline                           #
+# ========================================================================== #
+#
+# Agent Zero is a professional day trader who runs every trade end-to-end:
+# before entry he filters each strategy signal through the daily-bias gate,
+# and once a trade is live he actively manages it — tightening the stop or
+# closing early, never loosening.  One system prompt, one Ollama client, one
+# public method (AgentZero.review).  The input he receives on his desk — a
+# SIGNAL block for a fresh setup or a POSITION block for a live trade —
+# determines the shape of his JSON reply.
+
+AGENT_ZERO_SYSTEM_PROMPT = (
+    "You are AGENT ZERO — a professional day trader specialising in GBPUSD, "
+    "GBPJPY, EURUSD and EURJPY. These four pairs are your bread and butter: "
+    "the cleanest London/NY sessions, where your edge is strongest. You will "
+    "also review setups on other symbols the strategy presents, but you know "
+    "the core four best and trust them most.\n"
+    "\n"
+    "You run every trade from the moment a signal appears to the moment it "
+    "closes, so your thinking stays consistent across the trade's whole life. "
+    "Your edge rests on two habits:\n"
+    "\n"
+    "1) You filter every strategy signal through the DAILY BIAS before you "
+    "take it. The bias is today's price versus today's daily open:\n"
+    "   • current_price > daily_open → BULLISH → take BUY only.\n"
+    "   • current_price < daily_open → BEARISH → take SELL only.\n"
+    "   • current_price = daily_open → NEUTRAL → stand aside.\n"
+    "Approve setups that agree with the bias, reject the rest. Do not "
+    "second-guess the strategy's setup or SL/TP — only the bias gate decides.\n"
+    "\n"
+    "2) Once a trade is live, you actively manage it to MAXIMISE winners and "
+    "MINIMISE losers. You may TIGHTEN the stop or ask to CLOSE EARLY. You "
+    "never loosen risk. Allowed live actions are: hold, tighten, close_early.\n"
+    "\n"
+    "You always reply with a single JSON object on one line — no prose, no "
+    "markdown, no extra keys. The shape of the JSON follows what the user "
+    "has handed you:\n"
+    "\n"
+    "  • SIGNAL block (pre-entry review):\n"
+    "      {\"approve\": <bool>, \"confidence\": <0.0-1.0>, "
+    "\"reason\": \"<=20 words\"}\n"
+    "\n"
+    "  • POSITION block (live-trade review):\n"
+    "      {\"action\": \"hold|tighten|close_early\", "
+    "\"new_sl\": <float or null>, \"reason\": \"<=20 words\"}\n"
+    "      If action is hold or close_early, new_sl must be null. "
+    "If action is tighten, new_sl must be a valid numeric stop that is "
+    "strictly tighter than the current stop.\n"
 )
 
 
-class EntryReviewAgent:
-    """LLM-driven pre-trade approval. The daily-bias filter lives in the prompt."""
+class AgentZero:
+    """
+    The single AI persona in the pipeline — a professional day trader who
+    runs every trade end-to-end: he filters fresh signals by the daily-bias
+    gate and actively manages live positions by tightening stops or closing
+    early.  One system prompt, one Ollama client, one method.
+    """
+
+    name = "Agent Zero"
 
     def __init__(self, client: Optional[OllamaClient] = None) -> None:
         self.client = client or OllamaClient()
 
-    def review(self, symbol: str, signal: dict, df: Any) -> dict:
+    def review(self,
+               item: "dict | PositionContext",
+               *,
+               symbol: str = "",
+               df: Any = None) -> dict:
         """
-        signal must include at least: signal (BUY/SELL), entry_price, stop_loss,
-        take_profit, confidence, signal_source, reason.
-        Returns: {"approve": bool, "reason": str, "confidence": float,
-                  "htf_detail": str}
+        Hand Agent Zero whatever is on his desk and he decides:
+
+          • a strategy signal (dict) → pre-entry review; returns
+            {"approve": bool, "confidence": float, "reason": str,
+             "htf_detail": str}
+
+          • a live position (PositionContext) → live-trade review; returns
+            {"action": "hold"|"close"|"move_sl", "new_sl"?: float,
+             "reason": str}
+
+        For a signal, `symbol` (and optionally `df`) must also be supplied as
+        keyword arguments — Agent Zero needs the symbol to fetch today's
+        daily open.
         """
+        if isinstance(item, PositionContext):
+            return self._review_position(item)
+        if isinstance(item, dict):
+            return self._review_signal(symbol, item, df)
+        raise TypeError(
+            f"Agent Zero cannot review {type(item).__name__}; "
+            f"expected a signal dict or a PositionContext"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers — one private method per input shape.  The public #
+    # surface is .review(...); these just format the user message and    #
+    # parse the JSON reply for each shape.                               #
+    # ------------------------------------------------------------------ #
+
+    def _review_signal(self, symbol: str, signal: dict, df: Any) -> dict:
+        if not symbol:
+            raise ValueError("Agent Zero needs a symbol to review a signal")
         side  = str(signal.get("signal", "")).upper()
         entry = _coerce_float(signal.get("entry_price"))
         sl    = _coerce_float(signal.get("stop_loss"))
@@ -254,10 +352,10 @@ class EntryReviewAgent:
         )
 
         try:
-            raw = self.client.chat(ENTRY_SYSTEM_PROMPT, user,
-                                    expect_json=True, max_tokens=160)
+            raw = self.client.chat(AGENT_ZERO_SYSTEM_PROMPT, user,
+                                   expect_json=True, max_tokens=160)
         except Exception as exc:
-            log.warning("agent entry review transport error: %s — default reject", exc)
+            log.warning("agent zero signal-review transport error: %s — default reject", exc)
             return {
                 "approve": False,
                 "reason": f"agent transport error ({exc!s}) — rejected conservatively",
@@ -277,60 +375,7 @@ class EntryReviewAgent:
             "htf_detail": ctx.detail,
         }
 
-
-# ========================================================================== #
-# Risk review agent                                                           #
-# ========================================================================== #
-
-RISK_SYSTEM_PROMPT = (
-    "You are a PROFESSIONAL DAY TRADER who specialises in GBPUSD, GBPJPY, "
-    "EURUSD and EURJPY — these four pairs are your core edge, where you "
-    "read structure and volatility with the most confidence. You also "
-    "manage positions on other symbols the strategy takes, but the core "
-    "four are your primary book.\n\n"
-    "Your job: MAXIMISE winners, MINIMISE losers through active trade "
-    "management. You can only TIGHTEN a stop (never loosen) or request an "
-    "EARLY close. The broker's hard SL remains authoritative.\n\n"
-    "Use the structural cues (trend_intact, structure_broken, "
-    "fresh_structure) plus unrealised/peak P&L to decide.\n\n"
-    "Reply with a single JSON object on one line:\n"
-    "  {\"action\":\"hold|tighten|close_early\", \"new_sl\": <float or null>, "
-    "\"reason\":\"<=20 words\"}"
-)
-
-
-@dataclass
-class PositionContext:
-    symbol: str
-    ticket: int
-    side: str                 # BUY or SELL
-    entry: float
-    cur_price: float
-    cur_sl: float
-    cur_tp: float
-    profit_pts: float
-    peak_pts: float
-    atr: float
-    digits: int
-    trend_intact: Optional[bool] = None
-    structure_broken: Optional[bool] = None
-    fresh_structure: Optional[bool] = None
-    notes: str = ""
-
-
-class RiskReviewAgent:
-    """LLM-in-the-loop risk manager that can only tighten or close early."""
-
-    def __init__(self, client: Optional[OllamaClient] = None) -> None:
-        self.client = client or OllamaClient()
-
-    def review(self, ctx: PositionContext) -> dict:
-        """
-        Returns one of:
-          {"action": "hold"}
-          {"action": "close", "reason": str}           # close_early
-          {"action": "move_sl", "new_sl": float, "reason": str}   # tighten only
-        """
+    def _review_position(self, ctx: PositionContext) -> dict:
         is_buy = ctx.side.upper() == "BUY"
 
         user = (
@@ -348,10 +393,10 @@ class RiskReviewAgent:
         )
 
         try:
-            raw = self.client.chat(RISK_SYSTEM_PROMPT, user,
-                                    expect_json=True, max_tokens=160)
+            raw = self.client.chat(AGENT_ZERO_SYSTEM_PROMPT, user,
+                                   expect_json=True, max_tokens=160)
         except Exception as exc:
-            log.warning("agent risk review transport error: %s — hold (hard SL still active)", exc)
+            log.warning("agent zero position-review transport error: %s — hold (hard SL still active)", exc)
             return {"action": "hold", "reason": f"agent transport error ({exc!s})"}
 
         parsed = _extract_json_dict(raw) or {}
@@ -359,68 +404,64 @@ class RiskReviewAgent:
         reason = str(parsed.get("reason", "")).strip()[:160] or "no reason"
 
         if action in ("close", "close_early", "exit"):
-            return {"action": "close", "reason": f"agent: {reason}"}
+            return {"action": "close", "reason": f"agent zero: {reason}"}
 
         if action in ("tighten", "trail", "move_sl"):
             new_sl = parsed.get("new_sl")
             try:
                 new_sl = round(float(new_sl), ctx.digits)
             except Exception:
-                return {"action": "hold", "reason": "agent: invalid new_sl — hold"}
+                return {"action": "hold", "reason": "agent zero: invalid new_sl — hold"}
 
             # --- hard rails: wrong side of price?
             wrong_side = (is_buy and new_sl >= ctx.cur_price) or \
                          ((not is_buy) and new_sl <= ctx.cur_price)
             if wrong_side:
                 return {"action": "hold",
-                        "reason": f"agent: proposed SL {new_sl} is wrong side of price — hold"}
+                        "reason": f"agent zero: proposed SL {new_sl} is wrong side of price — hold"}
 
-            # --- hard rails: only tighten, never loosen (and never beyond entry to worse)
+            # --- hard rails: only tighten, never loosen
             if ctx.cur_sl:
                 not_tighter = (is_buy and new_sl <= ctx.cur_sl) or \
                               ((not is_buy) and new_sl >= ctx.cur_sl)
                 if not_tighter:
                     return {"action": "hold",
-                            "reason": f"agent: proposed SL not tighter than {ctx.cur_sl} — hold"}
+                            "reason": f"agent zero: proposed SL not tighter than {ctx.cur_sl} — hold"}
 
             return {"action": "move_sl", "new_sl": new_sl,
-                    "reason": f"agent: {reason}"}
+                    "reason": f"agent zero: {reason}"}
 
-        # Anything else (including "hold") → do nothing.  Hard SL remains.
-        return {"action": "hold", "reason": f"agent: {reason}"}
+        # Anything else (including "hold") → do nothing. Hard SL remains.
+        return {"action": "hold", "reason": f"agent zero: {reason}"}
 
 
 # ========================================================================== #
-# Module-level singletons (cheap to construct, heavy to call)                 #
+# Module-level singleton (cheap to construct, heavy to call)                  #
 # ========================================================================== #
 
-_entry_agent: Optional[EntryReviewAgent] = None
-_risk_agent:  Optional[RiskReviewAgent]  = None
+_agent_zero: Optional[AgentZero] = None
 
 
-def get_entry_agent() -> EntryReviewAgent:
-    global _entry_agent
-    if _entry_agent is None:
-        _entry_agent = EntryReviewAgent()
-    return _entry_agent
-
-
-def get_risk_agent() -> RiskReviewAgent:
-    global _risk_agent
-    if _risk_agent is None:
-        _risk_agent = RiskReviewAgent()
-    return _risk_agent
+def get_agent_zero() -> AgentZero:
+    """Return the one shared Agent Zero singleton — the only agent in the pipeline."""
+    global _agent_zero
+    if _agent_zero is None:
+        _agent_zero = AgentZero()
+    return _agent_zero
 
 
 def agent_backend_enabled() -> bool:
     """
-    True if the Ollama agent is the active AI backend.
+    True if Agent Zero is the active (and only) AI backend.
 
-    The agent is now the DEFAULT — set AI_BACKEND=deepseek explicitly to
-    revert to the HuggingFace LocalLLM path. Anything else (or unset) selects
-    the agent.
+    Agent Zero is the sole brain in the pipeline — there is no alternate
+    backend. The AI_BACKEND env var exists only as a kill-switch: set it
+    to "off" / "none" / "disabled" to run strategy-only (no AI gate, and
+    therefore no auto-trading). Any other value — or unset — keeps Agent
+    Zero on.
     """
-    return os.getenv("AI_BACKEND", "agent").strip().lower() in ("agent", "ollama", "")
+    val = os.getenv("AI_BACKEND", "agent").strip().lower()
+    return val not in ("off", "none", "disabled", "0", "false")
 
 
 def ollama_health() -> dict:
@@ -429,11 +470,11 @@ def ollama_health() -> dict:
     dashboard can render — never raises.
 
     {
-      "reachable":  bool,        # TCP + HTTP reachable
-      "model_loaded": bool,      # configured model shows up in /api/tags
-      "url":        str,         # base URL we tried
-      "model":      str,         # model name we tried
-      "error":      str|None,    # last error message, if any
+      "reachable":    bool,       # TCP + HTTP reachable
+      "model_loaded": bool,       # configured model shows up in /api/tags
+      "url":          str,        # base URL we tried
+      "model":        str,        # model name we tried
+      "error":        str|None,   # last error message, if any
     }
     """
     client = OllamaClient()
@@ -452,10 +493,10 @@ def ollama_health() -> dict:
             tags = r.json().get("models") or []
             wanted = client.model.split(":")[0].lower()
             out["model_loaded"] = any(
-                wanted in str(m.get("name", "")).lower() for m in tags
+                wanted in str(t.get("name", "")).lower() for t in tags
             )
         except Exception as exc:
-            out["error"] = f"bad /api/tags payload: {exc}"
+            out["error"] = f"tags parse: {exc!s}"
     except Exception as exc:
         out["error"] = str(exc)
     return out

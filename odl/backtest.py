@@ -1,11 +1,12 @@
 """
 ╔════════════════════════════════════════════════════════════════════╗
-║           AI_Pro Backtester — Historical Signal Validation         ║
+║        Agent Zero Backtester — Historical Signal Validation        ║
 ║        Measure component score correlation with trade outcomes     ║
 ╚════════════════════════════════════════════════════════════════════╝
 
-Tests the improved AI_Pro engine (structure detection, level states,
-momentum scoring, weighted confidence) against historical M15 data.
+Tests the Agent Zero Bot strategy engine (structure detection, level
+states, momentum scoring, weighted confidence) against historical M15
+data.
 
 Tracks:
   ► Signal generation metrics (by component)
@@ -44,13 +45,13 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
-# Optional: AI_Pro (only needed for live backtesting)
+# Optional: AgentZeroBot (only needed for live backtesting)
 try:
-    from ai_pro import AI_Pro, _mt5_initialize
+    from ai_pro import AgentZeroBot, _mt5_initialize
     HAS_AI_PRO = True
 except ImportError:
     HAS_AI_PRO = False
-    AI_Pro = None
+    AgentZeroBot = None
     _mt5_initialize = None
 
 logging.basicConfig(
@@ -101,7 +102,7 @@ def get_pip_usd_value(symbol: str, lot_size: float = 1.0,
 def default_spread_pips(symbol: str) -> float:
     """Typical retail-broker spread for the major pairs we trade.
 
-    Used as a cost on entry. Override via AI_ProBacktester(spread_pips=...).
+    Used as a cost on entry. Override via AgentZeroBacktester(spread_pips=...).
     """
     sym = symbol.upper()
     if "JPY" in sym:
@@ -114,7 +115,7 @@ def default_spread_pips(symbol: str) -> float:
 
 @dataclass
 class Signal:
-    """A generated signal from AI_Pro at a specific time."""
+    """A generated signal from AgentZeroBot at a specific time."""
     ts: datetime
     symbol: str
     signal: str  # "BUY", "SELL", "neutral"
@@ -188,17 +189,17 @@ class Trade:
 # BACKTESTER                                                   #
 # ============================================================ #
 
-class AI_ProBacktester:
+class AgentZeroBacktester:
     """
-    Backtester for AI_Pro trading signals.
-    
+    Backtester for Agent Zero Bot trading signals.
+
     Requires:
     1. MT5 to be running with credentials configured
     2. Historical M15 data accessible via MT5
-    
+
     Runs:
     1. Fetches M15 candles for period
-    2. For each candle, generates AI_Pro signals
+    2. For each candle, generates AgentZeroBot signals
     3. Tracks opening/closing of positions
     4. Measures correlation between component scores and outcomes
     """
@@ -243,7 +244,7 @@ class AI_ProBacktester:
         self.partial_close_rr        = float(partial_close_rr)
         self.breakeven_buffer_pips   = float(breakeven_buffer_pips)
         
-        # Import AI_Pro lazily to avoid MT5 requirement if just analyzing
+        # Import AgentZeroBot lazily to avoid MT5 requirement if just analyzing
         self._strategy = None
         self._mt5 = None
         
@@ -252,14 +253,14 @@ class AI_ProBacktester:
         self.candle_history: Dict[str, pd.DataFrame] = {}
     
     def _ensure_mt5(self):
-        """Lazy-load MT5 and AI_Pro strategy."""
+        """Lazy-load MT5 and AgentZeroBot strategy."""
         if self._strategy is not None:
             return  # Already initialized
-        
+
         if not HAS_AI_PRO:
-            log.error("AI_Pro module not available. Run: pip install MetaTrader5")
+            log.error("AgentZeroBot module not available. Run: pip install MetaTrader5")
             return
-        
+
         try:
             # Try to import MetaTrader5
             try:
@@ -267,19 +268,19 @@ class AI_ProBacktester:
             except ImportError:
                 log.error("MetaTrader5 not installed. Run: pip install MetaTrader5")
                 return
-            
+
             # Initialize MT5
             if not _mt5_initialize():
                 log.warning("MT5 initialization failed. Ensure MT5 terminal is running with credentials configured.")
                 return
-            
-            # Create strategy without AI (for speed)
-            self._strategy = AI_Pro(use_ai=False, lookback_candles=200)
+
+            # Create strategy without the Agent Zero review (raw signals, for speed)
+            self._strategy = AgentZeroBot(use_ai=False, lookback_candles=200)
             self._mt5 = mt5
-            log.info("MT5 and AI_Pro initialized successfully")
-        
+            log.info("MT5 and AgentZeroBot initialized successfully")
+
         except Exception as e:
-            log.error("Failed to initialize MT5/AI_Pro: %s", e)
+            log.error("Failed to initialize MT5/AgentZeroBot: %s", e)
     
     def fetch_data(self, symbol: str, days: int = 30) -> Optional[pd.DataFrame]:
         """
@@ -1576,7 +1577,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="AI_Pro backtester — validate signal generation"
+        description="Agent Zero backtester — validate signal generation"
     )
     parser.add_argument("--symbol", default="EURUSD", help="Symbol to backtest")
     parser.add_argument("--days", type=int, default=7, help="Days of history")
@@ -1588,12 +1589,12 @@ def main():
     
     if not HAS_AI_PRO:
         print("\n" + "!"*70)
-        print("ERROR: AI_Pro module not found in current directory")
+        print("ERROR: AgentZeroBot module not found in current directory")
         print("Make sure ai_pro.py is in the same folder as backtest.py")
         print("!"*70 + "\n")
         return
-    
-    backtest = AI_ProBacktester(lot_size=args.lot_size)
+
+    backtest = AgentZeroBacktester(lot_size=args.lot_size)
     results = backtest.run(args.symbol, days=args.days)
     
     if "error" in results:

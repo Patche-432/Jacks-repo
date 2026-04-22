@@ -22,7 +22,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path("/sessions/serene-inspiring-faraday/mnt/Jacks-repo")))
 
-from odl.backtest import AI_ProBacktester, Signal  # noqa: E402
+from odl.backtest import AgentZeroBacktester, Signal  # noqa: E402
 
 
 def make_df(path):
@@ -62,7 +62,7 @@ def sig_sell(ts, entry_hint, sl, tp, symbol="EURUSD"):
 
 def run_case(name, df, signal, expected_reason, expected_outcome,
              expected_pips_sign):
-    bt = AI_ProBacktester(lot_size=1.0, spread_pips=0.0)
+    bt = AgentZeroBacktester(lot_size=1.0, spread_pips=0.0)
     trades = bt.simulate_trades("EURUSD", [signal], df)
     assert len(trades) == 1, f"{name}: expected 1 trade got {len(trades)}"
     t = trades[0]
@@ -132,7 +132,7 @@ def main():
     ])
     s = sig_buy(df.iloc[0]["time"], 1.1000, 1.0990, 1.1020)
     # No partial fired → full position exits at SL → runner_pips=-10
-    bt = AI_ProBacktester(lot_size=1.0, spread_pips=0.0)
+    bt = AgentZeroBacktester(lot_size=1.0, spread_pips=0.0)
     trades = bt.simulate_trades("EURUSD", [s], df)
     t = trades[0]
     ok = (t.exit_reason == "sl" and t.outcome == "LOSS"
@@ -149,7 +149,7 @@ def main():
         (1.1015, 1.0988, 1.0995),  # both 1R and SL in same bar → SL wins
     ])
     s = sig_buy(df.iloc[0]["time"], 1.1000, 1.0990, 1.1020)
-    bt = AI_ProBacktester(lot_size=1.0, spread_pips=0.0)
+    bt = AgentZeroBacktester(lot_size=1.0, spread_pips=0.0)
     trades = bt.simulate_trades("EURUSD", [s], df)
     t = trades[0]
     ok = (t.exit_reason == "sl" and t.outcome == "LOSS"
@@ -171,7 +171,7 @@ def main():
     ]
     df = make_df(bars)
     s = sig_buy(df.iloc[0]["time"], 1.1000, 1.0990, 1.1020)
-    bt = AI_ProBacktester(lot_size=1.0, spread_pips=0.0,
+    bt = AgentZeroBacktester(lot_size=1.0, spread_pips=0.0,
                           max_trade_duration_bars=2)  # entry_idx=1, max=3
     trades = bt.simulate_trades("EURUSD", [s], df)
     t = trades[0]
@@ -204,7 +204,7 @@ def main():
         (1.1022, 1.1010, 1.1021),  # TP
     ])
     s = sig_buy(df.iloc[0]["time"], 1.1000, 1.0990, 1.1020)
-    bt = AI_ProBacktester(lot_size=1.0, spread_pips=0.0,
+    bt = AgentZeroBacktester(lot_size=1.0, spread_pips=0.0,
                           enable_trade_management=False)
     trades = bt.simulate_trades("EURUSD", [s], df)
     t = trades[0]

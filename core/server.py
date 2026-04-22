@@ -83,11 +83,12 @@ def _rr_string(entry: float, sl: float, tp: float) -> str:
 
 
 def _mt5_signal_snapshot(symbol: str) -> dict:
-    """Run the real AI_Pro 4-environment strategy and return a dashboard snapshot.
+    """Run the real Agent Zero 4-environment strategy and return a dashboard snapshot.
 
-    Uses AI_Pro.generate_trade_signal() with use_ai=False (no LLM overhead) so
-    the dashboard shows signals from the same CHoCH + PDH/PDL logic the bot uses,
-    not the old SMA20/SMA50 approximation.
+    Uses AgentZeroBot.generate_trade_signal() with use_ai=False (raw strategy
+    only, no Agent Zero review) so the dashboard shows signals from the same
+    CHoCH + PDH/PDL logic the live bot uses, not the old SMA20/SMA50
+    approximation.
 
     Falls back to an error dict on import or strategy failures.
     """
@@ -99,23 +100,23 @@ def _mt5_signal_snapshot(symbol: str) -> dict:
         return {"error": "MT5 not connected. Connect first then refresh signals."}
 
     try:
-        # Import AI_Pro at call-time to avoid circular-import issues at startup.
-        # The module-level Flask app in ai_pro.py is created but never started,
-        # so importing it here is safe.
-        from ai_pro import AI_Pro
+        # Import AgentZeroBot at call-time to avoid circular-import issues at
+        # startup. The module-level Flask app in ai_pro.py is created but
+        # never started, so importing it here is safe.
+        from ai_pro import AgentZeroBot
     except Exception as exc:
-        log.error("Could not import AI_Pro: %s", exc)
+        log.error("Could not import AgentZeroBot: %s", exc)
         return {"error": f"Strategy import failed: {exc}"}
 
     try:
-        # use_ai=False skips the heavy DeepSeek LLM — pure rule-based signal
-        strategy = AI_Pro(use_ai=False)
+        # use_ai=False skips the Agent Zero review — pure rule-based signal
+        strategy = AgentZeroBot(use_ai=False)
         sig = strategy.generate_trade_signal(symbol)
     except Exception as exc:
-        log.error("AI_Pro.generate_trade_signal(%s) raised: %s", symbol, exc)
+        log.error("AgentZeroBot.generate_trade_signal(%s) raised: %s", symbol, exc)
         return {"error": f"Strategy error: {exc}"}
 
-    # Map AI_Pro signal → dashboard format
+    # Map AgentZeroBot signal → dashboard format
     # signal_source encodes the environment: CHoCH-BUY@PDL / CHoCH-SELL@PDH /
     # Continuation-BUY@PDH / Continuation-SELL@PDL
     raw_signal = sig.get("signal", "neutral")
@@ -280,9 +281,7 @@ def api_config():
             "lot_size": 0.50,
             "sl_mult": 2.5,
             "tp_mult": 4.5,
-            "rr_ratio": "1:1.8",
-            "partial_close_rr": 1.0,
-            "be_buffer_pips": 1.0
+            "rr_ratio": "1:1.8"
         },
         "backtest_baseline": {
             "total_trades": 468,
@@ -339,7 +338,7 @@ def bot_start():
     global bot_process, bot_running
     
     if bot_running and bot_process and bot_process.poll() is None:
-        return jsonify({'ok': False, 'error': 'Bot already running'}), 409
+        return jsonify({'ok': False, 'error': 'Agent Zero is already on the desk.'}), 409
     
     try:
         ai_pro_path = os.path.join(root_path, 'ai_pro.py')
@@ -356,7 +355,7 @@ def bot_start():
         if rc is not None:
             bot_running = False
             log.error("AI Pro bot failed to start (exit code: %s)", rc)
-            return jsonify({'ok': False, 'error': f'Bot failed to start (exit code {rc}). Check the bot console/log output.'}), 500
+            return jsonify({'ok': False, 'error': f'Agent Zero could not wake up (bot exited with code {rc}). Check the bot console/log output.'}), 500
 
         bot_running = True
         log.info("AI Pro bot started (PID: %d)", bot_process.pid)
@@ -835,7 +834,7 @@ def bot_config_apply():
 #
 # POST /api/backtest/run {pairs?: [...], days?: int, lot_size?: float}
 #
-#   Runs odl.backtest.AI_ProBacktester for each pair and returns an aggregate
+#   Runs odl.backtest.AgentZeroBacktester for each pair and returns an aggregate
 #   summary plus per-pair breakdown — exactly what the BACKTEST tab renders.
 #   Guarded by a module-level lock so two callers can't kick off parallel
 #   backtests (each run fetches historical MT5 data and is heavyweight).
@@ -894,7 +893,7 @@ def api_backtest_run():
         # Import inside the handler so a server start without MT5 installed
         # still serves the other endpoints.
         try:
-            from odl.backtest import AI_ProBacktester
+            from odl.backtest import AgentZeroBacktester
         except Exception as exc:
             log.error("backtest import failed: %s", exc)
             return jsonify({
@@ -915,7 +914,7 @@ def api_backtest_run():
                 # Pure strategy validation — no 1R partial close, no BE
                 # trail. Whole position exits at first SL/TP/timeout so
                 # we're measuring the signal, not the management overlay.
-                bt = AI_ProBacktester(lot_size=lot_size,
+                bt = AgentZeroBacktester(lot_size=lot_size,
                                       enable_trade_management=False)
                 result = bt.run(symbol, days=days)
             except Exception as exc:
@@ -1056,7 +1055,7 @@ def api_backtest_stream():
         t0 = time.time()
         try:
             try:
-                from odl.backtest import AI_ProBacktester
+                from odl.backtest import AgentZeroBacktester
             except Exception as exc:
                 q.put({"__event__": "error", "error": f"Backtester import failed: {exc}"})
                 return
@@ -1086,7 +1085,7 @@ def api_backtest_stream():
                     # BE trail. The whole position exits at the first
                     # SL/TP/timeout so the numbers measure the signal
                     # itself, not the management overlay.
-                    bt = AI_ProBacktester(lot_size=lot_size,
+                    bt = AgentZeroBacktester(lot_size=lot_size,
                                           enable_trade_management=False)
                     result = bt.run(
                         symbol,
@@ -1185,7 +1184,7 @@ def api_backtest_stream():
                 # per_pair + self.trades would require passing a handle; the
                 # simpler path is to collect fresh from bt.trades (the last
                 # bt in the loop). We instead aggregate via a one-off.
-                from odl.backtest import AI_ProBacktester as _BT
+                from odl.backtest import AgentZeroBacktester as _BT
                 agg_bt = _BT(lot_size=lot_size)
                 all_trades = []
                 # Concatenate trades from each per-pair backtest via a second,
@@ -1295,7 +1294,7 @@ def api_backtest_stream():
 if __name__ == '__main__':
     # Important: disable the auto-reloader so long-running bot subprocesses
     # started from HTTP requests are not interrupted by Flask restarts.
-    # threaded=True is critical: /bot/signal/<symbol> instantiates AI_Pro and
+    # threaded=True is critical: /bot/signal/<symbol> instantiates AgentZeroBot and
     # runs generate_trade_signal(), which can take several seconds. Without
     # threading, four parallel signal fetches queue serially and BLOCK every
     # other endpoint (status, positions, ai_thoughts) — that's what made the

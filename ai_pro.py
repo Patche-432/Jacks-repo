@@ -1,18 +1,17 @@
 """
 ╔════════════════════════════════════════════════════════════════════╗
-║                      ⚡ FORTIS AI PRO ⚡                          ║
-║   CHoCH + Daily Levels Strategy — AI-Enhanced Edition              ║
+║                    ⚡ FORTIS AGENT ZERO ⚡                        ║
+║   CHoCH + Daily Levels Strategy — Agent Zero Edition              ║
 ╚════════════════════════════════════════════════════════════════════╝
 
-Merges the complete FORTIS AI Pro signal engine (CHoCH + Continuation on 4
-environments, ATR-based SL/TP, partial-close/breakeven trail)
-with the full AI stack from algo-v2:
+Merges the complete FORTIS signal engine (CHoCH + Continuation on 4
+environments, ATR-based SL/TP) with Agent Zero, the single Ollama-backed
+trader persona in ai_agent.py:
 
-  ► LocalLLM         — DeepSeek-R1-Distill-Qwen-1.5B via HuggingFace Transformers
+  ► Agent Zero       — single Ollama-backed trader (see ai_agent.py) that
+                       filters every signal by daily bias AND is the sole
+                       in-flight position manager (tighten / close / hold)
   ► Thought Logger   — thread-safe in-memory AI reasoning log (last 120)
-  ► AI Signal Review — DeepSeek validates every AI Pro signal before execution
-  ► AI Risk Manager  — DeepSeek reviews open positions every N ticks
-                       (trail harder / tighten / close if momentum gone)
   ► Trade Memory     — JSON persistence (last 100 trades, win/loss stats)
   ► Flask Dashboard  — REST API + embedded UI at http://localhost:5000
 
@@ -25,14 +24,14 @@ ENV 4 │ Continuation SELL — broke below PDL, retesting it as resistance
 
 All environments require level interaction for confirmation.
 CHoCH signals have priority (confidence 85) over Continuation (65-75).
-Auto-trade fires when DeepSeek approves (confidence pre-filtered to >= 75).
+Auto-trade fires when Agent Zero approves a signal.
 
 Usage:
-    python ai_pro.py              # starts Flask on :5000, bot idle
-    python ai_pro.py --run        # starts bot immediately on EURUSD
+    python ai_pro.py              # starts Flask on :5000, Agent Zero idle
+    python ai_pro.py --run        # starts Agent Zero immediately on EURUSD
 
 Requirements:
-    pip install flask flask-cors MetaTrader5 numpy pandas transformers torch pyyaml
+    pip install flask flask-cors MetaTrader5 numpy pandas pyyaml requests
 """
 
 from __future__ import annotations
@@ -117,32 +116,13 @@ entry:
   allow_counter_trend:    false
   allow_pyramiding:       true   # no direction/profit guard; agent bias is the sole filter
 
-exit:
-  trailing_stop_fraction:    0.50
-  breakeven_trigger_points:  10   # move SL to entry once 10 pts (MT5 points) in profit
-  trailing_stop_points:       0   # 0 = disabled — remaining position holds to TP limit order
-                                   # Set to N (pips) to trail N pips behind current price
-
-  partial_take_profit:
-    enabled:          true
-    trigger_fraction: 0.50
-    close_fraction:   0.50
-    sl_plus_points:    5
-
-  conditions:
-    - "Trail SL at 50% of current profit pips (locks in half gains, lets winners run)."
-    - "Partial close at 50% of halfway to TP (secure 25% of full TP profit early)."
-    - "Let price extend beyond TP if momentum continues; no breakeven hardlock."
-
 ai:
   extra_instructions: |
-    AI_Pro AI risk notes:
-    1. CHoCH setups (ENV1/ENV2) have structural backing — trail generously.
-    2. Continuation setups (ENV3/ENV4) — tighten faster on structure breaks.
-    3. Move SL to BE once 10pts in profit.
-    4. Trail 8pts behind price while in profit.
-    5. Close 50% at halfway to TP, lock SL above entry after partial.
-    6. Every 3 ticks Qwen reviews and may trail harder, tighten, or close.
+    Agent Zero risk notes:
+    1. CHoCH setups (ENV1/ENV2) have stronger structural backing.
+    2. Continuation setups (ENV3/ENV4) should be cut faster on structure breaks.
+    3. Agent Zero is the sole live position manager.
+    4. Allowed live actions are hold, tighten stop, or close early.
 """
 
 # ============================================================ #
@@ -167,9 +147,11 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
-# Optional local Ollama agent backend (replaces DeepSeek-R1 when
-# AI_BACKEND=agent/ollama). Import is tolerant so the module still loads
-# if ai_agent.py / requests is missing.
+# Agent Zero — the one and only AI brain in this pipeline, lives in
+# ai_agent.py and talks to a local Ollama server. Import is tolerant so
+# the module still loads if ai_agent.py / requests is missing; in that
+# case auto-trading is disabled (strategy emits signals, Agent Zero is
+# the gate that never opens).
 try:
     import ai_agent as _ai_agent      # noqa: F401
     _AGENT_IMPORT_OK = True
@@ -188,96 +170,11 @@ _MEMORY_PATH = Path(__file__).resolve().parent / "ai_pro_trade_log.json"
 _CREDS_PATH  = Path(__file__).resolve().parent / "mt5_credentials.json"
 
 # ============================================================ #
-# SECTION 3 — LOCAL LLM (DeepSeek-R1-Distill-Qwen-1.5B)        #
+# SECTION 3 — AI BRAIN                                          #
 # ============================================================ #
-
-class LocalLLM:
-    """
-    Singleton HuggingFace wrapper.  Loads lazily on first generate() call.
-    Override model with AI_MODEL env variable.
-    """
-    _tokenizer  = None
-    _model      = None
-    _model_name: Optional[str] = None
-    _device:     Optional[str] = None
-
-    def __init__(self, model_name: Optional[str] = None) -> None:
-        self.model_name = model_name or os.getenv(
-            "AI_MODEL", "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-        )
-
-    def _ensure_loaded(self) -> None:
-        if (self.__class__._model is not None
-                and self.__class__._model_name == self.model_name):
-            return
-
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        log.info("Loading LLM %s ...", self.model_name)
-        cuda = torch.cuda.is_available()
-        device = "cuda" if cuda else "cpu"
-        dtype  = torch.float16 if cuda else torch.float32
-
-        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        model     = AutoModelForCausalLM.from_pretrained(
-            self.model_name, torch_dtype=dtype
-        ).to(device)
-        model.eval()
-
-        self.__class__._tokenizer  = tokenizer
-        self.__class__._model      = model
-        self.__class__._model_name = self.model_name
-        self.__class__._device     = device
-        log.info("LLM loaded on %s", device)
-
-    def generate(self, prompt: str,
-                 max_new_tokens: int = 250,
-                 temperature: float  = 0.0) -> str:
-        self._ensure_loaded()
-        import torch
-        tokenizer = self.__class__._tokenizer
-        model     = self.__class__._model
-        device    = self.__class__._device
-
-        conversation = [
-            {
-                "role":    "system",
-                "content": (
-                    "You are a professional forex trader. Your only objectives are "
-                    "to MAXIMISE winning trades and MINIMISE losing positions. "
-                    "You ALWAYS filter trades through higher-timeframe bias (D1, H4, "
-                    "H1): never take a setup that fights the dominant HTF direction, "
-                    "and prefer setups where every higher timeframe agrees with the "
-                    "trade side. Be strict — when in doubt, reject the trade. Keep "
-                    "any internal reasoning under 50 words. Your final output MUST "
-                    "be a single JSON object on its own line after </think>. No "
-                    "markdown, no backticks, no prose."
-                )
-            },
-            {"role": "user", "content": prompt},
-        ]
-        encoded = tokenizer.apply_chat_template(
-            conversation,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-        )
-        input_ids      = encoded["input_ids"].to(device)
-        attention_mask = encoded["attention_mask"].to(device)
-
-        with torch.no_grad():
-            output_ids = model.generate(
-                input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=int(max_new_tokens),
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        new_tokens = output_ids[0][input_ids.shape[-1]:]
-        return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+# Intentionally empty. All AI logic lives in ai_agent.py (Agent
+# Zero, Ollama-backed). This module only imports that singleton
+# via `_ai_agent.get_agent_zero()` and never owns any model code.
 
 
 # ============================================================ #
@@ -404,17 +301,6 @@ class TradingRules:
         self.allow_counter_trend: bool   = bool(entry.get("allow_counter_trend", False))
         self.allow_pyramiding: bool      = bool(entry.get("allow_pyramiding", False))
 
-        exit_: dict = raw.get("exit") or {}
-        self.breakeven_trigger_points: Optional[int]   = _to_int(exit_.get("breakeven_trigger_points"))
-        self.trailing_stop_points: Optional[int]       = _to_int(exit_.get("trailing_stop_points"))
-        self.exit_conditions: list = list(exit_.get("conditions") or [])
-
-        partial: dict = exit_.get("partial_take_profit") or {}
-        self.partial_tp_enabled: bool           = bool(partial.get("enabled", True))
-        self.partial_tp_trigger_fraction: float = float(partial.get("trigger_fraction", 0.5))
-        self.partial_tp_close_fraction: float   = float(partial.get("close_fraction", 0.5))
-        self.partial_tp_sl_plus_points: int     = int(partial.get("sl_plus_points", 5))
-
         ai: dict = raw.get("ai") or {}
         self.extra_instructions: str = str(ai.get("extra_instructions", ""))
 
@@ -472,233 +358,11 @@ def _to_int(val: Any) -> Optional[int]:
 # ============================================================ #
 # SECTION 6 — JSON HELPERS                                     #
 # ============================================================ #
-
-_THINK_RE   = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-_THINK_OPEN = re.compile(r"<think>.*?$",       re.DOTALL | re.IGNORECASE)
-_FENCE_RE   = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
-
-
-def _clean_llm_text(text: str) -> str:
-    """Strip reasoning-model artifacts: <think> blocks, markdown fences, role tags."""
-    if not text:
-        return ""
-    # Drop closed <think>...</think> blocks
-    text = _THINK_RE.sub("", text)
-    # Drop unterminated <think>... (model ran out of tokens mid-thought)
-    text = _THINK_OPEN.sub("", text)
-    # Drop assistant/user role artifacts from chat templates
-    text = re.sub(r"</?(assistant|user|system)>", "", text, flags=re.IGNORECASE)
-    return text.strip()
-
-
-def _try_json_loads(s: str):
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-
-def _scan_json_objects(text: str):
-    """Yield every balanced {...} substring in text that parses as a JSON dict.
-
-    Walks the text manually so we tolerate nested braces, quoted strings with
-    escaped quotes, and prose around the JSON.
-    """
-    if not text:
-        return
-    search_from = 0
-    n = len(text)
-    while True:
-        start = text.find("{", search_from)
-        if start == -1:
-            return
-        depth, in_string, escape_next = 0, False, False
-        end = -1
-        for i in range(start, n):
-            ch = text[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if ch == "\\" and in_string:
-                escape_next = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
-        if end == -1:
-            search_from = start + 1
-            continue
-        candidate = text[start:end + 1]
-        obj = _try_json_loads(candidate)
-        if isinstance(obj, dict):
-            yield obj
-        else:
-            normalised = (candidate
-                          .replace("“", '"').replace("”", '"')
-                          .replace("‘", "'").replace("’", "'"))
-            normalised = re.sub(r",(\s*[}\]])", r"\1", normalised)
-            obj = _try_json_loads(normalised)
-            if isinstance(obj, dict):
-                yield obj
-        search_from = end + 1
-
-
-def _extract_json(text: str, want_keys: tuple = ()):
-    """Extract a JSON object from an LLM response.
-
-    Strategy (most-permissive wins):
-      1. Search the RAW text first — DeepSeek-R1 sometimes emits the final
-         JSON inside the closing portion of <think> when token budget is tight.
-      2. If `want_keys` is supplied, prefer the first object that contains
-         any of those keys (so we don't accidentally pick up a sub-object).
-      3. Fall back to scanning the cleaned text (with <think> stripped).
-      4. Try fenced code blocks explicitly.
-    Returns None only if every candidate fails to parse.
-    """
-    if not text:
-        return None
-
-    def best(objs):
-        objs = list(objs)
-        if not objs:
-            return None
-        if want_keys:
-            for o in objs:
-                if any(k in o for k in want_keys):
-                    return o
-        return objs[0]
-
-    # 1) raw text — catches JSON emitted before/inside an unterminated <think>
-    obj = best(_scan_json_objects(text))
-    if obj is not None:
-        return obj
-
-    # 2) cleaned text — strips <think> and role tags
-    cleaned = _clean_llm_text(text)
-    if cleaned and cleaned != text:
-        # whole-blob fast path
-        whole = _try_json_loads(cleaned)
-        if isinstance(whole, dict):
-            return whole
-        obj = best(_scan_json_objects(cleaned))
-        if obj is not None:
-            return obj
-
-    # 3) fenced code blocks
-    for m in _FENCE_RE.finditer(text):
-        inner = m.group(1).strip()
-        cand = _try_json_loads(inner)
-        if isinstance(cand, dict):
-            return cand
-        obj = best(_scan_json_objects(inner))
-        if obj is not None:
-            return obj
-
-    return None
-
-
-def _keyword_fallback_entry(text: str) -> Optional[dict]:
-    """If JSON parsing fails, infer an approve/reject verdict from free text.
-
-    Scans the FULL raw response (including <think> reasoning) so we can still
-    extract intent when the model never emitted JSON. Always returns a verdict
-    (defaults to approve) — never returns None — so the AI gate is never silent.
-    """
-    if not text:
-        # Empty model output → trust the strategy gate
-        return {"approve": True,
-                "reason": "Fallback parse: empty response, trusting strategy",
-                "confidence": 0.5}
-
-    t = text.lower()
-
-    # Strong reject signals
-    reject_terms = (
-        "reject", "do not take", "don't take", "do not approve",
-        "do not enter", "don't enter", "skip this", "avoid this",
-        "not approve", "not approved", "disapprove", "decline",
-        "false signal", "weak setup", "invalid setup", "wait for",
-        "no trade", "stand aside", '"approve": false', '"approve":false',
-        "approve: false",
-    )
-    reject_score = sum(1 for w in reject_terms if w in t)
-
-    # Strong approve signals
-    approve_terms = (
-        "approve", "approved", "take the trade", "take this trade",
-        "take the setup", "take the entry", "valid setup", "valid entry",
-        "go long", "go short", "enter long", "enter short", "good setup",
-        "high probability", "accept", "execute the trade",
-        '"approve": true', '"approve":true', "approve: true",
-    )
-    approve_score = sum(1 for w in approve_terms if w in t)
-
-    # Pull a confidence-like number if present (look for "0.7" or "70%")
-    conf = 0.6
-    m = re.search(r"confidence[^0-9]{0,12}(0?\.\d+|\d{1,3})\s*%?", t)
-    if m:
-        try:
-            v = float(m.group(1))
-            conf = v / 100.0 if v > 1.0 else v
-            conf = max(0.0, min(1.0, conf))
-        except ValueError:
-            pass
-
-    if reject_score > approve_score:
-        return {"approve": False,
-                "reason": f"Fallback parse: model leaned reject (score {reject_score} vs {approve_score})",
-                "confidence": conf}
-    if approve_score > reject_score:
-        return {"approve": True,
-                "reason": f"Fallback parse: model leaned approve (score {approve_score} vs {reject_score})",
-                "confidence": conf}
-    # Tie or no clear signal — defer to the strategy gate (which already
-    # passed its own confidence threshold to even reach the AI reviewer)
-    return {"approve": True,
-            "reason": "Fallback parse: no clear verdict, deferring to strategy",
-            "confidence": 0.5}
-
-
-def _keyword_fallback_risk(text: str) -> Optional[dict]:
-    """Fallback parser for risk-manager responses (hold/trail/tighten/close).
-
-    Scans the full raw response (reasoning included) for action keywords.
-    Always returns a verdict (defaults to hold) so the manager is never silent.
-    """
-    if not text:
-        return {"action": "hold", "new_sl": None,
-                "reason": "Fallback parse: empty response, holding"}
-    t = text.lower()
-    # Priority order: close > tighten > trail > hold
-    if any(w in t for w in ("recommend close", "close the position",
-                             "close position", "exit now", "action: close",
-                             "should close", "close it", "exit the trade",
-                             '"action": "close"', '"action":"close"',
-                             '"close"')):
-        return {"action": "close", "new_sl": None,
-                "reason": "Fallback parse: close"}
-    if any(w in t for w in ("tighten", "action: tighten",
-                             '"action": "tighten"', '"action":"tighten"',
-                             '"tighten"')):
-        return {"action": "tighten", "new_sl": None,
-                "reason": "Fallback parse: tighten"}
-    if any(w in t for w in ("trail", "trailing stop", "action: trail",
-                             '"action": "trail"', '"action":"trail"',
-                             '"trail"', "lock gains", "lock in gains")):
-        return {"action": "trail", "new_sl": None,
-                "reason": "Fallback parse: trail"}
-    # Default to hold — safest action
-    return {"action": "hold", "new_sl": None,
-            "reason": "Fallback parse: defaulting to hold"}
+#
+# Intentionally empty. All JSON parsing happens inside ai_agent.py
+# (via _extract_json_dict against Ollama's native format=json output).
+# No strategy-side parser lives here — that was deliberate, to guarantee
+# Agent Zero is the only thing that can produce an entry or risk verdict.
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -792,22 +456,23 @@ def record_outcome(symbol: str, direction: str, source: str,
 
 
 # ============================================================ #
-# SECTION 8 — AI_Pro CORE STRATEGY                         #
-# (all AI Pro logic intact, AI calls woven in)              #
+# SECTION 8 — AGENT ZERO BOT CORE STRATEGY                   #
+# (full signal engine + Agent Zero review hooks)              #
 # ============================================================ #
 
-class AI_Pro:
+class AgentZeroBot:
     """
-    AI Pro — CHoCH + Daily Levels Strategy, AI-Enhanced Edition.
+    Agent Zero Bot — CHoCH + Daily Levels Strategy harness.
 
-    Signal engine from the CHoCH + Daily Levels core.
-    Each signal is reviewed by a local DeepSeek LLM before execution.
-    Open positions are monitored by an AI risk manager every N ticks.
-    All AI reasoning is persisted in the thought log (see /ai_thoughts).
+    Produces raw signals from the CHoCH + Daily Levels core.
+    Every signal is reviewed by Agent Zero (ai_agent.py) before execution.
+    Open positions are reviewed by Agent Zero every N ticks; he is the only
+    thing that can tighten stops or close a live position.
+    All Agent Zero reasoning is persisted in the thought log (/ai_thoughts).
     """
 
-    CONFIDENCE_THRESHOLD = 0.40   # DeepSeek min confidence to approve a trade
-    AI_REVIEW_TICKS      = 3      # DeepSeek reviews open positions every N ticks
+    CONFIDENCE_THRESHOLD = 0.40   # agent min confidence to approve a trade
+    AI_REVIEW_TICKS      = 3      # agent reviews open positions every N ticks
     AI_REVIEW_MIN_SECS   = 180    # …and at least this many seconds since the last AI review per ticket (survives bot restarts)
     MONITOR_HEARTBEAT_SECS = 600  # how often each open ticket emits a "monitoring" heartbeat to ai_thoughts
 
@@ -819,9 +484,6 @@ class AI_Pro:
         sl_atr_mult: float              = 2.5,
         tp_atr_mult: float              = 4.5,
         level_interaction_bars: int     = 10,
-        partial_close_ratio: float      = 0.5,
-        partial_close_rr: float         = 1.0,
-        breakeven_buffer_pips: float    = 1.0,
         use_ai: bool                    = True,
     ) -> None:
         self._mt5_initialized = False
@@ -833,35 +495,21 @@ class AI_Pro:
         self.sl_atr_mult              = sl_atr_mult
         self.tp_atr_mult              = tp_atr_mult
         self.level_interaction_bars   = level_interaction_bars
-        self.partial_close_ratio      = partial_close_ratio
-        self.partial_close_rr         = partial_close_rr
-        self.breakeven_buffer_pips    = breakeven_buffer_pips
         self.use_ai                   = use_ai
 
         self.previous_day_high: Optional[float] = None
         self.previous_day_low:  Optional[float] = None
 
-        self._partial_closed_tickets: set  = set()
         self._filling_mode_cache: dict     = {}
         self._mt5_info_cache: dict         = {"connected": False, "error": "MT5 not initialized"}
 
-        # AI components
-        self._llm: Optional[LocalLLM]      = None
+        # Agent Zero bookkeeping (the agent itself lives in ai_agent.py
+        # as a module-level singleton; this class holds no AI state of
+        # its own, only per-ticket counters for the review cadence).
         self._ai_tick_counters: dict       = {}   # ticket -> int
-        self._ai_breakeven_done: set       = set()
-        self._ai_partial_done: set         = set()
         self._ai_peak_profit: dict         = {}   # ticket -> float pts
-        self._ai_last_review_ts: dict      = {}   # ticket -> unix seconds (last AI risk review)
+        self._ai_last_review_ts: dict      = {}   # ticket -> unix seconds (last Agent Zero risk review)
         self._ai_last_heartbeat_ts: dict   = {}   # ticket -> unix seconds (last "monitoring" log)
-
-    # ------------------------------------------------------------------ #
-    # LLM access                                                          #
-    # ------------------------------------------------------------------ #
-
-    def _get_llm(self) -> LocalLLM:
-        if self._llm is None:
-            self._llm = LocalLLM()
-        return self._llm
 
     def mt5_snapshot(self) -> dict:
         return dict(self._mt5_info_cache)
@@ -979,7 +627,7 @@ class AI_Pro:
             "price":        close_price,
             "deviation":    20,
             "magic":        234000,
-            "comment":      "AI_Pro close",
+            "comment":      "AgentZero close",
             "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": filling,
         }
@@ -1003,7 +651,7 @@ class AI_Pro:
                 "message": f"Close failed: {comment}"}
 
     # ------------------------------------------------------------------ #
-    # Partial close + breakeven trail (AI Pro native)                  #
+    # Broker execution helpers used only for AI-directed actions             #
     # ------------------------------------------------------------------ #
 
     def _modify_sl(self, position, new_sl: float) -> dict:
@@ -1026,185 +674,19 @@ class AI_Pro:
         comment = result.comment if result else "N/A"
         return {"success": False, "ticket": position.ticket,
                 "message": f"SL modify failed: {comment}"}
-
-    def _partial_close(self, position, close_ratio: float) -> dict:
-        import MetaTrader5 as mt5
-        symbol_info = mt5.symbol_info(position.symbol)
-        if symbol_info is None:
-            return {"success": False, "message": "Symbol info unavailable"}
-        vol_step  = symbol_info.volume_step
-        raw_vol   = position.volume * close_ratio
-        close_vol = round(raw_vol - (raw_vol % vol_step), 10)
-        close_vol = max(close_vol, vol_step)
-        close_vol = min(close_vol, position.volume - vol_step)
-        if close_vol <= 0:
-            return {"success": False,
-                    "message": "Position too small to split"}
-        is_buy      = position.type == mt5.ORDER_TYPE_BUY
-        close_type  = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY
-        tick        = mt5.symbol_info_tick(position.symbol)
-        close_price = tick.bid if is_buy else tick.ask
-        filling     = self._get_filling_mode(position.symbol)
-        request = {
-            "action":       mt5.TRADE_ACTION_DEAL,
-            "symbol":       position.symbol,
-            "volume":       float(close_vol),
-            "type":         close_type,
-            "position":     position.ticket,
-            "price":        close_price,
-            "deviation":    20,
-            "magic":        234000,
-            "comment":      "AI_Pro partial",
-            "type_time":    mt5.ORDER_TIME_GTC,
-            "type_filling": filling,
-        }
-        result = mt5.order_send(request)
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            return {
-                "success": True, "ticket": position.ticket,
-                "closed_vol": close_vol,
-                "remain_vol": round(position.volume - close_vol, 10),
-                "price": result.price,
-                "message": (f"Partial {close_vol} of {position.volume}"
-                            f" @ {result.price:.5f} #{position.ticket}")
-            }
-        comment = result.comment if result else "N/A"
-        return {"success": False, "ticket": position.ticket,
-                "message": f"Partial failed: {comment}"}
-
-    def _was_partially_closed(self, ticket: int) -> bool:
-        """Detect via MT5 deal history whether this position has had a partial close.
-
-        Survives bot restarts and catches partials done outside of this process.
-        A position is considered partialled if the sum of OUT deals on this ticket
-        is > 0 and < the original opening IN deal volume.
-        """
-        import MetaTrader5 as mt5
-        try:
-            deals = mt5.history_deals_get(position=int(ticket))
-        except Exception:
-            return False
-        if not deals:
-            return False
-        opened_vol = 0.0
-        closed_vol = 0.0
-        for d in deals:
-            if d.entry == mt5.DEAL_ENTRY_IN:
-                opened_vol += float(d.volume)
-            elif d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY):
-                closed_vol += float(d.volume)
-        if opened_vol <= 0:
-            return False
-        # Partial: some volume closed, but not all
-        return 0 < closed_vol < opened_vol
-
-    def check_partial_close_and_breakeven(self, symbol: str) -> list:
-        import MetaTrader5 as mt5
-        if not self._ensure_mt5():
-            return []
-        positions = mt5.positions_get(symbol=symbol)
-        if not positions:
-            return []
-        symbol_info = mt5.symbol_info(symbol)
-        if symbol_info is None:
-            return []
-
-        # Correct pip size: JPY pairs have 2-3 decimal digits (1 pip = 0.01),
-        # all others have 4-5 decimal digits (1 pip = 0.0001).
-        pip    = 0.01 if symbol_info.digits in (2, 3) else 0.0001
-        be_buf = self.breakeven_buffer_pips * pip
-        results = []
-
-        # Import MT5 history window — last 7 days is enough for live trades
-        try:
-            from datetime import datetime, timedelta
-            _hist_from = datetime.now() - timedelta(days=7)
-            _hist_to   = datetime.now() + timedelta(days=1)
-            mt5.history_select(_hist_from, _hist_to)
-        except Exception:
-            pass
-
-        for pos in positions:
-            ticket = pos.ticket
-            entry  = pos.price_open
-            sl     = pos.sl
-            is_buy = pos.type == mt5.ORDER_TYPE_BUY
-
-            # Reconcile in-memory set with actual MT5 deal history
-            if ticket not in self._partial_closed_tickets:
-                if self._was_partially_closed(ticket):
-                    self._partial_closed_tickets.add(ticket)
-                    log_thought("partial_close", symbol, "detected_external",
-                                f"#{ticket} partial detected via history — will move SL to BE",
-                                action="reconcile")
-
-            if ticket in self._partial_closed_tickets:
-                be_price = round(
-                    entry + be_buf if is_buy else entry - be_buf,
-                    symbol_info.digits
-                )
-                sl_at_be = (sl >= be_price) if is_buy else (sl <= be_price)
-                if not sl_at_be:
-                    log_thought("partial_close", symbol, "breakeven",
-                                f"Moving SL to BE {be_price:.5f} on #{ticket} "
-                                f"(partial already taken)",
-                                action="move_sl")
-                    results.append(self._modify_sl(pos, be_price))
-                continue
-
-            if sl == 0.0:
-                continue
-
-            risk_dist = abs(entry - sl)
-            trigger   = (entry + risk_dist * self.partial_close_rr if is_buy
-                         else entry - risk_dist * self.partial_close_rr)
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                continue
-            current   = tick.bid if is_buy else tick.ask
-            triggered = (current >= trigger) if is_buy else (current <= trigger)
-            if not triggered:
-                continue
-
-            log_thought("partial_close", symbol, "trigger",
-                        f"1:1 hit #{ticket} — closing {self.partial_close_ratio*100:.0f}%",
-                        detail=f"entry={entry:.5f} trigger={trigger:.5f} current={current:.5f}",
-                        action="partial_close")
-
-            pc = self._partial_close(pos, self.partial_close_ratio)
-            results.append(pc)
-            if not pc["success"]:
-                continue
-
-            self._partial_closed_tickets.add(ticket)
-
-            updated    = mt5.positions_get(ticket=ticket)
-            target_pos = updated[0] if updated else pos
-            be_price   = round(
-                entry + be_buf if is_buy else entry - be_buf,
-                symbol_info.digits
-            )
-            log_thought("partial_close", symbol, "breakeven",
-                        f"Moving SL to BE {be_price:.5f} on #{ticket}",
-                        action="move_sl")
-            be = self._modify_sl(target_pos, be_price)
-            results.append(be)
-
-        return results
-
     # ------------------------------------------------------------------ #
-    # AI Risk Manager (algo-v2 style, adapted for AI Pro positions)       #
+    # Agent Zero Risk Manager — sole in-flight position manager           #
     # ------------------------------------------------------------------ #
 
     def _ai_risk_review_position(self, pos, symbol: str,
                                   point: float, digits: int,
                                   atr: float) -> Optional[dict]:
         """
-        Reviews one open position.  When AI_BACKEND=agent/ollama this is
-        delegated to the Ollama agent in ai_agent.py, which can only
-        TIGHTEN the stop or request an EARLY close — the broker's hard SL
-        remains authoritative.  On any agent failure we fall back to the
-        DeepSeek path below.
+        Reviews one open position. Delegated to Agent Zero in ai_agent.py,
+        who can only TIGHTEN the stop or request an EARLY close — the
+        broker's hard SL remains authoritative. There is NO fallback LLM:
+        if Agent Zero is unreachable we HOLD and let the broker's hard SL
+        do its job.
         """
         import MetaTrader5 as mt5
         ticket     = int(pos.ticket)
@@ -1269,7 +751,7 @@ class AI_Pro:
                 notes=(f"trend_reason={hh_ll_status.get('reason','')} "
                        f"struct_reason={structure_status.get('reason','')}"),
             )
-            verdict = _ai_agent.get_risk_agent().review(ctx)
+            verdict = _ai_agent.get_agent_zero().review(ctx)
             action  = str(verdict.get("action", "hold"))
             reason  = str(verdict.get("reason", ""))[:120]
 
@@ -1312,7 +794,7 @@ class AI_Pro:
     def run_ai_risk_manager(self, symbol: str) -> list:
         """
         Called each cycle BEFORE entry signal generation.
-        Runs rule-based checks (BE, trail) AND DeepSeek review every N ticks.
+        Open positions are managed only by the prompt-driven risk agent.
         """
         import MetaTrader5 as mt5
         if not self._ensure_mt5():
@@ -1330,11 +812,6 @@ class AI_Pro:
         df     = self._fetch_m15(symbol)
         atr    = self._calculate_atr(df) if df is not None else 0.0
 
-        try:
-            rules = _load_rules()
-        except Exception:
-            rules = None
-
         results = []
 
         for pos in positions:
@@ -1350,64 +827,15 @@ class AI_Pro:
             price  = float(tick_.bid) if is_buy else float(tick_.ask)
             profit_pts = ((price - entry) / point if is_buy
                           else (entry - price) / point)
-
-            # Correct pip size (must match check_partial_close_and_breakeven)
-            pip_size = 0.01 if digits in (2, 3) else 0.0001
-
-            # -- Rule-based: breakeven
-            # Fires once when profit_pts >= breakeven_trigger_points.
-            # Uses the same breakeven_buffer_pips as the partial-close path so
-            # the SL always lands at a consistent level (entry ± 1 pip by default).
-            if ticket not in self._ai_breakeven_done and rules:
-                be_pts = int(getattr(rules, "breakeven_trigger_points", 0) or 0)
-                if be_pts and profit_pts >= be_pts:
-                    be_buf = self.breakeven_buffer_pips * pip_size
-                    be_sl  = round(
-                        entry + be_buf if is_buy else entry - be_buf,
-                        digits
-                    )
-                    if _sl_is_better(be_sl, cur_sl, is_buy):
-                        self._ai_breakeven_done.add(ticket)
-                        log_thought("rule_risk", symbol, "breakeven",
-                                    f"#{ticket} — SL to BE {be_sl:.5f} "
-                                    f"(profit={profit_pts:.1f}pts >= trigger={be_pts}pts)",
-                                    action="move_sl")
-                        updated = mt5.positions_get(ticket=ticket)
-                        p2 = updated[0] if updated else pos
-                        results.append(self._modify_sl(p2, be_sl))
-
-            # -- Rule-based: trailing stop
-            # Uses pip units (not raw MT5 points) so "8 trailing" means 8 pips.
-            # Only fires if trailing_stop_points > 0 in config.
-            # Does NOT fire if disabled (0) — the TP limit order handles final exit.
-            if rules:
-                trail_pts = int(getattr(rules, "trailing_stop_points", 0) or 0)
-                if trail_pts and profit_pts > 0:
-                    trail_sl = round(
-                        price - trail_pts * pip_size if is_buy
-                        else price + trail_pts * pip_size,
-                        digits
-                    )
-                    if _sl_is_better(trail_sl, cur_sl, is_buy):
-                        log_thought("rule_risk", symbol, "trail",
-                                    f"#{ticket} — trail SL {trail_sl:.5f} "
-                                    f"({trail_pts} pips behind {price:.5f})",
-                                    action="move_sl")
-                        updated = mt5.positions_get(ticket=ticket)
-                        p2 = updated[0] if updated else pos
-                        results.append(self._modify_sl(p2, trail_sl))
-
-            # -- Heartbeat: prove to the user that risk monitoring is alive.
-            # One log line per ticket every MONITOR_HEARTBEAT_SECS so the AI
-            # Log shows continuous oversight instead of going silent between
-            # reviews. Keeps the message lightweight to avoid log spam.
+            # Lightweight heartbeat so the dashboard shows continuous AI
+            # supervision between prompt-driven reviews.
             now_ts = time.time()
             last_hb = self._ai_last_heartbeat_ts.get(ticket, 0.0)
             if now_ts - last_hb >= self.MONITOR_HEARTBEAT_SECS:
                 self._ai_last_heartbeat_ts[ticket] = now_ts
                 log_thought(
-                    "rule_risk", symbol, "monitor",
-                    f"#{ticket} {direction} monitoring — "
+                    "ai_risk", symbol, "monitor",
+                    f"#{ticket} {direction} monitoring - "
                     f"{profit_pts:+.1f}pts (peak {self._ai_peak_profit.get(ticket, 0):.0f}), "
                     f"SL={cur_sl:.5f} TP={cur_tp:.5f}",
                 )
@@ -1450,8 +878,6 @@ class AI_Pro:
         for t in list(self._ai_tick_counters):
             if t not in active:
                 del self._ai_tick_counters[t]
-                self._ai_breakeven_done.discard(t)
-                self._ai_partial_done.discard(t)
                 self._ai_peak_profit.pop(t, None)
                 self._ai_last_review_ts.pop(t, None)
                 self._ai_last_heartbeat_ts.pop(t, None)
@@ -1772,14 +1198,14 @@ class AI_Pro:
         }
 
     # ------------------------------------------------------------------ #
-    # AI Signal Review (DeepSeek approves/rejects AI Pro signal)           #
+    # Signal Review — Agent Zero approves/rejects raw strategy signal     #
     # ------------------------------------------------------------------ #
 
     def _ai_review_signal(self, symbol: str, signal: dict,
                            df: pd.DataFrame) -> dict:
         """
-        Single-path entry review via the Ollama agent (ai_agent.py).
-        The agent filters each raw signal by DAILY BIAS and returns:
+        Single-path entry review via Agent Zero (ai_agent.py).
+        Agent Zero filters each raw signal by DAILY BIAS and returns:
           {"approve": bool, "reason": str, "confidence": float}
 
         There is NO fallback LLM. If the agent module is missing or the
@@ -1807,7 +1233,7 @@ class AI_Pro:
                 detail=str(signal.get("reason", ""))[:120],
                 action=direction.lower() if direction else None,
             )
-            verdict    = _ai_agent.get_entry_agent().review(symbol, signal, df)
+            verdict    = _ai_agent.get_agent_zero().review(signal, symbol=symbol, df=df)
             approve    = bool(verdict.get("approve", False))
             reason     = str(verdict.get("reason", "")).strip() or "no reason"
             ai_conf    = float(verdict.get("confidence", 0.0) or 0.0)
@@ -2013,28 +1439,54 @@ class AI_Pro:
                 signal["ai_reason"]     = "AI disabled"
                 signal["ai_confidence"] = 1.0
         else:
-            env1_ready = bool(
-                choch_data and choch_data["choch_detected"]
-                and choch_data["type"] == "bullish"
-                and near_low_choch and failed_low_at_pdl
-            )
-            env2_ready = bool(
-                choch_data and choch_data["choch_detected"]
-                and choch_data["type"] == "bearish"
-                and near_high_choch and failed_high_at_pdh
-            )
-            env3_ready = bool(
-                cont_data and cont_data["continuation_detected"]
-                and cont_data["type"] == "bullish"
-                and broke_above_pdh and near_high
-            )
-            env4_ready = bool(
-                cont_data and cont_data["continuation_detected"]
-                and cont_data["type"] == "bearish"
-                and broke_below_pdl and near_low
-            )
+            def _why(env: int) -> str:
+                """
+                First missing precondition for the given env, in priority order.
+                Returns 'ready' if every precondition is met (very rare at this
+                point — would normally mean the daily-trend filter blocked it).
+                """
+                if env in (1, 2):
+                    if not choch_data or not choch_data.get("choch_detected"):
+                        return "no CHoCH"
+                    want = "bullish" if env == 1 else "bearish"
+                    if choch_data["type"] != want:
+                        return f"CHoCH {choch_data['type']} (need {want})"
+                    if env == 1 and not near_low_choch:
+                        return "price not near PDL"
+                    if env == 2 and not near_high_choch:
+                        return "price not near PDH"
+                    if env == 1 and not failed_low_at_pdl:
+                        return "prior low not at PDL"
+                    if env == 2 and not failed_high_at_pdh:
+                        return "prior high not at PDH"
+                    # CHoCH all good — only daily-bias filter can block now.
+                    if env == 1 and daily_trend == "bearish":
+                        return "daily bias bearish blocks BUY"
+                    if env == 2 and daily_trend == "bullish":
+                        return "daily bias bullish blocks SELL"
+                    return "ready"
+                # env 3 / 4 (continuation)
+                if not cont_data or not cont_data.get("continuation_detected"):
+                    return "no continuation"
+                want = "bullish" if env == 3 else "bearish"
+                if cont_data["type"] != want:
+                    return f"continuation {cont_data['type']} (need {want})"
+                if env == 3 and not broke_above_pdh:
+                    return "no break above PDH"
+                if env == 4 and not broke_below_pdl:
+                    return "no break below PDL"
+                if env == 3 and not near_high:
+                    return "price not retesting PDH"
+                if env == 4 and not near_low:
+                    return "price not retesting PDL"
+                if env == 3 and daily_trend == "bearish":
+                    return "daily bias bearish blocks BUY"
+                if env == 4 and daily_trend == "bullish":
+                    return "daily bias bullish blocks SELL"
+                return "ready"
+
             signal["reason"] = self._environment_summary(
-                env1_ready, env2_ready, env3_ready, env4_ready
+                _why(1), _why(2), _why(3), _why(4)
             )
 
         # Filter: Only return signals with sufficient confidence
@@ -2067,17 +1519,25 @@ class AI_Pro:
 
     @staticmethod
     def _environment_summary(
-        env1: bool = False,
-        env2: bool = False,
-        env3: bool = False,
-        env4: bool = False,
+        env1: "bool | str" = False,
+        env2: "bool | str" = False,
+        env3: "bool | str" = False,
+        env4: "bool | str" = False,
     ) -> str:
-        return " | ".join([
-            f"ENV1 {'active' if env1 else 'inactive'}",
-            f"ENV2 {'active' if env2 else 'inactive'}",
-            f"ENV3 {'active' if env3 else 'inactive'}",
-            f"ENV4 {'active' if env4 else 'inactive'}",
-        ])
+        """
+        Compact per-env status line for the Zero Log. Accepts either a bool
+        (legacy: active/inactive) or a string reason — when a string comes in
+        we show the *why* instead of a generic 'inactive'. 'ready' means every
+        precondition was met (e.g. daily-bias filter was the last blocker).
+        """
+        def _fmt(n: int, v) -> str:
+            if isinstance(v, str):
+                # "ready" → active; anything else → why it's off
+                label = "active" if v == "ready" else f"off ({v})"
+                return f"ENV{n} {label}"
+            return f"ENV{n} {'active' if v else 'inactive'}"
+        return " | ".join([_fmt(1, env1), _fmt(2, env2),
+                           _fmt(3, env3), _fmt(4, env4)])
 
     # ------------------------------------------------------------------ #
     # Trade execution                                                       #
@@ -2190,34 +1650,33 @@ class AI_Pro:
         Workflow: STRATEGY → AGENT → MARKET
 
           STRATEGY (rule engine — untouched):
-            1. Partial close + breakeven management on existing positions
-            2. Generate fresh M15 signal via AI_Pro rules
+            1. Generate fresh M15 signal via Agent Zero Bot rules
 
           AGENT (Ollama — gates + manages):
-            3. Risk review of open positions (tighten SL / close early only;
+            2. Risk review of open positions (tighten SL / close early only;
                broker's hard SL remains authoritative)
-            4. Entry review — agent filters the signal by DAILY BIAS
+            3. Entry review — agent filters the signal by DAILY BIAS
                (daily open vs current price) and approves or rejects
 
           MARKET (broker):
-            5. Auto-execute approved signals via MT5 (no hard-coded symbol
+            4. Auto-execute approved signals via MT5 (no hard-coded symbol
                whitelist — any configured symbol is tradable)
         """
         log.info("=" * 65)
-        log.info("AI Pro — %s", symbol)
+        log.info("Agent Zero — %s", symbol)
         log.info("=" * 65)
 
         df = self._fetch_m15(symbol)
 
         exit_results = []
 
-        # Step 1 — AI Pro partial close / breakeven
-        partial_results = self.check_partial_close_and_breakeven(symbol)
+        # Native code-based trade management removed.
+        partial_results = []
 
-        # Step 2 — AI risk manager
+        # Step 1 - AI risk manager
         ai_risk_results = self.run_ai_risk_manager(symbol)
 
-        # Step 3+4 — Signal + AI review
+        # Step 2+3 - Signal + AI review
         signal = self.generate_trade_signal(symbol)
 
         log.info("Signal      : %s", signal["signal"])
@@ -2236,7 +1695,7 @@ class AI_Pro:
                      signal["entry_price"], signal["stop_loss"],
                      signal["take_profit"], rr)
 
-            # Step 6 — Execute
+            # Step 4 - Execute
             if (auto_trade
                     and signal.get("ai_approved", False)):
                 log.info("AUTO TRADE — executing")
@@ -2415,11 +1874,9 @@ class Bot:
             "atr_tolerance_multiplier": float(strategy_kwargs.get("atr_tolerance_multiplier", 1.5)),
             "sl_atr_mult":              float(strategy_kwargs.get("sl_atr_mult", 2.5)),
             "tp_atr_mult":              float(strategy_kwargs.get("tp_atr_mult", 4.5)),
-            "partial_close_rr":         float(strategy_kwargs.get("partial_close_rr", 1.0)),
-            "breakeven_buffer_pips":    float(strategy_kwargs.get("breakeven_buffer_pips", 1.0)),
         }
 
-        self._strategy  = AI_Pro(use_ai=use_ai, **strategy_kwargs)
+        self._strategy  = AgentZeroBot(use_ai=use_ai, **strategy_kwargs)
         self._running   = False
         self._stop      = threading.Event()
 
@@ -2431,6 +1888,31 @@ class Bot:
     def run(self) -> None:
         log.info("Bot starting — symbols=%s  poll=%ss  auto_trade=%s  use_ai=%s",
                  self.symbols, self.poll_secs, self.auto_trade, self.use_ai)
+        # Agent Zero preflight — confirm the one and only brain is reachable
+        # *before* we start polling. Surfaces Ollama outages up front instead
+        # of discovering them on the first signal.
+        try:
+            if self.use_ai and _AGENT_IMPORT_OK and _ai_agent is not None:
+                health = _ai_agent.ollama_health()
+                if health.get("reachable") and health.get("model_loaded"):
+                    log.info("Agent Zero preflight OK — Ollama %s @ %s, model=%s",
+                             "reachable", health.get("url"), health.get("model"))
+                    log_thought("ai_entry", "*", "preflight",
+                                f"Agent Zero online — model '{health.get('model')}' loaded at {health.get('url')}",
+                                action="hold", confidence=1.0)
+                else:
+                    log.warning("Agent Zero preflight FAILED — reachable=%s model_loaded=%s err=%s",
+                                health.get("reachable"), health.get("model_loaded"), health.get("error"))
+                    log_thought("ai_entry", "*", "preflight",
+                                f"Agent Zero offline — auto-trading paused. reachable={health.get('reachable')} model_loaded={health.get('model_loaded')} err={health.get('error') or '—'}",
+                                action="hold", confidence=0.0)
+            elif self.use_ai and not _AGENT_IMPORT_OK:
+                log.warning("Agent Zero module failed to import — auto-trading disabled")
+                log_thought("ai_entry", "*", "preflight",
+                            "Agent Zero module missing — auto-trading disabled",
+                            action="hold", confidence=0.0)
+        except Exception as exc:
+            log.warning("Agent Zero preflight threw: %s", exc)
         if not self._strategy._ensure_mt5():
             raise RuntimeError("MT5 failed to initialize")
         self._running = True
@@ -2501,15 +1983,7 @@ class Bot:
                     val = float(strategy["tp_atr_mult"])
                     self.strategy_config["tp_atr_mult"] = val
                     self._strategy.tp_atr_mult = val
-                if "partial_close_rr" in strategy:
-                    val = float(strategy["partial_close_rr"])
-                    self.strategy_config["partial_close_rr"] = val
-                    self._strategy.partial_close_rr = val
-                if "breakeven_buffer_pips" in strategy:
-                    val = float(strategy["breakeven_buffer_pips"])
-                    self.strategy_config["breakeven_buffer_pips"] = val
-                    self._strategy.breakeven_buffer_pips = val
-            
+             
             return {"ok": True, "config": self.config_snapshot()}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -2575,19 +2049,6 @@ class Bot:
                 with self._results_lock:
                     self._results[symbol] = blocked_result
                 return
-
-            # ALWAYS manage existing positions first (partial close /
-            # breakeven / agent risk review). This runs regardless of any
-            # circuit breakers below — we never abandon open trades.
-            if positions:
-                try:
-                    self._strategy.check_partial_close_and_breakeven(symbol)
-                except Exception as exc:
-                    log.error("[%s] partial/BE check failed: %s", symbol, exc)
-                try:
-                    self._strategy.run_ai_risk_manager(symbol)
-                except Exception as exc:
-                    log.error("[%s] AI risk manager failed: %s", symbol, exc)
 
             # ------------------------------------------------------------
             # Circuit breakers — block NEW entries only (managers above
@@ -2726,10 +2187,8 @@ _last_bot_config: dict = {
     "use_ai":     True,
     "strategy": {
         "atr_tolerance_multiplier": 1.5,
-        "sl_atr_mult":              2.5,   # matches AI_Pro default and documented 2.5×ATR
-        "tp_atr_mult":              4.5,   # matches AI_Pro default and documented 4.5×ATR
-        "partial_close_rr":         1.0,
-        "breakeven_buffer_pips":    1.0,
+        "sl_atr_mult":              2.5,   # matches AgentZeroBot default and documented 2.5×ATR
+        "tp_atr_mult":              4.5,   # matches AgentZeroBot default and documented 4.5×ATR
     },
 }
 
@@ -3027,7 +2486,7 @@ def serve_js():
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "version": "AI_Pro"})
+    return jsonify({"ok": True, "version": "AgentZero"})
 
 
 @app.route("/bot/status")
@@ -3071,11 +2530,11 @@ def bot_status():
                 "ai_reason":  signal.get("ai_reason"),
             }
     # ---- Active AI backend + liveness summary ----
-    # Agent is the default. We report which backend is currently selected
-    # and, if it's the agent, whether the Ollama server is actually up so
-    # the dashboard can warn the user before a trade gets reviewed.
+    # Agent Zero is the only backend. We report whether he is live
+    # (import OK + enabled + Ollama reachable) so the dashboard can
+    # warn the user before a trade gets reviewed.
     ai_backend = {
-        "active":       "deepseek",      # overwritten below when agent is on
+        "active":       "disabled",      # overwritten below when Agent Zero is on
         "agent_import": bool(_AGENT_IMPORT_OK),
     }
     try:
@@ -3118,7 +2577,7 @@ def bot_ai_backend():
     whether the Ollama server is actually reachable. Safe to poll.
     """
     out = {
-        "active":       "deepseek",
+        "active":       "disabled",
         "agent_import": bool(_AGENT_IMPORT_OK),
     }
     try:
@@ -3200,8 +2659,6 @@ def bot_start():
             "atr_tolerance_multiplier": float(strategy.get("atr_tolerance_multiplier", 1.5)),
             "sl_atr_mult":              float(strategy.get("sl_atr_mult",              1.5)),
             "tp_atr_mult":              float(strategy.get("tp_atr_mult",              3.0)),
-            "partial_close_rr":         float(strategy.get("partial_close_rr",         1.0)),
-            "breakeven_buffer_pips":    float(strategy.get("breakeven_buffer_pips",    1.0)),
         },
     }
 
@@ -3222,8 +2679,6 @@ def bot_start():
         atr_tolerance_multiplier = float(strategy.get("atr_tolerance_multiplier", 1.5)),
         sl_atr_mult              = float(strategy.get("sl_atr_mult",              1.5)),
         tp_atr_mult              = float(strategy.get("tp_atr_mult",              3.0)),
-        partial_close_rr         = float(strategy.get("partial_close_rr",         1.0)),
-        breakeven_buffer_pips    = float(strategy.get("breakeven_buffer_pips",    1.0)),
     )
 
     t = threading.Thread(target=_run_bot_thread, args=(new_bot,), daemon=True)
@@ -3483,7 +2938,7 @@ def ai_init():
 @app.route("/bot/signal/<symbol>")
 def manual_signal(symbol: str):
     """Run a one-shot signal check without a running bot (for testing)."""
-    strategy = AI_Pro()
+    strategy = AgentZeroBot()
     try:
         sig = strategy.generate_trade_signal(symbol.upper())
     finally:
@@ -3616,8 +3071,6 @@ if __name__ == "__main__":
                         atr_tolerance_multiplier=1.5,
                         sl_atr_mult=2.5,
                         tp_atr_mult=4.5,
-                        partial_close_rr=1.0,
-                        breakeven_buffer_pips=1.0,
                     )
                     t = threading.Thread(target=_run_bot_thread, args=(auto_bot,), daemon=True)
                     with _bot_lock:
@@ -3634,10 +3087,10 @@ if __name__ == "__main__":
         print("=" * 55)
         chosen_port = _choose_http_port()
         if chosen_port in (5000, 5001):
-            print(f"  AI Pro Dashboard -> http://localhost:{chosen_port}")
+            print(f"  Agent Zero Dashboard -> http://localhost:{chosen_port}")
             print(f"  LAN: http://<your-ip>:{chosen_port}")
         else:
-            print(f"  AI Pro Dashboard -> http://localhost:{chosen_port}")
+            print(f"  Agent Zero Dashboard -> http://localhost:{chosen_port}")
             print(f"  LAN: http://<your-ip>:{chosen_port}")
         print("  API:  /bot/start  /bot/stop  /bot/status")
         print("  Test: /bot/signal/EURUSD")

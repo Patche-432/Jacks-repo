@@ -5,7 +5,7 @@ Backtest all trading pairs and generate results table
 import sys
 sys.path.insert(0, '.')
 
-from odl.backtest import AI_ProBacktester
+from odl.backtest import AgentZeroBacktester
 import pandas as pd
 
 # Trading pairs from configuration
@@ -21,8 +21,8 @@ def run_all_backtests(days=7):
         print(f"[BACKTESTING] {symbol}")
         print(f"{'='*70}")
         
-        bt = AI_ProBacktester()
-        results = bt.run(symbol, days=days)
+        # bt = AgentZeroBacktester()
+        # results = bt.run(symbol, days=days)
         
         if "error" in results:
             print(f"[ERROR] {results['error']}")
