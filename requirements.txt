@@ -4,8 +4,10 @@
 #   pip install -r requirements.txt
 #
 # Optional extras:
-#   pip install -r requirements-llm.txt
 #   pip install -r requirements-backtest.txt
+#
+# Agent Zero runs against a local Ollama server (install separately:
+# https://ollama.com). No in-process LLM dependencies are required.
 
 Flask>=2.3
 flask-cors>=4.0

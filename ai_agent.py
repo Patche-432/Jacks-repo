@@ -28,8 +28,10 @@ with itself.
 
 Configuration via env:
   OLLAMA_URL      (default http://localhost:11434)
-  OLLAMA_MODEL    (default qwen2.5:14b-instruct)
-  AGENT_TIMEOUT_S (default 30)
+  OLLAMA_MODEL    (default qwen2.5:3b-instruct — CPU-friendly; override
+                   with qwen2.5:7b-instruct or qwen2.5:14b-instruct on
+                   GPU hosts, or llama3.2:3b on Snapdragon X / ARM CPUs)
+  AGENT_TIMEOUT_S (default 60 — bumped from 30 to tolerate CPU inference)
 """
 
 from __future__ import annotations
@@ -92,8 +94,15 @@ class OllamaClient:
                  model: Optional[str] = None,
                  timeout: Optional[float] = None) -> None:
         self.url = (url or os.getenv("OLLAMA_URL", "http://localhost:11434")).rstrip("/")
-        self.model = model or os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct")
-        self.timeout = float(timeout or os.getenv("AGENT_TIMEOUT_S", "30"))
+        # Default to qwen2.5:3b-instruct: small enough to run responsively
+        # on CPU (including Snapdragon X / ARM64), strong enough to follow
+        # the strict JSON-only system prompt. Override via OLLAMA_MODEL for
+        # GPU hosts that can handle qwen2.5:7b/14b-instruct.
+        self.model = model or os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct")
+        # 60s ceiling — CPU inference of a ~200-token JSON verdict on a 3B
+        # model typically finishes in 5-15s, but we keep headroom so slow
+        # first-token latency (model load) doesn't trip the review.
+        self.timeout = float(timeout or os.getenv("AGENT_TIMEOUT_S", "60"))
 
     def chat(self,
              system: str,

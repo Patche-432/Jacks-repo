@@ -3122,17 +3122,45 @@ if __name__ == "__main__":
 
         threading.Thread(target=_auto_start_bot, daemon=True, name="bot-autostart").start()
 
+        # Attempt MT5 auto-connect in the background so it's ready when the dashboard loads.
+        def _auto_connect_mt5():
+            if MT5_CONFIG.get("login"):
+                log.info("Auto-connecting MT5 with saved credentials (login=%s) ...", MT5_CONFIG["login"])
+                result = _mt5_snapshot(shutdown_when_done=True)
+                if result.get("connected"):
+                    log.info("MT5 auto-connect OK — server=%s", result.get("server"))
+                else:
+                    log.warning("MT5 auto-connect failed: %s", result.get("error"))
+            else:
+                log.info("No saved MT5 credentials — waiting for manual connect via dashboard.")
+
+        threading.Thread(target=_auto_connect_mt5, daemon=True, name="mt5-autoconnect").start()
+
+        # ----- Ollama / Agent Zero health banner -----
+        try:
+            if _AGENT_IMPORT_OK and _ai_agent is not None:
+                health = _ai_agent.ollama_health()
+                if health.get("reachable") and health.get("model_loaded"):
+                    log.info("Agent Zero online — Ollama %s, model %s",
+                             health.get("url"), health.get("model"))
+                elif health.get("reachable"):
+                    log.warning("Agent Zero: Ollama reachable at %s but model '%s' not loaded. "
+                                "Run `ollama pull %s` to enable auto-trading.",
+                                health.get("url"), health.get("model"), health.get("model"))
+                else:
+                    log.warning("Agent Zero: Ollama NOT reachable at %s (%s). "
+                                "Auto-trading paused until Ollama comes up.",
+                                health.get("url"), health.get("error"))
+            else:
+                log.warning("Agent Zero import failed — strategy will run but auto-trading is disabled.")
+        except Exception as _exc:
+            log.warning("Agent Zero health probe error: %s", _exc)
+
         print("=" * 55)
         chosen_port = _choose_http_port()
-        if chosen_port in (5000, 5001):
-            print(f"  Agent Zero Dashboard -> http://localhost:{chosen_port}")
-            print(f"  LAN: http://<your-ip>:{chosen_port}")
-        else:
-            print(f"  Agent Zero Dashboard -> http://localhost:{chosen_port}")
-            print(f"  LAN: http://<your-ip>:{chosen_port}")
+        print(f"  FORTIS Agent Zero Dashboard -> http://localhost:{chosen_port}")
+        print(f"  LAN: http://<your-ip>:{chosen_port}")
         print("  API:  /bot/start  /bot/stop  /bot/status")
         print("  Test: /bot/signal/EURUSD")
-        print("=" * 55)
-        print("  ▶ AUTO-START: Connecting MT5, Running Test Trade, Starting Bot...")
         print("=" * 55)
         app.run(host="0.0.0.0", port=chosen_port, debug=False, threaded=True)

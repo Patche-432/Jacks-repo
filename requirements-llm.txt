@@ -1,8 +1,0 @@
-# Local LLM dependencies (used by LocalLLM in ai_pro.py)
--r requirements.txt
-
-transformers>=4.40
-# torch wheels vary by CPU/GPU; install the appropriate build for your machine.
-# If plain `pip install torch` fails, follow the official selector:
-#   https://pytorch.org/get-started/locally/
-torch
