@@ -286,12 +286,32 @@ function updateMt5Display(data) {
 }
 
 // ── Bot control ───────────────────────────────────────────────
+function readBotConfigPayload() {
+    return {
+        symbols:       (document.getElementById('cfg-symbols')  || {}).value,
+        volume:        parseFloat((document.getElementById('cfg-volume')   || { value: 0.5  }).value),
+        poll_interval: parseInt((document.getElementById('cfg-poll') || { value: 300 }).value, 10),
+        dry_run:       !!((document.getElementById('cfg-dry')  || {}).checked),
+        ai_review:     !!((document.getElementById('cfg-ai')   || { checked: true }).checked),
+        auto_trade:    !!((document.getElementById('cfg-auto') || { checked: true }).checked),
+        sl_mult:       parseFloat((document.getElementById('cfg-sl-mult')  || { value: 2.5 }).value),
+        tp_mult:       parseFloat((document.getElementById('cfg-tp-mult')  || { value: 4.5 }).value),
+        atr_mult:      parseFloat((document.getElementById('cfg-atr-mult') || { value: 1.5 }).value),
+        pc_rr:         parseFloat((document.getElementById('cfg-pc-rr')    || { value: 1.0 }).value),
+        be_buffer:     parseFloat((document.getElementById('cfg-be-buf')   || { value: 1.0 }).value),
+    };
+}
+
 async function startBot() {
     const btn = document.getElementById('start-btn');
     btn.disabled = true;
     btn.textContent = 'Starting…';
     try {
-        const r = await fetch('/bot/start', { method: 'POST' });
+        const r = await fetch('/bot/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(readBotConfigPayload()),
+        });
         const data = await r.json();
         if (r.status === 409) {
             _setBotRunning(true);
@@ -393,19 +413,7 @@ async function applyConfig() {
     const applyBtn = document.getElementById('apply-btn');
     if (applyBtn) { applyBtn.disabled = true; applyBtn.textContent = 'Applying…'; }
     try {
-        const payload = {
-            symbols:       (document.getElementById('cfg-symbols')  || {}).value,
-            volume:        parseFloat((document.getElementById('cfg-volume')   || { value: 0.5  }).value),
-            poll_interval: parseInt(  (document.getElementById('cfg-poll')     || { value: 300  }).value, 10),
-            dry_run:       !!((document.getElementById('cfg-dry')    || {}).checked),
-            ai_review:     !!((document.getElementById('cfg-ai')     || { checked: true }).checked),
-            auto_trade:    !!((document.getElementById('cfg-auto')   || { checked: true }).checked),
-            sl_mult:       parseFloat((document.getElementById('cfg-sl-mult')  || { value: 2.5  }).value),
-            tp_mult:       parseFloat((document.getElementById('cfg-tp-mult')  || { value: 4.5  }).value),
-            atr_mult:      parseFloat((document.getElementById('cfg-atr-mult') || { value: 1.5  }).value),
-            pc_rr:         parseFloat((document.getElementById('cfg-pc-rr')    || { value: 1.0  }).value),
-            be_buffer:     parseFloat((document.getElementById('cfg-be-buf')   || { value: 1.0  }).value),
-        };
+        const payload = readBotConfigPayload();
         const r = await fetch('/bot/config', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

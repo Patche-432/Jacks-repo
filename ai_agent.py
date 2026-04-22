@@ -41,7 +41,41 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import requests
+# HTTP to Ollama goes through the stdlib (urllib.request + json), so
+# Agent Zero has zero external pip dependencies beyond what Python
+# already ships with. This removed the old `requests` requirement that
+# was tripping up fresh installs.
+import json as _json
+import urllib.request
+import urllib.error
+
+
+def _http_post_json(url: str, payload: dict, timeout: float) -> dict:
+    """POST JSON, return parsed JSON dict. Raises on HTTP / transport error."""
+    body = _json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    try:
+        return _json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"non-JSON response from {url}: {exc}") from exc
+
+
+def _http_get_json(url: str, timeout: float) -> dict:
+    """GET, return parsed JSON dict. Raises on HTTP / transport error."""
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    try:
+        return _json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(f"non-JSON response from {url}: {exc}") from exc
 
 log = logging.getLogger("ai_agent")
 
@@ -87,9 +121,11 @@ class OllamaClient:
         }
         if expect_json:
             payload["format"] = "json"
-        resp = requests.post(f"{self.url}/api/chat", json=payload, timeout=self.timeout)
-        resp.raise_for_status()
-        data = resp.json()
+        data = _http_post_json(
+            f"{self.url}/api/chat",
+            payload=payload,
+            timeout=self.timeout,
+        )
         return (data.get("message") or {}).get("content", "") or ""
 
 
@@ -486,17 +522,23 @@ def ollama_health() -> dict:
         "error": None,
     }
     try:
-        r = requests.get(f"{client.url}/api/tags", timeout=min(3.0, client.timeout))
-        r.raise_for_status()
+        data = _http_get_json(
+            f"{client.url}/api/tags",
+            timeout=min(3.0, client.timeout),
+        )
         out["reachable"] = True
         try:
-            tags = r.json().get("models") or []
+            tags = data.get("models") or []
             wanted = client.model.split(":")[0].lower()
             out["model_loaded"] = any(
                 wanted in str(t.get("name", "")).lower() for t in tags
             )
         except Exception as exc:
             out["error"] = f"tags parse: {exc!s}"
+    except urllib.error.URLError as exc:
+        # Most common real-world case: Ollama isn't running, or not on this URL.
+        reason = getattr(exc, "reason", exc)
+        out["error"] = f"cannot reach Ollama at {client.url}: {reason}"
     except Exception as exc:
         out["error"] = str(exc)
     return out

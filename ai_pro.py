@@ -31,7 +31,7 @@ Usage:
     python ai_pro.py --run        # starts Agent Zero immediately on EURUSD
 
 Requirements:
-    pip install flask flask-cors MetaTrader5 numpy pandas pyyaml requests
+    pip install flask flask-cors MetaTrader5 numpy pandas pyyaml
 """
 
 from __future__ import annotations
@@ -148,10 +148,12 @@ import numpy as np
 import pandas as pd
 
 # Agent Zero — the one and only AI brain in this pipeline, lives in
-# ai_agent.py and talks to a local Ollama server. Import is tolerant so
-# the module still loads if ai_agent.py / requests is missing; in that
-# case auto-trading is disabled (strategy emits signals, Agent Zero is
-# the gate that never opens).
+# ai_agent.py and talks to a local Ollama server (via stdlib urllib,
+# zero external deps). Import is tolerant so the module still loads
+# even if ai_agent.py is somehow missing; in that case auto-trading
+# is disabled (strategy emits signals, Agent Zero is the gate that
+# never opens).
+_agent_import_err: Optional[Exception] = None
 try:
     import ai_agent as _ai_agent      # noqa: F401
     _AGENT_IMPORT_OK = True
@@ -159,6 +161,13 @@ except Exception as _agent_exc:       # pragma: no cover
     _ai_agent = None
     _AGENT_IMPORT_OK = False
     _agent_import_err = _agent_exc
+    # Print to stderr immediately so the bot console shows *why* Agent
+    # Zero is offline — otherwise the only trace is the generic
+    # "Agent Zero offline" line in the Zero Log.
+    import sys as _sys, traceback as _tb
+    print(f"[ai_pro] Failed to import ai_agent: "
+          f"{type(_agent_exc).__name__}: {_agent_exc}", file=_sys.stderr)
+    _tb.print_exc(file=_sys.stderr)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -377,6 +386,21 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
         if normalized in {"false", "no", "n", "0", "reject", "rejected"}:
             return False
     return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_symbols(name: str, default: list[str]) -> list[str]:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return list(default)
+    items = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    return items or list(default)
 
 
 def _normalize_confidence(value: Any, default: float = 0.0) -> float:
@@ -684,9 +708,9 @@ class AgentZeroBot:
         """
         Reviews one open position. Delegated to Agent Zero in ai_agent.py,
         who can only TIGHTEN the stop or request an EARLY close — the
-        broker's hard SL remains authoritative. There is NO fallback LLM:
-        if Agent Zero is unreachable we HOLD and let the broker's hard SL
-        do its job.
+        broker's hard SL remains authoritative. Agent Zero is the only
+        brain in the pipeline; if he is unreachable we simply HOLD and
+        let the broker's hard SL do its job.
         """
         import MetaTrader5 as mt5
         ticket     = int(pos.ticket)
@@ -721,14 +745,18 @@ class AgentZeroBot:
             fresh_struct = {"fresh_structure": False, "structure_type": None}
 
         # ---------- Single-path agent risk review ----------
-        # The Ollama agent is the sole risk manager. It can only TIGHTEN a
-        # stop or request an EARLY close — never loosen, never override the
-        # broker's hard SL. On any agent failure we HOLD (broker hard SL
-        # remains authoritative), we never guess with a fallback LLM.
+        # Agent Zero is the sole risk manager. He can only TIGHTEN a stop
+        # or request an EARLY close — never loosen, never override the
+        # broker's hard SL. If he is offline or raises, we HOLD (the
+        # broker's hard SL is always authoritative anyway). There is no
+        # second opinion to consult — that is intentional.
         if not (_AGENT_IMPORT_OK and _ai_agent is not None):
+            why = (f"{type(_agent_import_err).__name__}: {_agent_import_err}"
+                   if _agent_import_err else "unknown import error")
             log_thought("ai_risk", symbol, "error",
-                        f"#{ticket} agent module unavailable — holding "
+                        f"#{ticket} Agent Zero offline — holding "
                         f"(broker SL still active).",
+                        detail=f"ai_agent import failed: {why}",
                         action="hold")
             return None
 
@@ -1208,22 +1236,26 @@ class AgentZeroBot:
         Agent Zero filters each raw signal by DAILY BIAS and returns:
           {"approve": bool, "reason": str, "confidence": float}
 
-        There is NO fallback LLM. If the agent module is missing or the
-        agent raises, we return a safe REJECT — never a default approve.
-        The broker-side hard SL remains authoritative regardless.
+        Agent Zero is the only brain. If he is offline (module import
+        failed or he raises), we SAFE-REJECT the signal — by design, not
+        as degraded behaviour. The broker-side hard SL remains
+        authoritative regardless.
         """
         direction = signal.get("signal", "")
         env       = signal.get("signal_source", "unknown")
 
-        # Hard guard — agent module must be importable.
+        # Hard guard — Agent Zero must be importable.
         if not (_AGENT_IMPORT_OK and _ai_agent is not None):
+            why = (f"{type(_agent_import_err).__name__}: {_agent_import_err}"
+                   if _agent_import_err else "unknown import error")
             log_thought(
                 "ai_entry", symbol, "error",
-                "Agent module unavailable — rejecting signal (no fallback LLM).",
+                "Agent Zero offline — safe-rejecting signal.",
+                detail=f"ai_agent import failed: {why}",
                 action="hold", confidence=0.0,
             )
             return {"approve": False,
-                    "reason": "agent module unavailable — safe reject",
+                    "reason": f"Agent Zero offline — safe reject ({why})",
                     "confidence": 0.0}
 
         try:
@@ -1250,11 +1282,12 @@ class AgentZeroBot:
         except Exception as exc:
             log_thought(
                 "ai_entry", symbol, "error",
-                f"Agent error: {exc} — rejecting signal (no fallback LLM).",
+                f"Agent Zero raised {type(exc).__name__} — safe-rejecting signal.",
+                detail=str(exc)[:200],
                 action="hold", confidence=0.0,
             )
             return {"approve": False,
-                    "reason": f"agent error: {exc!s} — safe reject",
+                    "reason": f"Agent Zero raised {type(exc).__name__}: {exc!s} — safe reject",
                     "confidence": 0.0}
 
     # ------------------------------------------------------------------ #
@@ -2920,10 +2953,12 @@ def mt5_status_api():
 
 @app.route("/ai/init", methods=["POST"])
 def ai_init():
-    """Probe the Ollama agent (the only supported backend)."""
+    """Probe Agent Zero (the only brain in the pipeline)."""
     if not (_AGENT_IMPORT_OK and _ai_agent is not None):
+        why = (f"{type(_agent_import_err).__name__}: {_agent_import_err}"
+               if _agent_import_err else "unknown import error")
         return jsonify({"ok": False,
-                        "message": "Agent module unavailable — check ai_agent.py import"}), 500
+                        "message": f"Agent Zero offline — ai_agent import failed: {why}"}), 500
     try:
         health = _ai_agent.ollama_health()
     except Exception as exc:
@@ -2955,11 +2990,14 @@ if __name__ == "__main__":
         # Headless bot mode — no Flask (always live trading).
         # Volume defaults to 0.50 lot; override with BOT_AUTOSTART_VOLUME.
         bot = Bot(
-            symbols=["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
-            volume=float(os.getenv("BOT_AUTOSTART_VOLUME", "0.50")),
-            poll_secs=300,
-            auto_trade=True,
-            use_ai=True,
+            symbols=_env_symbols("BOT_AUTOSTART_SYMBOLS", ["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"]),
+            volume=_env_float("BOT_AUTOSTART_VOLUME", 0.50),
+            poll_secs=_env_float("BOT_AUTOSTART_POLL_SECS", 300.0),
+            auto_trade=_coerce_bool(os.getenv("BOT_AUTOSTART_AUTO_TRADE"), True),
+            use_ai=_coerce_bool(os.getenv("BOT_AUTOSTART_USE_AI"), True),
+            atr_tolerance_multiplier=_env_float("BOT_AUTOSTART_ATR_MULT", 1.5),
+            sl_atr_mult=_env_float("BOT_AUTOSTART_SL_MULT", 2.5),
+            tp_atr_mult=_env_float("BOT_AUTOSTART_TP_MULT", 4.5),
         )
         bot.run()
     else:

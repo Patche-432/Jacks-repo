@@ -341,11 +341,24 @@ def bot_start():
         return jsonify({'ok': False, 'error': 'Agent Zero is already on the desk.'}), 409
     
     try:
+        payload = request.get_json(silent=True) or {}
+        _apply_bot_config_payload(payload)
+
         ai_pro_path = os.path.join(root_path, 'ai_pro.py')
         env = os.environ.copy()
         env['PYTHONPATH'] = os.path.join(root_path, 'core') + os.pathsep + env.get('PYTHONPATH', '')
+        env['BOT_AUTOSTART_SYMBOLS'] = ','.join(sorted(_enabled_symbols))
+        env['BOT_AUTOSTART_VOLUME'] = str(_bot_config.get('volume', 0.50))
+        env['BOT_AUTOSTART_POLL_SECS'] = str(_bot_config.get('poll_interval', 300))
+        env['BOT_AUTOSTART_AUTO_TRADE'] = '1' if (
+            bool(_bot_config.get('auto_trade', True)) and not bool(_bot_config.get('dry_run', False))
+        ) else '0'
+        env['BOT_AUTOSTART_USE_AI'] = '1' if bool(_bot_config.get('ai_review', True)) else '0'
+        env['BOT_AUTOSTART_ATR_MULT'] = str(_bot_config.get('atr_mult', 1.5))
+        env['BOT_AUTOSTART_SL_MULT'] = str(_bot_config.get('sl_mult', 2.5))
+        env['BOT_AUTOSTART_TP_MULT'] = str(_bot_config.get('tp_mult', 4.5))
         bot_process = subprocess.Popen(
-            [sys.executable, ai_pro_path, '--run', '--lot-size', '0.50'],
+            [sys.executable, ai_pro_path, '--run'],
             cwd=root_path,
             env=env
         )
@@ -359,7 +372,22 @@ def bot_start():
 
         bot_running = True
         log.info("AI Pro bot started (PID: %d)", bot_process.pid)
-        return jsonify({'ok': True, 'running': True, 'pid': bot_process.pid})
+        return jsonify({
+            'ok': True,
+            'running': True,
+            'pid': bot_process.pid,
+            'config': {
+                'symbols': sorted(_enabled_symbols),
+                'volume': _bot_config.get('volume', 0.50),
+                'poll_interval': _bot_config.get('poll_interval', 300),
+                'dry_run': bool(_bot_config.get('dry_run', False)),
+                'ai_review': bool(_bot_config.get('ai_review', True)),
+                'auto_trade': bool(_bot_config.get('auto_trade', True)),
+                'sl_mult': _bot_config.get('sl_mult', 2.5),
+                'tp_mult': _bot_config.get('tp_mult', 4.5),
+                'atr_mult': _bot_config.get('atr_mult', 1.5),
+            },
+        })
     except Exception as e:
         log.error(f"Failed to start bot: {e}")
         return jsonify({'ok': False, 'error': str(e)}), 500
@@ -800,22 +828,29 @@ def bot_performance():
 _bot_config: dict = {}
 
 
+def _apply_bot_config_payload(payload: dict) -> None:
+    """Persist dashboard bot config and enabled symbols into process memory."""
+    global _enabled_symbols, _bot_config
+    if not isinstance(payload, dict):
+        return
+
+    if payload.get('symbols'):
+        syms = [s.strip().upper() for s in str(payload['symbols']).split(',') if s.strip()]
+        if syms:
+            _enabled_symbols = set(syms)
+
+    for key in ('volume', 'poll_interval', 'dry_run', 'ai_review', 'auto_trade',
+                'sl_mult', 'tp_mult', 'atr_mult', 'pc_rr', 'be_buffer'):
+        if key in payload:
+            _bot_config[key] = payload[key]
+
+
 @app.route('/bot/config', methods=['POST'])
 def bot_config_apply():
     """Apply configuration from the dashboard sidebar."""
-    global _enabled_symbols, _bot_config
     try:
         payload = request.get_json(silent=True) or {}
-        # Update enabled symbols if provided
-        if payload.get('symbols'):
-            syms = [s.strip().upper() for s in str(payload['symbols']).split(',') if s.strip()]
-            if syms:
-                _enabled_symbols = set(syms)
-        # Persist remaining config values
-        for key in ('volume', 'poll_interval', 'dry_run', 'ai_review', 'auto_trade',
-                    'sl_mult', 'tp_mult', 'atr_mult', 'pc_rr', 'be_buffer'):
-            if key in payload:
-                _bot_config[key] = payload[key]
+        _apply_bot_config_payload(payload)
         return jsonify({
             'ok': True,
             'applied': {
