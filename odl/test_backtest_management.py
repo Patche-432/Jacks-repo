@@ -204,8 +204,7 @@ def main():
         (1.1022, 1.1010, 1.1021),  # TP
     ])
     s = sig_buy(df.iloc[0]["time"], 1.1000, 1.0990, 1.1020)
-    bt = AgentZeroBacktester(lot_size=1.0, spread_pips=0.0,
-                          enable_trade_management=False)
+    bt = AgentZeroBacktester(lot_size=1.0, spread_pips=0.0)
     trades = bt.simulate_trades("EURUSD", [s], df)
     t = trades[0]
     ok = (t.exit_reason == "tp" and t.outcome == "WIN"
@@ -215,6 +214,29 @@ def main():
     print(f"  [{status}] RAW mode BUY: full TP (no mgmt)         "
           f"exit={t.exit_reason:20s} outcome={t.outcome:4s} "
           f"pips={t.profit_pips:+.1f}")
+
+    # Gap regression: recompute ATR distances from next-bar fill, not stale signal close.
+    df = make_df([
+        (1.1010, 1.1000, 1.1010),
+        (1.1011, 1.1001, 1.1010),
+        (1.1012, 1.1001, 1.1008),
+        (1.1013, 1.1000, 1.1002),
+    ])
+    s = sig_buy(df.iloc[0]["time"], 1.1000, 1.0990, 1.1020)
+    s.atr = 0.0004  # 10 pip SL / 18 pip TP with default multipliers
+    bt = AgentZeroBacktester(lot_size=1.0, spread_pips=0.0,
+                          enable_trade_management=False)
+    trades = bt.simulate_trades("EURUSD", [s], df)
+    t = trades[0]
+    ok = (abs(t.entry_price - 1.1010) < 1e-6
+          and abs(t.signal.stop_loss - 1.1000) < 1e-6
+          and abs(t.signal.take_profit - 1.1028) < 1e-6
+          and t.exit_reason == "sl")
+    status = "PASS" if ok else "FAIL"
+    total += 1; passed += 1 if ok else 0
+    print(f"  [{status}] RAW mode BUY: gap recalcs SL/TP         "
+          f"entry={t.entry_price:.4f} sl={t.signal.stop_loss:.4f} "
+          f"tp={t.signal.take_profit:.4f} exit={t.exit_reason}")
 
     # ── Case 8: window_start clips signal generation ──────────────
     # No MT5 needed — we probe the index arithmetic directly.

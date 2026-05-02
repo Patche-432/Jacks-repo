@@ -5,23 +5,28 @@ Design principles:
 
   1. HARD SL ALWAYS FIRES (code-enforced).  While a trade is live, Agent
      Zero can only TIGHTEN a stop or request an EARLY close.  He cannot
-     override the broker's hard stop — that authority has been removed.
+     loosen a stop, widen a TP, or override the broker's hard stop —
+     that authority has been removed in code.
 
-  2. DAILY BIAS is Agent Zero's entry filter and is initiated ONLY via the
-     prompt.  This module does not classify or gate on bias; it only fetches
-     raw daily_open and current_price and hands them to the agent.  The LLM
-     applies the filter per its system prompt.
+  2. AGENT ZERO IS A DAY-TRADER, NOT A BIAS GATE.  Directional bias is
+     handled upstream by the strategy's POC bias filter (BUY only above
+     POC, SELL only below POC), so by the time a signal reaches Agent
+     Zero the side is already settled.  Agent Zero's two jobs are:
+       (a) sanity-check the entry — confirm setup quality on its own
+           merits (structure, distances, confidence), approve or reject;
+       (b) manage every live trade like a real day trader — protect
+           profit, cut losers early, ride winners.  Allowed live actions:
+           hold, tighten, close_early.
 
   3. ONE AGENT, ONE PERSONA.  The pipeline has exactly one AI persona —
-     Agent Zero — a professional day trader who runs every trade end-to-end:
-     he filters fresh signals by the daily-bias gate and then actively
-     manages the live position.  One system prompt, one Ollama client, one
-     public method.
+     Agent Zero — a professional day trader who runs each trade end-to-
+     end.  One system prompt, one Ollama client, one public method
+     (`AgentZero.review`) whose behaviour switches on the input shape.
 
 Public surface used by ai_pro.py:
 
   • get_agent_zero().review(signal_dict, symbol=..., df=...) -> dict
-  • get_agent_zero().review(position_ctx)                    -> dict
+  • get_agent_zero().review(position_ctx)                    -> dict   [legacy]
 
 No shims, no aliases, no second opinion — the pipeline cannot disagree
 with itself.
@@ -139,19 +144,21 @@ class OllamaClient:
 
 
 # ========================================================================== #
-# Raw market context (no code-level bias decision)                            #
+# Raw market context (back-compat shim — POC gate now lives in the strategy) #
 # ========================================================================== #
 #
-# This module does NOT classify the market.  It only fetches the daily open
-# and current price and hands them to the agent.  The daily-bias filter is
-# initiated entirely in the prompt — the LLM does the classification.
+# Bias filtering used to be initiated here via daily_open / current_price
+# fed to the LLM.  That responsibility has moved to the strategy layer
+# (`ai_pro.generate_trade_signal` applies the POC bias gate).  This shim
+# is kept only so older callers that still import `MarketContext`,
+# `HTFBias`, `fetch_market_context`, or `compute_htf_bias` don't crash.
 
 @dataclass
 class MarketContext:
-    """Raw values passed to the agent. No decision, no label."""
+    """Back-compat shim. Bias decisions no longer flow through here."""
     daily_open: float = 0.0
     current_price: float = 0.0
-    detail: str = "no data"
+    detail: str = "bias gate moved to strategy POC filter"
 
     # Back-compat aliases kept so older callers importing HTFBias still work.
     d1: str = "n/a"
@@ -167,8 +174,9 @@ HTFBias = MarketContext
 
 def fetch_market_context(symbol: str) -> MarketContext:
     """
-    Fetch today's daily open and current price from MT5. That's it.
-    No bias labelling, no gating, no decision.
+    Back-compat shim.  Returns a `MarketContext` populated with today's
+    daily open and current price purely for legacy callers that still
+    log this; the agent no longer consumes these values for bias.
     """
     ctx = MarketContext()
     try:
@@ -192,7 +200,7 @@ def fetch_market_context(symbol: str) -> MarketContext:
     except Exception:
         ctx.current_price = float(d1[-1]["close"])
 
-    ctx.detail = f"DO={ctx.daily_open:.5f} px={ctx.current_price:.5f}"
+    ctx.detail = f"strategy-POC-gated (legacy DO={ctx.daily_open:.5f} px={ctx.current_price:.5f})"
     return ctx
 
 
@@ -284,29 +292,36 @@ class PositionContext:
 AGENT_ZERO_SYSTEM_PROMPT = (
     "You are AGENT ZERO — a professional day trader specialising in GBPUSD, "
     "GBPJPY, EURUSD and EURJPY. These four pairs are your bread and butter: "
-    "the cleanest London/NY sessions, where your edge is strongest. You will "
-    "also review setups on other symbols the strategy presents, but you know "
-    "the core four best and trust them most.\n"
+    "the cleanest London/NY sessions, where your edge is strongest. You "
+    "also review setups on other symbols the strategy presents, but you "
+    "know the core four best and trust them most.\n"
     "\n"
-    "You run every trade from the moment a signal appears to the moment it "
-    "closes, so your thinking stays consistent across the trade's whole life. "
-    "Your edge rests on two habits:\n"
+    "You run every trade end-to-end — from the moment a signal lands on "
+    "your desk to the moment the position closes — so your thinking stays "
+    "consistent across the trade's whole life. Your edge rests on two "
+    "habits:\n"
     "\n"
-    "1) You filter every strategy signal through the DAILY BIAS before you "
-    "take it. The bias is today's price versus today's daily open:\n"
-    "   • current_price > daily_open → BULLISH → take BUY only.\n"
-    "   • current_price < daily_open → BEARISH → take SELL only.\n"
-    "   • current_price = daily_open → NEUTRAL → stand aside.\n"
-    "Approve setups that agree with the bias, reject the rest. Do not "
-    "second-guess the strategy's setup or SL/TP — only the bias gate decides.\n"
+    "1) ENTRY QUALITY CHECK. Directional bias is already handled upstream "
+    "by the strategy's POC bias filter (BUY only above POC, SELL only "
+    "below POC), so the side is settled before the signal reaches you. "
+    "Your job at entry is to sanity-check the SETUP — does the named "
+    "environment (CHoCH or Continuation) make sense at the level it cites, "
+    "are the stop and target distances reasonable, is the strategy "
+    "confidence plausible? Approve clean setups, reject only the broken "
+    "ones. Do not re-apply directional bias.\n"
     "\n"
-    "2) Once a trade is live, you actively manage it to MAXIMISE winners and "
-    "MINIMISE losers. You may TIGHTEN the stop or ask to CLOSE EARLY. You "
-    "never loosen risk. Allowed live actions are: hold, tighten, close_early.\n"
+    "2) ACTIVE TRADE MANAGEMENT. Once a trade is live, you manage it like "
+    "a real day trader to MAXIMISE winners and MINIMISE losers. You may "
+    "TIGHTEN the stop (move it closer to price, never further) or ask to "
+    "CLOSE EARLY when the structure that justified the trade has broken. "
+    "Use peak unrealised profit, current ATR, fresh structure breaks, and "
+    "trend-intactness clues from the POSITION block to decide. You never "
+    "loosen risk and you cannot widen the TP. Allowed live actions: "
+    "hold, tighten, close_early.\n"
     "\n"
-    "You always reply with a single JSON object on one line — no prose, no "
-    "markdown, no extra keys. The shape of the JSON follows what the user "
-    "has handed you:\n"
+    "You always reply with a single JSON object on one line — no prose, "
+    "no markdown, no extra keys. The shape of the JSON depends on what "
+    "the user has handed you:\n"
     "\n"
     "  • SIGNAL block (pre-entry review):\n"
     "      {\"approve\": <bool>, \"confidence\": <0.0-1.0>, "
@@ -317,7 +332,8 @@ AGENT_ZERO_SYSTEM_PROMPT = (
     "\"new_sl\": <float or null>, \"reason\": \"<=20 words\"}\n"
     "      If action is hold or close_early, new_sl must be null. "
     "If action is tighten, new_sl must be a valid numeric stop that is "
-    "strictly tighter than the current stop.\n"
+    "strictly tighter than the current stop and on the correct side of "
+    "the current price.\n"
 )
 
 
@@ -380,8 +396,11 @@ class AgentZero:
         rew   = abs(tp - entry) if (entry and tp) else 0.0
         rr    = (rew / risk) if risk > 0 else 0.0
 
-        # Fetch raw daily open + current price. The prompt does the bias work.
-        ctx = fetch_market_context(symbol)
+        # Strategy has already gated by POC bias before this method is
+        # called. We surface the POC value to the agent purely as audit
+        # context — the agent's job is quality review, not bias.
+        vp  = signal.get("volume_profile") or {}
+        poc = _coerce_float(vp.get("poc"))
 
         user = (
             f"SIGNAL\n"
@@ -392,8 +411,12 @@ class AgentZero:
             f"  risk_reward: {rr:.2f}\n"
             f"  strategy_confidence: {signal.get('confidence', 0)}%\n"
             f"  reason: {str(signal.get('reason',''))[:200]}\n\n"
-            f"MARKET CONTEXT\n"
-            f"  daily_open: {ctx.daily_open:.5f}   current_price: {ctx.current_price:.5f}\n"
+            f"CONTEXT (already POC-gated by strategy)\n"
+            f"  poc: {poc:.5f}   entry: {entry:.5f}\n"
+        )
+
+        bias_detail = (
+            f"POC={poc:.5f} entry={entry:.5f} side={side} (strategy-gated)"
         )
 
         try:
@@ -405,7 +428,7 @@ class AgentZero:
                 "approve": False,
                 "reason": f"agent transport error ({exc!s}) — rejected conservatively",
                 "confidence": 0.0,
-                "htf_detail": ctx.detail,
+                "htf_detail": bias_detail,
             }
 
         parsed = _extract_json_dict(raw) or {}
@@ -417,10 +440,16 @@ class AgentZero:
             "approve": approve,
             "reason": reason,
             "confidence": conf,
-            "htf_detail": ctx.detail,
+            "htf_detail": bias_detail,
         }
 
     def _review_position(self, ctx: PositionContext) -> dict:
+        """
+        Live-trade review.  Agent Zero may TIGHTEN the stop or request an
+        EARLY close — never loosen, never widen TP, never override the
+        broker's hard SL.  Hard rails enforce these invariants in code,
+        regardless of what the LLM proposes.
+        """
         is_buy = ctx.side.upper() == "BUY"
 
         user = (

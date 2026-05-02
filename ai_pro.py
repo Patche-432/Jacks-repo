@@ -9,8 +9,11 @@ environments, ATR-based SL/TP) with Agent Zero, the single Ollama-backed
 trader persona in ai_agent.py:
 
   ► Agent Zero       — single Ollama-backed trader (see ai_agent.py) that
-                       filters every signal by daily bias AND is the sole
-                       in-flight position manager (tighten / close / hold)
+                       reviews every signal on quality grounds AND
+                       actively manages every live position like a real
+                       day trader (tighten / close_early / hold). The
+                       directional bias gate is the strategy's POC bias
+                       filter, applied upstream in generate_trade_signal.
   ► Thought Logger   — thread-safe in-memory AI reasoning log (last 120)
   ► Trade Memory     — JSON persistence (last 100 trades, win/loss stats)
   ► Flask Dashboard  — REST API + embedded UI at http://localhost:5000
@@ -90,7 +93,7 @@ def _save_credentials(login, password, server, path) -> None:
 
 _RULES_YAML = """
 # allowed_symbols: empty list = NO restriction (any symbol is tradable).
-# The agent filters per signal by daily bias — no code-level pair whitelist.
+# The strategy filters each signal by POC bias — no code-level pair whitelist.
 allowed_symbols: []
 
 sessions:
@@ -631,6 +634,220 @@ class AgentZeroBot:
         atr = tr.rolling(self.atr_period).mean().iloc[-1]
         return float(atr) if not np.isnan(atr) else 0.0001
 
+    def _volume_series(self, df: pd.DataFrame) -> pd.Series:
+        """Prefer real volume, then tick volume, then a flat fallback."""
+        for col in ("real_volume", "tick_volume", "volume"):
+            if col in df.columns:
+                s = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+                if float(s.sum()) > 0:
+                    return s.astype(float)
+        return pd.Series(np.ones(len(df), dtype=float), index=df.index)
+
+    # ------------------------------------------------------------------ #
+    # POC (Point of Control) — bias gate                                 #
+    # ------------------------------------------------------------------ #
+    # Live strategy mirrors the backtester's POC bias filter so live and
+    # backtest gate on the same dimension.  POC = price of the highest
+    # volume bin in a histogram of typical price weighted by volume over
+    # a trailing M15 window.  We then keep only signals whose entry sits
+    # on the matching side of POC: BUY above POC, SELL below POC.
+    POC_BIAS_LOOKBACK = 96   # M15 bars ≈ 24h profile window (matches backtest)
+    POC_BIAS_BINS     = 32   # histogram resolution (matches backtest)
+
+    def _compute_poc(self, df: pd.DataFrame) -> float:
+        """
+        Return the price of the highest-volume bin in the histogram of
+        typical price weighted by volume over the trailing window.
+        Returns 0.0 when data is insufficient or degenerate (which is
+        treated as 'no opinion' — passthrough — by the bias gate).
+        """
+        if df is None or len(df) < 12:
+            return 0.0
+        window = df.tail(self.POC_BIAS_LOOKBACK)
+        if len(window) < 12:
+            return 0.0
+        vols = self._volume_series(window)
+        if float(vols.sum()) <= 0.0:
+            return 0.0
+        low_min = float(window["low"].min())
+        high_max = float(window["high"].max())
+        if high_max <= low_min:
+            return 0.0
+        typical = (
+            window["high"].astype(float)
+            + window["low"].astype(float)
+            + window["close"].astype(float)
+        ) / 3.0
+        try:
+            hist, edges = np.histogram(
+                typical.to_numpy(dtype=float),
+                bins=self.POC_BIAS_BINS,
+                range=(low_min, high_max),
+                weights=vols.to_numpy(dtype=float),
+            )
+        except Exception:
+            return 0.0
+        if hist.sum() <= 0:
+            return 0.0
+        idx = int(np.argmax(hist))
+        return float((edges[idx] + edges[idx + 1]) / 2.0)
+
+    def _poc_aligned(self, side: str, entry_price: float, poc: float) -> bool:
+        """
+        Return True if the signal's side is on the matching side of POC.
+        BUY  → entry > POC  (we're above value, room to push up)
+        SELL → entry < POC  (we're below value, room to push down)
+        Defensive: if POC or entry is 0/missing, return True (passthrough)
+        so we don't penalise the strategy for our own data hiccups.
+        """
+        try:
+            poc_f   = float(poc or 0.0)
+            entry_f = float(entry_price or 0.0)
+        except Exception:
+            return True
+        if poc_f <= 0.0 or entry_f <= 0.0:
+            return True
+        side_u = (side or "").upper()
+        if side_u == "BUY":
+            return entry_f > poc_f
+        if side_u == "SELL":
+            return entry_f < poc_f
+        return True
+
+    def _analyze_volume_profile(self, df: pd.DataFrame, daily_levels: dict,
+                                atr: float) -> dict:
+        """
+        Lightweight PDH/PDL volume-profile context.
+
+        Concepts used:
+        - HVN/LVN near PDH or PDL from a recent-session profile
+        - Acceptance through PDH/PDL on above-average volume
+        - Rejection back inside range after probing PDH/PDL
+        """
+        if df is None or len(df) < 12:
+            return {
+                "pdh_node": "neutral",
+                "pdl_node": "neutral",
+                "pdh_acceptance": False,
+                "pdl_acceptance": False,
+                "pdh_rejection": False,
+                "pdl_rejection": False,
+                "pdh_volume_ratio": 1.0,
+                "pdl_volume_ratio": 1.0,
+                "poc": 0.0,
+                "summary": "volume profile unavailable",
+            }
+
+        lookback = int(max(24, min(len(df), self.lookback_candles)))
+        recent = df.tail(lookback).copy()
+        vols = self._volume_series(recent)
+        recent["vol"] = vols.values
+
+        low_min = float(recent["low"].min())
+        high_max = float(recent["high"].max())
+        if high_max <= low_min:
+            return {
+                "pdh_node": "neutral",
+                "pdl_node": "neutral",
+                "pdh_acceptance": False,
+                "pdl_acceptance": False,
+                "pdh_rejection": False,
+                "pdl_rejection": False,
+                "pdh_volume_ratio": 1.0,
+                "pdl_volume_ratio": 1.0,
+                "poc": 0.0,
+                "summary": "flat range",
+            }
+
+        bins = int(max(16, min(32, lookback // 2)))
+        typical_price = (
+            recent["high"].astype(float) +
+            recent["low"].astype(float) +
+            recent["close"].astype(float)
+        ) / 3.0
+        hist, edges = np.histogram(
+            typical_price.to_numpy(dtype=float),
+            bins=bins,
+            range=(low_min, high_max),
+            weights=recent["vol"].to_numpy(dtype=float),
+        )
+        hist = hist.astype(float)
+        centers = (edges[:-1] + edges[1:]) / 2.0
+        non_zero = hist[hist > 0]
+        hvn_cut = float(np.percentile(non_zero, 70)) if len(non_zero) else 0.0
+        lvn_cut = float(np.percentile(non_zero, 30)) if len(non_zero) else 0.0
+
+        def _node_state(price: float) -> str:
+            if len(centers) == 0:
+                return "neutral"
+            idx = int(np.argmin(np.abs(centers - float(price))))
+            density = float(hist[idx])
+            if density <= lvn_cut:
+                return "lvn"
+            if density >= hvn_cut:
+                return "hvn"
+            return "neutral"
+
+        pdh = float(daily_levels["high"])
+        pdl = float(daily_levels["low"])
+        zone = max(float(atr) * 0.30, 0.0001)
+        recent_tail = recent.tail(max(6, self.level_interaction_bars))
+        vol_avg = float(recent["vol"].tail(max(12, self.level_interaction_bars)).mean() or 1.0)
+
+        pdh_accept = recent_tail[
+            (recent_tail["close"].astype(float) > pdh) &
+            (recent_tail["low"].astype(float) <= pdh + zone)
+        ]
+        pdl_accept = recent_tail[
+            (recent_tail["close"].astype(float) < pdl) &
+            (recent_tail["high"].astype(float) >= pdl - zone)
+        ]
+        pdh_reject = recent_tail[
+            (recent_tail["high"].astype(float) >= pdh - zone) &
+            (recent_tail["close"].astype(float) < pdh)
+        ]
+        pdl_reject = recent_tail[
+            (recent_tail["low"].astype(float) <= pdl + zone) &
+            (recent_tail["close"].astype(float) > pdl)
+        ]
+
+        pdh_volume_ratio = float(pdh_accept["vol"].mean() / vol_avg) if len(pdh_accept) else 0.0
+        pdl_volume_ratio = float(pdl_accept["vol"].mean() / vol_avg) if len(pdl_accept) else 0.0
+        pdh_reject_ratio = float(pdh_reject["vol"].mean() / vol_avg) if len(pdh_reject) else 0.0
+        pdl_reject_ratio = float(pdl_reject["vol"].mean() / vol_avg) if len(pdl_reject) else 0.0
+
+        pdh_acceptance = len(pdh_accept) >= 1 and pdh_volume_ratio >= 1.05
+        pdl_acceptance = len(pdl_accept) >= 1 and pdl_volume_ratio >= 1.05
+        pdh_rejection = len(pdh_reject) >= 1 and pdh_reject_ratio >= 0.95
+        pdl_rejection = len(pdl_reject) >= 1 and pdl_reject_ratio >= 0.95
+
+        pdh_node = _node_state(pdh)
+        pdl_node = _node_state(pdl)
+        summary = (
+            f"VP PDH:{pdh_node} acc={pdh_acceptance} rej={pdh_rejection} | "
+            f"PDL:{pdl_node} acc={pdl_acceptance} rej={pdl_rejection}"
+        )
+        # POC of the same trailing window — used by generate_trade_signal as
+        # the bias gate (BUY only above POC, SELL only below POC). Mirrors
+        # the backtester's POC_BIAS_LOOKBACK / POC_BIAS_BINS settings via
+        # `self._compute_poc` so live and backtest gate identically.
+        poc_value = self._compute_poc(df)
+
+        return {
+            "pdh_node": pdh_node,
+            "pdl_node": pdl_node,
+            "pdh_acceptance": pdh_acceptance,
+            "pdl_acceptance": pdl_acceptance,
+            "pdh_rejection": pdh_rejection,
+            "pdl_rejection": pdl_rejection,
+            "pdh_volume_ratio": round(pdh_volume_ratio, 2),
+            "pdl_volume_ratio": round(pdl_volume_ratio, 2),
+            "pdh_reject_ratio": round(pdh_reject_ratio, 2),
+            "pdl_reject_ratio": round(pdl_reject_ratio, 2),
+            "poc": round(poc_value, 6),
+            "summary": summary,
+        }
+
     def _close_position(self, position) -> dict:
         import MetaTrader5 as mt5
         symbol      = position.symbol
@@ -822,7 +1039,11 @@ class AgentZeroBot:
     def run_ai_risk_manager(self, symbol: str) -> list:
         """
         Called each cycle BEFORE entry signal generation.
-        Open positions are managed only by the prompt-driven risk agent.
+        Open positions are managed by Agent Zero acting as a day trader:
+        he may tighten the SL or close a position early when structure
+        breaks, but he can never loosen risk or override the broker's
+        hard SL/TP. Bias is NOT his job — the strategy's POC bias filter
+        handles that upstream at signal generation.
         """
         import MetaTrader5 as mt5
         if not self._ensure_mt5():
@@ -1233,12 +1454,18 @@ class AgentZeroBot:
                            df: pd.DataFrame) -> dict:
         """
         Single-path entry review via Agent Zero (ai_agent.py).
-        Agent Zero filters each raw signal by DAILY BIAS and returns:
+
+        IMPORTANT — bias gate has moved upstream to the strategy.
+        `generate_trade_signal` now applies the POC bias filter (BUY only
+        above POC, SELL only below POC) BEFORE this method is called, so
+        any signal reaching the agent has already passed the bias gate.
+        Agent Zero is now a pure quality reviewer: he sanity-checks the
+        setup but does not re-apply bias. Returns:
+
           {"approve": bool, "reason": str, "confidence": float}
 
-        Agent Zero is the only brain. If he is offline (module import
-        failed or he raises), we SAFE-REJECT the signal — by design, not
-        as degraded behaviour. The broker-side hard SL remains
+        If Agent Zero is offline (module import failed or he raises), we
+        SAFE-REJECT the signal — the broker-side hard SL remains
         authoritative regardless.
         """
         direction = signal.get("signal", "")
@@ -1294,28 +1521,14 @@ class AgentZeroBot:
     # HTF bias detection                                                   #
     # ------------------------------------------------------------------ #
 
-    def _get_daily_trend_bias(self, symbol: str) -> str:
-        """Determine daily timeframe trend direction."""
-        try:
-            import MetaTrader5 as mt5
-            # Get last daily candle
-            daily_data = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 2)
-            if daily_data is None or len(daily_data) < 1:
-                return "neutral"
-            
-            last_daily = daily_data[-1]
-            daily_close = last_daily["close"]
-            daily_open  = last_daily["open"]
-            
-            # Simple trend: close above open = bullish, below = bearish
-            if daily_close > daily_open:
-                return "bullish"
-            elif daily_close < daily_open:
-                return "bearish"
-            else:
-                return "neutral"
-        except Exception:
-            return "neutral"
+    # NOTE: Bias filtering has been replaced by the POC bias gate, which
+    # lives at the strategy level inside `generate_trade_signal`.  The
+    # rule: BUY only when price is above POC, SELL only when price is
+    # below POC.  POC = highest-volume bin in the typical-price histogram
+    # over the trailing 96-bar M15 window (see `_compute_poc`).  This
+    # mirrors the backtester's `_apply_vp_filter` so live and backtest
+    # gate identically.  The previous daily-bias gate (`_get_daily_trend_bias`,
+    # then later Agent Zero's prompt) has been retired in both places.
 
     # ------------------------------------------------------------------ #
     # Main signal generator                                                #
@@ -1330,7 +1543,9 @@ class AgentZeroBot:
         if df is None:
             return self._neutral(symbol, "Could not fetch M15 data")
 
-        daily_trend = self._get_daily_trend_bias(symbol)
+        # POC bias gate is applied later in this method (after a setup
+        # is selected). The previous daily-bias gate has been retired —
+        # POC is now the singular bias filter, mirroring the backtester.
         atr           = self._calculate_atr(df)
         current_price = df.iloc[-1]["close"]
         zone          = atr * self.atr_tolerance_multiplier
@@ -1342,6 +1557,7 @@ class AgentZeroBot:
 
         choch_data = self.detect_choch_on_m15(symbol, df)
         cont_data  = self.detect_trend_continuation(symbol, df)
+        volume_profile = self._analyze_volume_profile(df, daily_levels, atr)
 
         signal = {
             "symbol":            symbol,
@@ -1356,22 +1572,94 @@ class AgentZeroBot:
             "previous_day_low":  daily_levels["low"],
             "atr":               round(atr, 6),
             "dynamic_zone_pips": round(zone / 0.0001, 1),
+            "volume_profile":    volume_profile,
+            "component_scores":  {},
             "ai_approved":       None,
             "ai_reason":         None,
             "ai_confidence":     None,
         }
 
-        def buy_levels():
-            sl_mult = self.get_sl_multiplier(symbol)
-            sl = round(current_price - atr * sl_mult, 5)
-            tp = round(current_price + atr * self.tp_atr_mult, 5)
-            return sl, tp
+        def level_set(is_buy: bool):
+            entry = current_price
+            try:
+                import MetaTrader5 as mt5
+                tick = mt5.symbol_info_tick(symbol)
+                if tick is not None:
+                    entry = float(tick.ask if is_buy else tick.bid)
+            except Exception:
+                pass
 
-        def sell_levels():
             sl_mult = self.get_sl_multiplier(symbol)
-            sl = round(current_price + atr * sl_mult, 5)
-            tp = round(current_price - atr * self.tp_atr_mult, 5)
-            return sl, tp
+            if is_buy:
+                sl = round(entry - atr * sl_mult, 5)
+                tp = round(entry + atr * self.tp_atr_mult, 5)
+            else:
+                sl = round(entry + atr * sl_mult, 5)
+                tp = round(entry - atr * self.tp_atr_mult, 5)
+            return round(entry, 5), sl, tp
+
+        def profile_adjustment(env: int) -> tuple[int, str, dict]:
+            score = 0
+            notes = []
+
+            if env == 1:
+                if volume_profile["pdl_rejection"]:
+                    score += 10
+                    notes.append("PDL rejection volume confirms failed auction")
+                if volume_profile["pdl_node"] == "lvn":
+                    score += 5
+                    notes.append("PDL sits on LVN edge")
+                elif volume_profile["pdl_node"] == "hvn":
+                    score -= 5
+                    notes.append("PDL sits inside HVN")
+                if volume_profile["pdl_acceptance"]:
+                    score -= 10
+                    notes.append("volume accepted below PDL")
+            elif env == 2:
+                if volume_profile["pdh_rejection"]:
+                    score += 10
+                    notes.append("PDH rejection volume confirms failed auction")
+                if volume_profile["pdh_node"] == "lvn":
+                    score += 5
+                    notes.append("PDH sits on LVN edge")
+                elif volume_profile["pdh_node"] == "hvn":
+                    score -= 5
+                    notes.append("PDH sits inside HVN")
+                if volume_profile["pdh_acceptance"]:
+                    score -= 10
+                    notes.append("volume accepted above PDH")
+            elif env == 3:
+                if volume_profile["pdh_acceptance"]:
+                    score += 10
+                    notes.append("volume accepted above PDH")
+                if volume_profile["pdh_node"] == "hvn":
+                    score += 5
+                    notes.append("PDH rotates into HVN support")
+                elif volume_profile["pdh_node"] == "lvn":
+                    score -= 5
+                    notes.append("PDH retest still on LVN edge")
+                if volume_profile["pdh_rejection"]:
+                    score -= 10
+                    notes.append("recent PDH rejection still active")
+            elif env == 4:
+                if volume_profile["pdl_acceptance"]:
+                    score += 10
+                    notes.append("volume accepted below PDL")
+                if volume_profile["pdl_node"] == "hvn":
+                    score += 5
+                    notes.append("PDL rotates into HVN resistance")
+                elif volume_profile["pdl_node"] == "lvn":
+                    score -= 5
+                    notes.append("PDL retest still on LVN edge")
+                if volume_profile["pdl_rejection"]:
+                    score -= 10
+                    notes.append("recent PDL rejection still active")
+
+            comp = {
+                "structure": 0.85 if env in (1, 2) else 0.75,
+                "volume_profile": max(0.0, min(1.0, 0.5 + score / 20.0)),
+            }
+            return score, "; ".join(notes) if notes else "volume profile neutral", comp
 
         triggered = []
 
@@ -1384,15 +1672,17 @@ class AgentZeroBot:
         )
         if (choch_data and choch_data["choch_detected"]
                 and choch_data["type"] == "bullish"
-                and near_low_choch and failed_low_at_pdl
-                and daily_trend != "bearish"):
-            sl, tp = buy_levels()
+                and near_low_choch and failed_low_at_pdl):
+            entry, sl, tp = level_set(True)
+            vp_score, vp_note, comps = profile_adjustment(1)
             triggered.append((1, {
                 "signal": "BUY", "signal_source": "CHoCH-BUY@PDL",
-                "confidence": 85,
+                "confidence": max(60, min(95, 85 + vp_score)),
                 "reason": (f"ENV1 — CHoCH BUY: failed LL at PDL "
                            f"{daily_levels['low']:.5f} ±{signal['dynamic_zone_pips']}p. "
-                           f"{choch_data['reason']}"),
+                           f"{choch_data['reason']}. VP: {vp_note}"),
+                "entry_price": entry,
+                "component_scores": comps,
                 "stop_loss": sl, "take_profit": tp
             }))
 
@@ -1405,15 +1695,17 @@ class AgentZeroBot:
         )
         if (choch_data and choch_data["choch_detected"]
                 and choch_data["type"] == "bearish"
-                and near_high_choch and failed_high_at_pdh
-                and daily_trend != "bullish"):
-            sl, tp = sell_levels()
+                and near_high_choch and failed_high_at_pdh):
+            entry, sl, tp = level_set(False)
+            vp_score, vp_note, comps = profile_adjustment(2)
             triggered.append((1, {
                 "signal": "SELL", "signal_source": "CHoCH-SELL@PDH",
-                "confidence": 85,
+                "confidence": max(60, min(95, 85 + vp_score)),
                 "reason": (f"ENV2 — CHoCH SELL: failed HH at PDH "
                            f"{daily_levels['high']:.5f} ±{signal['dynamic_zone_pips']}p. "
-                           f"{choch_data['reason']}"),
+                           f"{choch_data['reason']}. VP: {vp_note}"),
+                "entry_price": entry,
+                "component_scores": comps,
                 "stop_loss": sl, "take_profit": tp
             }))
 
@@ -1423,17 +1715,19 @@ class AgentZeroBot:
         ).any()
         if (cont_data and cont_data["continuation_detected"]
                 and cont_data["type"] == "bullish"
-                and broke_above_pdh and near_high
-                and daily_trend != "bearish"):
+                and broke_above_pdh and near_high):
             strength   = cont_data.get("trend_strength", 1)
             confidence = 65 + strength * 10
-            sl, tp     = buy_levels()
+            entry, sl, tp = level_set(True)
+            vp_score, vp_note, comps = profile_adjustment(3)
             triggered.append((2, {
                 "signal": "BUY", "signal_source": "Continuation-BUY@PDH",
-                "confidence": confidence,
+                "confidence": max(60, min(95, confidence + vp_score)),
                 "reason": (f"ENV3 — Continuation BUY: broke above PDH "
                            f"{daily_levels['high']:.5f}, retesting as support. "
-                           f"Strength {strength}/2. {cont_data['reason']}"),
+                           f"Strength {strength}/2. {cont_data['reason']}. VP: {vp_note}"),
+                "entry_price": entry,
+                "component_scores": comps,
                 "stop_loss": sl, "take_profit": tp
             }))
 
@@ -1443,17 +1737,19 @@ class AgentZeroBot:
         ).any()
         if (cont_data and cont_data["continuation_detected"]
                 and cont_data["type"] == "bearish"
-                and broke_below_pdl and near_low
-                and daily_trend != "bullish"):
+                and broke_below_pdl and near_low):
             strength   = cont_data.get("trend_strength", 1)
             confidence = 65 + strength * 10
-            sl, tp     = sell_levels()
+            entry, sl, tp = level_set(False)
+            vp_score, vp_note, comps = profile_adjustment(4)
             triggered.append((2, {
                 "signal": "SELL", "signal_source": "Continuation-SELL@PDL",
-                "confidence": confidence,
+                "confidence": max(60, min(95, confidence + vp_score)),
                 "reason": (f"ENV4 — Continuation SELL: broke below PDL "
                            f"{daily_levels['low']:.5f}, retesting as resistance. "
-                           f"Strength {strength}/2. {cont_data['reason']}"),
+                           f"Strength {strength}/2. {cont_data['reason']}. VP: {vp_note}"),
+                "entry_price": entry,
+                "component_scores": comps,
                 "stop_loss": sl, "take_profit": tp
             }))
 
@@ -1461,7 +1757,31 @@ class AgentZeroBot:
             triggered.sort(key=lambda x: x[0])
             signal.update(triggered[0][1])
 
-            # AI review gate
+            # ---- POC BIAS GATE (live mirror of backtester's _apply_vp_filter)
+            # Strategy-level filter: keep BUYs only above POC, SELLs only
+            # below POC. Mirrors the backtester gate so live and backtest
+            # filter identically. The agent no longer applies daily bias —
+            # this is the singular bias filter for the pipeline.
+            poc_value = float(signal.get("volume_profile", {}).get("poc") or 0.0)
+            entry_for_gate = float(signal.get("entry_price") or 0.0)
+            side_for_gate  = signal.get("signal", "")
+            if not self._poc_aligned(side_for_gate, entry_for_gate, poc_value):
+                # Drop this signal — return neutral with the POC reason so
+                # the dashboard shows why the setup didn't fire.
+                drop_reason = (
+                    f"POC bias veto: {side_for_gate} entry {entry_for_gate:.5f} "
+                    f"on wrong side of POC {poc_value:.5f}"
+                )
+                neutral = self._neutral(symbol, drop_reason)
+                # Preserve volume_profile (incl. POC) for dashboard transparency
+                neutral["volume_profile"] = signal.get("volume_profile")
+                neutral["previous_day_high"] = signal.get("previous_day_high")
+                neutral["previous_day_low"]  = signal.get("previous_day_low")
+                neutral["atr"] = signal.get("atr")
+                return neutral
+
+            # AI review gate (post-POC). Strategy already gated the bias —
+            # the agent is now a pure quality reviewer, not a bias filter.
             if self.use_ai:
                 review = self._ai_review_signal(symbol, signal, df)
                 signal["ai_approved"]   = review["approve"]
@@ -1475,8 +1795,10 @@ class AgentZeroBot:
             def _why(env: int) -> str:
                 """
                 First missing precondition for the given env, in priority order.
-                Returns 'ready' if every precondition is met (very rare at this
-                point — would normally mean the daily-trend filter blocked it).
+                Returns 'ready' if every precondition is met (rare — usually
+                means a structural check just barely failed). The POC bias
+                gate is applied AFTER `_why` (it only runs on triggered setups),
+                so 'ready' here doesn't include the bias check.
                 """
                 if env in (1, 2):
                     if not choch_data or not choch_data.get("choch_detected"):
@@ -1492,11 +1814,6 @@ class AgentZeroBot:
                         return "prior low not at PDL"
                     if env == 2 and not failed_high_at_pdh:
                         return "prior high not at PDH"
-                    # CHoCH all good — only daily-bias filter can block now.
-                    if env == 1 and daily_trend == "bearish":
-                        return "daily bias bearish blocks BUY"
-                    if env == 2 and daily_trend == "bullish":
-                        return "daily bias bullish blocks SELL"
                     return "ready"
                 # env 3 / 4 (continuation)
                 if not cont_data or not cont_data.get("continuation_detected"):
@@ -1512,10 +1829,6 @@ class AgentZeroBot:
                     return "price not retesting PDH"
                 if env == 4 and not near_low:
                     return "price not retesting PDL"
-                if env == 3 and daily_trend == "bearish":
-                    return "daily bias bearish blocks BUY"
-                if env == 4 and daily_trend == "bullish":
-                    return "daily bias bullish blocks SELL"
                 return "ready"
 
             signal["reason"] = self._environment_summary(
@@ -1610,12 +1923,27 @@ class AgentZeroBot:
         is_buy    = signal["signal"] == "BUY"
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
         price      = tick.ask if is_buy else tick.bid
-        sl         = round(signal["stop_loss"],   digits)
+        atr        = float(signal.get("atr") or 0.0)
+
+        if atr > 0:
+            sl_mult = self.get_sl_multiplier(symbol)
+            if is_buy:
+                sl = round(price - atr * sl_mult, digits)
+                tp = round(price + atr * self.tp_atr_mult, digits)
+            else:
+                sl = round(price + atr * sl_mult, digits)
+                tp = round(price - atr * self.tp_atr_mult, digits)
+        else:
+            sl = round(signal["stop_loss"], digits)
+            tp = round(signal["take_profit"], digits)
+
+        signal["entry_price"] = round(price, digits)
+        signal["stop_loss"] = sl
 
         # No direction guard — raw signals approved by the agent's daily-bias
         # filter execute regardless of any existing position's direction. The
         # agent (not code) is the sole gate on whether a new trade opens.
-        tp         = round(signal["take_profit"], digits)
+        signal["take_profit"] = tp
         filling    = self._get_filling_mode(symbol)
 
         # Build comment string, limited to MT5 max 31 chars
@@ -1682,18 +2010,25 @@ class AgentZeroBot:
         """
         Workflow: STRATEGY → AGENT → MARKET
 
-          STRATEGY (rule engine — untouched):
+          STRATEGY (rule engine — POC bias is the singular gate):
             1. Generate fresh M15 signal via Agent Zero Bot rules
+            2. Apply POC bias filter inside generate_trade_signal
+               (BUY only above POC, SELL only below POC) — mirrors the
+               backtester's _apply_vp_filter so live and backtest gate
+               on the same dimension.
 
-          AGENT (Ollama — gates + manages):
-            2. Risk review of open positions (tighten SL / close early only;
-               broker's hard SL remains authoritative)
-            3. Entry review — agent filters the signal by DAILY BIAS
-               (daily open vs current price) and approves or rejects
+          AGENT (Ollama — quality reviewer + active position manager):
+            3. Risk review of open positions — agent acts as a day
+               trader: he may TIGHTEN the SL or request an EARLY close
+               when structure breaks, but never loosens risk and never
+               overrides the broker's hard SL/TP.
+            4. Entry review — agent sanity-checks the setup quality
+               (structure, distances, plausibility). Directional bias
+               is NOT his job; the strategy's POC filter handles it.
 
           MARKET (broker):
-            4. Auto-execute approved signals via MT5 (no hard-coded symbol
-               whitelist — any configured symbol is tradable)
+            5. Auto-execute approved signals via MT5 (no hard-coded symbol
+               whitelist — any configured symbol is tradable).
         """
         log.info("=" * 65)
         log.info("Agent Zero — %s", symbol)

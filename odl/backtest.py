@@ -127,8 +127,17 @@ class Signal:
     stop_loss: float
     take_profit: float
     rr_ratio: float
+    atr: float = 0.0  # ATR (price units) at the bar that produced the signal
     component_scores: Dict[str, float] = field(default_factory=dict)
     environment: str = ""  # CHoCH, Continuation, etc.
+    # Snapshot of the strategy's volume-profile context at signal time —
+    # used historically by the backtester's VP filter. Kept on the signal
+    # for diagnostics even though the active filter is now POC-bias only.
+    volume_profile: Dict[str, Any] = field(default_factory=dict)
+    # Volume-profile Point of Control (price of the highest-volume bin)
+    # computed by the backtester from the bar window up to and including
+    # the trigger bar. 0.0 when unavailable (insufficient data).
+    poc: float = 0.0
 
 
 @dataclass
@@ -220,15 +229,6 @@ class AgentZeroBacktester:
         # (worst realistic outcome), "optimistic" assumes TP (old
         # behaviour), "neutral" splits 50/50.
         intrabar_policy: str = "conservative",
-        # ── Trade management (matches live bot) ───────────────────────
-        # When True, simulate the live 50% partial close at 1R plus
-        # stop-loss trailed to breakeven (+ buffer). When False, runs
-        # the raw strategy to first SL/TP — useful for pure signal
-        # quality validation, but will NOT match live P&L.
-        enable_trade_management: bool = True,
-        partial_close_ratio: float    = 0.5,
-        partial_close_rr:    float    = 1.0,
-        breakeven_buffer_pips: float  = 1.0,
     ):
         self.symbols = symbols or ["EURUSD"]
         self.lookback_bars = lookback_bars
@@ -239,10 +239,6 @@ class AgentZeroBacktester:
         self.intrabar_policy = intrabar_policy if intrabar_policy in {
             "conservative", "optimistic", "neutral"
         } else "conservative"
-        self.enable_trade_management = bool(enable_trade_management)
-        self.partial_close_ratio     = float(partial_close_ratio)
-        self.partial_close_rr        = float(partial_close_rr)
-        self.breakeven_buffer_pips   = float(breakeven_buffer_pips)
         
         # Import AgentZeroBot lazily to avoid MT5 requirement if just analyzing
         self._strategy = None
@@ -511,15 +507,16 @@ class AgentZeroBacktester:
                             "range": float(prev_week["high"]) - float(prev_week["low"]),
                         }
                 
-                # Temporarily override the strategy's fetch methods. We must
-                # also override _get_daily_trend_bias because the live version
-                # calls mt5.copy_rates_from_pos directly — which would leak the
-                # CURRENT daily trend into every replayed bar (lookahead bias).
+                # Temporarily override the strategy's fetch methods so each
+                # replayed bar sees only its own historical context.
+                #
+                # Note: the strategy no longer applies a daily-bias gate
+                # (that filter has moved to Agent Zero — see ai_agent.py).
+                # The backtester therefore tests RAW signals — no bias —
+                # and the previous `_get_daily_trend_bias` lookahead patch
+                # is no longer needed.
                 original_fetch = self._strategy._fetch_m15
                 original_levels = self._strategy.get_previous_day_levels
-                original_daily_bias = getattr(
-                    self._strategy, "_get_daily_trend_bias", None
-                )
 
                 def mock_fetch(sym):
                     return df_slice
@@ -529,38 +526,8 @@ class AgentZeroBacktester:
                         return correct_levels
                     return {"date": bar_date, "high": 0.0, "low": 0.0, "range": 0.0}
 
-                # Compute the historically-correct daily trend at bar_time:
-                # use today's daily candle's open vs the current M15 close
-                # (the bar we're replaying). Falls back to "neutral" if no
-                # daily data is available.
-                def mock_daily_trend(sym):
-                    try:
-                        if df_daily is None or len(df_daily) == 0:
-                            return "neutral"
-                        today_rows = df_daily[df_daily["time"].dt.date == bar_date]
-                        if len(today_rows) == 0:
-                            # Fall back to last completed daily candle
-                            prev = df_daily[df_daily["time"].dt.date < bar_date]
-                            if len(prev) == 0:
-                                return "neutral"
-                            row = prev.iloc[-1]
-                            return ("bullish" if row["close"] > row["open"]
-                                    else "bearish" if row["close"] < row["open"]
-                                    else "neutral")
-                        today_open = float(today_rows.iloc[0]["open"])
-                        cur_close  = float(df_slice.iloc[-1]["close"])
-                        if cur_close > today_open:
-                            return "bullish"
-                        if cur_close < today_open:
-                            return "bearish"
-                        return "neutral"
-                    except Exception:
-                        return "neutral"
-
                 self._strategy._fetch_m15 = mock_fetch
                 self._strategy.get_previous_day_levels = mock_levels
-                if original_daily_bias is not None:
-                    self._strategy._get_daily_trend_bias = mock_daily_trend
 
                 # Also set these directly as a safety net. Always assign
                 # (even when levels are missing) so a stale value from a
@@ -582,8 +549,13 @@ class AgentZeroBacktester:
                 try:
                     # Generate signal at this point
                     raw_signal = self._strategy.generate_trade_signal(symbol)
-                    
+
                     if raw_signal.get("signal") != "neutral":
+                        # Compute POC from the no-lookahead window the
+                        # strategy just saw. Used by _apply_vp_filter to
+                        # gate trades by VP bias (price > POC = bullish,
+                        # price < POC = bearish). Strategy is untouched.
+                        poc_value = self._compute_poc(df_slice)
                         sig = Signal(
                             ts=df_slice.iloc[-1]["time"],
                             symbol=symbol,
@@ -596,16 +568,17 @@ class AgentZeroBacktester:
                             stop_loss=raw_signal.get("stop_loss", 0.0),
                             take_profit=raw_signal.get("take_profit", 0.0),
                             rr_ratio=raw_signal.get("rr_ratio", 0.0),
+                            atr=float(raw_signal.get("atr") or 0.0),
                             component_scores=raw_signal.get("component_scores", {}),
                             environment=raw_signal.get("signal_source", "?").split("-")[0] if raw_signal.get("signal_source") else "?",
+                            volume_profile=dict(raw_signal.get("volume_profile") or {}),
+                            poc=poc_value,
                         )
                         signals.append(sig)
                 finally:
                     # Restore original methods
                     self._strategy._fetch_m15 = original_fetch
                     self._strategy.get_previous_day_levels = original_levels
-                    if original_daily_bias is not None:
-                        self._strategy._get_daily_trend_bias = original_daily_bias
             
             except Exception as e:
                 log.error("Signal gen error at bar %d: %s", i, str(e)[:200])
@@ -634,27 +607,11 @@ class AgentZeroBacktester:
 
         Exit model
         ----------
-        Two modes (`enable_trade_management`):
-
-        A) FULL MANAGEMENT (default, matches live bot):
-             Phase 1 ("full"):   whole position open at initial SL.
-                - SL hit            → full loss, exit.
-                - 1R target hit     → close `partial_close_ratio` (50%) at
-                                      1R, trail SL to BE + buffer, switch
-                                      to runner phase.
-                - TP hit first      → rare (rr>1) but supported: full TP.
-             Phase 2 ("runner"): (1 − ratio) of size open, SL at BE.
-                - BE SL hit         → runner exits at BE (small gain from
-                                      the buffer).
-                - TP hit            → runner exits at TP.
-                - Timeout           → runner exits at last bar's close.
-
-             Total P&L = ratio * partial_pips + (1 − ratio) * runner_pips
-             (both scaled by lot_size when converting to USD).
-
-        B) RAW (enable_trade_management=False):
-             Single-exit model — whole position exits at first SL/TP/timeout.
-             Useful for signal-quality testing; will NOT match live P&L.
+        Single-exit RAW model: the whole position exits at the first
+        SL/TP touch, or at the final bar's close on timeout. No partial
+        close, no breakeven trail, no runner — this isolates the raw
+        signal edge. Live trade-management overlay belongs in the live
+        bot, not the backtest.
 
         Intrabar collisions
         -------------------
@@ -682,7 +639,6 @@ class AgentZeroBacktester:
                        if self.spread_pips_override is not None
                        else default_spread_pips(symbol))
         spread_price = spread_pips * pip_size
-        usd_per_pip  = get_pip_usd_value(symbol, lot_size=self.lot_size)
 
         import bisect
         times_sorted = times  # df already sorted by time
@@ -727,8 +683,26 @@ class AgentZeroBacktester:
             else:
                 continue
 
-            sl_price = float(sig.stop_loss)
-            tp_price = float(sig.take_profit)
+            if float(sig.atr or 0.0) > 0.0:
+                if self._strategy is not None:
+                    sl_mult = self._strategy.get_sl_multiplier(symbol)
+                    tp_mult = self._strategy.tp_atr_mult
+                else:
+                    sl_mult = 2.5
+                    tp_mult = 4.5
+                if side == "BUY":
+                    sl_price = entry_price - float(sig.atr) * sl_mult
+                    tp_price = entry_price + float(sig.atr) * tp_mult
+                else:
+                    sl_price = entry_price + float(sig.atr) * sl_mult
+                    tp_price = entry_price - float(sig.atr) * tp_mult
+            else:
+                sl_price = float(sig.stop_loss)
+                tp_price = float(sig.take_profit)
+
+            sig.entry_price = float(entry_price)
+            sig.stop_loss = float(sl_price)
+            sig.take_profit = float(tp_price)
 
             # Validate SL is on the correct side of entry (defensive —
             # bad signals otherwise create negative risk_pips / huge P&L).
@@ -737,15 +711,11 @@ class AgentZeroBacktester:
             if side == "SELL" and sl_price <= entry_price:
                 continue
 
-            # Risk distance and 1R / BE targets
+            # Risk distance — used for skip-on-bad-signal guard only.
             if side == "BUY":
-                risk_abs     = entry_price - sl_price
-                one_r_target = entry_price + risk_abs * self.partial_close_rr
-                be_sl        = entry_price + self.breakeven_buffer_pips * pip_size
+                risk_abs = entry_price - sl_price
             else:
-                risk_abs     = sl_price - entry_price
-                one_r_target = entry_price - risk_abs * self.partial_close_rr
-                be_sl        = entry_price - self.breakeven_buffer_pips * pip_size
+                risk_abs = sl_price - entry_price
 
             if risk_abs <= 0:
                 continue
@@ -755,205 +725,183 @@ class AgentZeroBacktester:
             max_exit_idx = min(entry_idx + self.max_trade_duration_bars,
                                len(df) - 1)
 
-            # ── RAW mode ─────────────────────────────────────────────
-            if not self.enable_trade_management:
-                resolved = False
-                for j in range(entry_idx, max_exit_idx + 1):
-                    c = df.iloc[j]
-                    c_high = float(c["high"]); c_low = float(c["low"])
-                    c_time = c["time"]
-
-                    if side == "BUY":
-                        tp_hit = c_high >= tp_price
-                        sl_hit = c_low  <= sl_price
-                    else:
-                        tp_hit = c_low  <= tp_price
-                        sl_hit = c_high >= sl_price
-
-                    if tp_hit and sl_hit:
-                        exit_price, reason = _resolve_intrabar(
-                            float(c["open"]), tp_price, sl_price, sl_price, tp_price)
-                        trade.calculate_exit(exit_price, c_time, reason, self.lot_size)
-                        resolved = True; break
-                    if tp_hit:
-                        trade.calculate_exit(tp_price, c_time, "tp", self.lot_size)
-                        resolved = True; break
-                    if sl_hit:
-                        trade.calculate_exit(sl_price, c_time, "sl", self.lot_size)
-                        resolved = True; break
-
-                if not resolved:
-                    close_candle = df.iloc[max_exit_idx]
-                    exit_price = float(close_candle.get("close", entry_price))
-                    trade.calculate_exit(exit_price, close_candle["time"],
-                                         "timeout", self.lot_size)
-                trades.append(trade)
-                continue
-
-            # ── FULL MANAGEMENT mode (default) ───────────────────────
-            ratio          = self.partial_close_ratio
-            phase          = "full"
-            current_sl     = sl_price
-            partial_hit    = False  # True once 1R partial-close has fired
-            partial_pips   = 0.0    # pips realised from the partial leg
-            exit_price     = None
-            exit_time      = None
-            exit_reason    = None
-            runner_pips    = 0.0
-
+            # ── RAW exit loop — first SL/TP wins; timeout otherwise ──
+            resolved = False
             for j in range(entry_idx, max_exit_idx + 1):
                 c = df.iloc[j]
                 c_high = float(c["high"]); c_low = float(c["low"])
-                c_open = float(c["open"]); c_time = c["time"]
+                c_time = c["time"]
 
-                if phase == "full":
-                    if side == "BUY":
-                        sl_hit = c_low  <= current_sl
-                        r1_hit = c_high >= one_r_target
-                        tp_hit = c_high >= tp_price
-                    else:
-                        sl_hit = c_high >= current_sl
-                        r1_hit = c_low  <= one_r_target
-                        tp_hit = c_low  <= tp_price
-
-                    # Initial-SL vs 1R collision → conservative SL
-                    if sl_hit and r1_hit:
-                        if side == "BUY":
-                            runner_pips = (current_sl - entry_price) / pip_size
-                        else:
-                            runner_pips = (entry_price - current_sl) / pip_size
-                        exit_price, exit_time, exit_reason = current_sl, c_time, "sl"
-                        break
-
-                    if sl_hit:
-                        if side == "BUY":
-                            runner_pips = (current_sl - entry_price) / pip_size
-                        else:
-                            runner_pips = (entry_price - current_sl) / pip_size
-                        exit_price, exit_time, exit_reason = current_sl, c_time, "sl"
-                        break
-
-                    # TP before 1R is only possible if rr < 1 (unusual).
-                    # Close the whole position at TP.
-                    if tp_hit and not r1_hit:
-                        if side == "BUY":
-                            runner_pips = (tp_price - entry_price) / pip_size
-                        else:
-                            runner_pips = (entry_price - tp_price) / pip_size
-                        exit_price, exit_time, exit_reason = tp_price, c_time, "tp"
-                        break
-
-                    if r1_hit:
-                        # 50% closes at 1R, SL trails to BE, runner continues.
-                        if side == "BUY":
-                            partial_pips = (one_r_target - entry_price) / pip_size
-                        else:
-                            partial_pips = (entry_price - one_r_target) / pip_size
-                        partial_hit = True
-                        phase       = "runner"
-                        current_sl  = be_sl
-                        # Intentionally do NOT re-check runner exits on the
-                        # trigger bar — we can't resolve post-1R intrabar
-                        # order from OHLC. Resume next bar.
-                        continue
-
-                    # Nothing hit → next bar
-                    continue
-
-                # phase == "runner"
                 if side == "BUY":
-                    sl_hit = c_low  <= current_sl
                     tp_hit = c_high >= tp_price
+                    sl_hit = c_low  <= sl_price
                 else:
-                    sl_hit = c_high >= current_sl
                     tp_hit = c_low  <= tp_price
+                    sl_hit = c_high >= sl_price
 
-                if sl_hit and tp_hit:
-                    xp, xr = _resolve_intrabar(c_open, tp_price, current_sl,
-                                               current_sl, tp_price)
-                    if side == "BUY":
-                        runner_pips = (xp - entry_price) / pip_size
-                    else:
-                        runner_pips = (entry_price - xp) / pip_size
-                    exit_price, exit_time, exit_reason = xp, c_time, "be+" + xr
-                    break
-
+                if tp_hit and sl_hit:
+                    exit_price, reason = _resolve_intrabar(
+                        float(c["open"]), tp_price, sl_price, sl_price, tp_price)
+                    trade.calculate_exit(exit_price, c_time, reason, self.lot_size)
+                    resolved = True; break
                 if tp_hit:
-                    if side == "BUY":
-                        runner_pips = (tp_price - entry_price) / pip_size
-                    else:
-                        runner_pips = (entry_price - tp_price) / pip_size
-                    exit_price, exit_time, exit_reason = tp_price, c_time, "partial+tp"
-                    break
-
+                    trade.calculate_exit(tp_price, c_time, "tp", self.lot_size)
+                    resolved = True; break
                 if sl_hit:
-                    if side == "BUY":
-                        runner_pips = (current_sl - entry_price) / pip_size
-                    else:
-                        runner_pips = (entry_price - current_sl) / pip_size
-                    exit_price, exit_time, exit_reason = current_sl, c_time, "partial+be"
-                    break
+                    trade.calculate_exit(sl_price, c_time, "sl", self.lot_size)
+                    resolved = True; break
 
-            # Timeout branch — close remainder at final bar's close
-            if exit_price is None:
+            if not resolved:
                 close_candle = df.iloc[max_exit_idx]
-                cx = float(close_candle.get("close", entry_price))
-                if side == "BUY":
-                    runner_pips = (cx - entry_price) / pip_size
-                else:
-                    runner_pips = (entry_price - cx) / pip_size
-                exit_price  = cx
-                exit_time   = close_candle["time"]
-                exit_reason = ("partial+timeout" if phase == "runner"
-                               else "timeout")
-
-            # Compose the trade's final numbers. If the partial close
-            # never fired (exit happened in "full" phase), the whole
-            # position exits at runner_pips — no ratio weighting.
-            if partial_hit:
-                total_pips = ratio * partial_pips + (1.0 - ratio) * runner_pips
-            else:
-                total_pips = runner_pips
-            trade.exit_price      = exit_price
-            trade.exit_time       = exit_time
-            trade.exit_reason     = exit_reason
-            trade.profit_pips     = total_pips
-            trade.profit          = total_pips * usd_per_pip
-            trade.duration_minutes = int(
-                (exit_time - entry_time).total_seconds() / 60)
-            if trade.profit > 0:
-                trade.outcome = "WIN"
-            elif trade.profit < 0:
-                trade.outcome = "LOSS"
-            else:
-                trade.outcome = "BE"
-            # RR achieved relative to initial full-position risk
-            if risk_abs > 0:
-                risk_pips = risk_abs / pip_size
-                trade.rr_achieved = abs(total_pips) / risk_pips
-            else:
-                trade.rr_achieved = 0.0
+                exit_price = float(close_candle.get("close", entry_price))
+                trade.calculate_exit(exit_price, close_candle["time"],
+                                     "timeout", self.lot_size)
 
             if trade.profit_pips <= -20:
                 log.warning(
                     "LARGE LOSS: %s %s | Entry: %.5f | SL: %.5f | TP: %.5f | "
                     "Exit: %.5f at %s | P&L: %+.1f pips | Reason: %s | Env: %s",
                     side, symbol, entry_price, sl_price, tp_price,
-                    exit_price, exit_time, total_pips, exit_reason,
-                    sig.environment
+                    trade.exit_price, trade.exit_time, trade.profit_pips,
+                    trade.exit_reason, sig.environment
                 )
 
             trades.append(trade)
 
-        log.info("Simulated %d trades, closed %d  (spread=%.1fp, intrabar=%s, "
-                 "management=%s)",
+        log.info("Simulated %d trades, closed %d  (spread=%.1fp, intrabar=%s)",
                  len(trades),
                  len([t for t in trades if t.outcome != "open"]),
-                 spread_pips, self.intrabar_policy,
-                 "on" if self.enable_trade_management else "off")
+                 spread_pips, self.intrabar_policy)
         _emit({"type": "sim_done", "symbol": symbol, "trades": len(trades)})
         return trades
-    
+
+    # ---------------------------------------------------------------- #
+    # Volume-profile POC bias filter                                   #
+    # ---------------------------------------------------------------- #
+    # Backtest-only POC bias gate. The volume profile gives us context:
+    # whichever side of the Point of Control we're on is our bias.
+    #
+    #   price > POC  →  bullish bias  →  only BUY signals are kept
+    #   price < POC  →  bearish bias  →  only SELL signals are kept
+    #
+    # Strategy still emits the full PDH/PDL + VP setups; the backtester
+    # filters them down to those that align with POC bias.
+    #
+    # POC is computed from the same no-lookahead bar window the strategy
+    # just saw (typical-price weighted by volume), so the filter never
+    # peeks at future bars.
+    POC_BIAS_LOOKBACK = 96   # M15 bars ≈ 24h profile window
+    POC_BIAS_BINS     = 32   # histogram resolution
+
+    def _compute_poc(self, df_slice: "pd.DataFrame") -> float:
+        """
+        Return the price of the highest-volume bin in the histogram of
+        typical price weighted by volume over the trailing window.
+        Returns 0.0 when data is insufficient or degenerate.
+        """
+        if df_slice is None or len(df_slice) < 12:
+            return 0.0
+        window = df_slice.tail(self.POC_BIAS_LOOKBACK)
+        if len(window) < 12:
+            return 0.0
+        try:
+            vols = self._strategy._volume_series(window)
+        except Exception:
+            for col in ("real_volume", "tick_volume", "volume"):
+                if col in window.columns:
+                    vols = pd.to_numeric(window[col], errors="coerce").fillna(0.0)
+                    if float(vols.sum()) > 0:
+                        break
+            else:
+                vols = pd.Series(np.ones(len(window), dtype=float), index=window.index)
+        if float(vols.sum()) <= 0.0:
+            return 0.0
+        low_min = float(window["low"].min())
+        high_max = float(window["high"].max())
+        if high_max <= low_min:
+            return 0.0
+        typical = (
+            window["high"].astype(float)
+            + window["low"].astype(float)
+            + window["close"].astype(float)
+        ) / 3.0
+        try:
+            hist, edges = np.histogram(
+                typical.to_numpy(dtype=float),
+                bins=self.POC_BIAS_BINS,
+                range=(low_min, high_max),
+                weights=vols.to_numpy(dtype=float),
+            )
+        except Exception:
+            return 0.0
+        if hist.sum() <= 0:
+            return 0.0
+        idx = int(np.argmax(hist))
+        return float((edges[idx] + edges[idx + 1]) / 2.0)
+
+    def _apply_vp_filter(self, signals: List[Signal]) -> Tuple[List[Signal], Dict[str, Any]]:
+        """
+        Keep only signals that align with POC bias.
+
+        BUY  signals are kept if entry_price > POC (price is above value).
+        SELL signals are kept if entry_price < POC (price is below value).
+        Signals with missing POC or entry price pass through unchanged
+        (defensive — don't silently drop on data hiccups).
+
+        Returns the filtered signals and a stats dict.
+        """
+        kept: List[Signal] = []
+        dropped_buy_below_poc = 0
+        dropped_sell_above_poc = 0
+        passthrough_no_poc = 0
+        sample_reasons: List[str] = []
+
+        def _record(reason: str) -> None:
+            if len(sample_reasons) < 25:
+                sample_reasons.append(reason)
+
+        for sig in signals:
+            poc = float(sig.poc or 0.0)
+            price = float(sig.entry_price or 0.0)
+            side = (sig.signal or "").upper()
+
+            if poc <= 0.0 or price <= 0.0:
+                # Insufficient data → don't filter (don't penalise the
+                # strategy for our own missing context).
+                passthrough_no_poc += 1
+                kept.append(sig)
+                continue
+
+            if side == "BUY":
+                if price > poc:
+                    kept.append(sig)
+                else:
+                    dropped_buy_below_poc += 1
+                    _record(f"BUY dropped: price {price:.5f} ≤ POC {poc:.5f}")
+            elif side == "SELL":
+                if price < poc:
+                    kept.append(sig)
+                else:
+                    dropped_sell_above_poc += 1
+                    _record(f"SELL dropped: price {price:.5f} ≥ POC {poc:.5f}")
+            else:
+                # Unknown side → pass through.
+                kept.append(sig)
+
+        stats = {
+            "mode":                    "poc_bias_only",
+            "input":                   len(signals),
+            "kept":                    len(kept),
+            "dropped":                 len(signals) - len(kept),
+            "dropped_buy_below_poc":   dropped_buy_below_poc,
+            "dropped_sell_above_poc":  dropped_sell_above_poc,
+            "passthrough_no_poc":      passthrough_no_poc,
+            "lookback_bars":           self.POC_BIAS_LOOKBACK,
+            "bins":                    self.POC_BIAS_BINS,
+            "sample_reasons":          sample_reasons[:10],
+        }
+        return kept, stats
+
     def analyze_early_exits(self, trades: List[Trade]) -> Dict:
         """Analyze trades that exit quickly (early reversals)."""
         early_exits = {}
@@ -1251,11 +1199,7 @@ class AgentZeroBacktester:
                 "intrabar_policy":     self.intrabar_policy,
                 "entry_fill":          ("bid-based OHLC: BUY pays full spread, "
                                         "SELL fills at open"),
-                "trade_management":    ("1R partial close "
-                                        f"({int(self.partial_close_ratio*100)}%) "
-                                        f"+ SL→BE ({self.breakeven_buffer_pips}p)"
-                                        if self.enable_trade_management
-                                        else "raw (single SL/TP exit)"),
+                "trade_management":    "raw (single SL/TP exit)",
                 "pip_usd_model":       "JPY pairs converted at ~150 USDJPY",
                 "commission":          "not modelled",
                 "swap":                "not modelled",
@@ -1312,6 +1256,16 @@ class AgentZeroBacktester:
 
             self.signals.extend(signals)
 
+            # ── Volume-profile POC bias filter ────────────────────────
+            # Keep only signals that align with POC bias (BUYs above POC,
+            # SELLs below POC). See _apply_vp_filter for the gate.
+            signals_pre = len(signals)
+            signals, vp_filter_stats = self._apply_vp_filter(signals)
+            if signals_pre != len(signals):
+                log.info("POC bias: kept %d of %d signals for %s (%s)",
+                         len(signals), signals_pre, symbol,
+                         vp_filter_stats)
+
             _emit({"type": "stage", "symbol": symbol, "stage": "simulating_trades"})
             trades = self.simulate_trades(symbol, signals, df, progress_cb=progress_cb)
             self.trades.extend(trades)
@@ -1327,6 +1281,9 @@ class AgentZeroBacktester:
             results["window_start_utc"] = window_start.isoformat()
             results["window_end_utc"]   = now_utc.isoformat()
             results["requested_days"]   = int(days)
+            # Surface VP-veto filter stats so the dashboard can show how
+            # many setups were dropped and why.
+            results["vp_filter"] = vp_filter_stats
 
             # ML diagnostic: feature importance on the trades we just closed
             fi = self.compute_feature_importance(trades)
@@ -1373,6 +1330,18 @@ class AgentZeroBacktester:
             "hour_of_day",
             "dow",
             "is_jpy",
+            # POC-bias context (filter is POC-only, so this captures
+            # how strongly aligned the trade was with the bias).
+            # dist_to_poc_atr: signed distance from entry to POC,
+            # scaled by ATR. Positive = aligned with the trade side
+            # (BUY above POC / SELL below POC). 0 when POC missing.
+            "dist_to_poc_atr",
+            # Raw distance (price units) → useful even when ATR is
+            # missing or close to zero on the trigger bar.
+            "dist_to_poc_pips",
+            # Whether a POC value was actually available for this
+            # signal (some early bars in the window won't have one).
+            "has_poc",
         ]
 
         X: List[List[float]] = []
@@ -1385,11 +1354,32 @@ class AgentZeroBacktester:
             hour = int(ts.hour) if ts is not None else 0
             dow  = int(ts.weekday()) if ts is not None else 0
 
+            # POC-bias features. Note: t.signal.entry_price has been
+            # rewritten to the actual fill (next-bar open ± spread) by
+            # simulate_trades, while t.signal.poc was captured at the
+            # trigger close. Those differ by at most a fraction of an
+            # ATR, so dist_to_poc_atr remains a meaningful proxy for
+            # "how strongly the price was on the bias side of POC".
+            poc_val = float(t.signal.poc or 0.0)
+            atr_val = float(t.signal.atr or 0.0)
+            entry_val = float(t.signal.entry_price or 0.0)
+            is_buy = str(t.signal.signal).upper() == "BUY"
+            if poc_val > 0.0 and entry_val > 0.0:
+                raw_diff = entry_val - poc_val
+                signed = raw_diff if is_buy else -raw_diff
+                dist_to_poc_atr  = signed / atr_val if atr_val > 0.0 else 0.0
+                dist_to_poc_pips = signed / pip if pip > 0.0 else 0.0
+                has_poc = 1.0
+            else:
+                dist_to_poc_atr  = 0.0
+                dist_to_poc_pips = 0.0
+                has_poc = 0.0
+
             row = [
                 float(t.signal.confidence or 0.0),
                 float(t.signal.rr_ratio or 0.0),
                 float(risk_pips),
-                1.0 if str(t.signal.signal).upper() == "BUY" else 0.0,
+                1.0 if is_buy else 0.0,
                 1.0 if "CHOCH" in src else 0.0,
                 1.0 if "CONTINUATION" in src else 0.0,
                 1.0 if src.endswith("@PDH") else 0.0,
@@ -1397,6 +1387,9 @@ class AgentZeroBacktester:
                 float(hour),
                 float(dow),
                 1.0 if "JPY" in str(t.signal.symbol).upper() else 0.0,
+                float(dist_to_poc_atr),
+                float(dist_to_poc_pips),
+                float(has_poc),
             ]
             X.append(row)
             y.append(1 if t.outcome == "WIN" else 0)
@@ -1555,6 +1548,7 @@ class AgentZeroBacktester:
                     "exit": round(t.exit_price or t.entry_price, 5),
                     "sl": round(t.signal.stop_loss, 5),
                     "tp": round(t.signal.take_profit, 5),
+                    "atr": round(t.signal.atr, 6),
                     "pips": round(t.profit_pips, 1),
                     "pnl": round(t.profit, 2),
                     "outcome": t.outcome,

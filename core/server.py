@@ -946,11 +946,10 @@ def api_backtest_run():
         for symbol in pairs:
             log.info("[BACKTEST] %s days=%d lot=%.2f", symbol, days, lot_size)
             try:
-                # Pure strategy validation — no 1R partial close, no BE
-                # trail. Whole position exits at first SL/TP/timeout so
-                # we're measuring the signal, not the management overlay.
-                bt = AgentZeroBacktester(lot_size=lot_size,
-                                      enable_trade_management=False)
+                # Pure strategy validation — whole position exits at first
+                # SL/TP/timeout so we're measuring the raw signal edge.
+                # (Trade-management overlay lives only in the live bot.)
+                bt = AgentZeroBacktester(lot_size=lot_size)
                 result = bt.run(symbol, days=days)
             except Exception as exc:
                 log.exception("backtest failed for %s", symbol)
@@ -1116,12 +1115,10 @@ def api_backtest_stream():
                 _push({"__event__": "pair_start", "symbol": symbol})
 
                 try:
-                    # Pure strategy validation — no 1R partial close, no
-                    # BE trail. The whole position exits at the first
-                    # SL/TP/timeout so the numbers measure the signal
-                    # itself, not the management overlay.
-                    bt = AgentZeroBacktester(lot_size=lot_size,
-                                          enable_trade_management=False)
+                    # Pure strategy validation — whole position exits at
+                    # the first SL/TP/timeout so the numbers measure the
+                    # raw signal itself, not the management overlay.
+                    bt = AgentZeroBacktester(lot_size=lot_size)
                     result = bt.run(
                         symbol,
                         days=days,
