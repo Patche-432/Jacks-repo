@@ -1439,7 +1439,11 @@ class Backtester:
     ) -> Optional[Dict[str, float]]:
         """Derive per-pair tuned_params from backtest statistics."""
         decided = [t for t in trades if t.outcome in ("WIN", "LOSS")]
-        if len(decided) < 5:
+        # Allow derivation from aggregate results when individual trades are
+        # unavailable (e.g. re-computing tuned_params for old backtest runs
+        # that pre-date per-trade storage), as long as we have >= 5 trades.
+        aggregate_trade_count = int((results or {}).get("trade_count") or 0)
+        if len(decided) < 5 and aggregate_trade_count < 5:
             return None
 
         pip_size = get_pip_value(symbol)
@@ -1465,7 +1469,10 @@ class Backtester:
         )
 
         if median_atr_pips <= 0:
-            return None
+            # ATR data absent (old trades pre-dating ATR logging).
+            # Use a pair-specific typical M15 ATR so we can still derive
+            # sensible SL/TP multipliers rather than skipping tuning entirely.
+            median_atr_pips = 20.0 if "JPY" in symbol.upper() else 10.0
 
         def _f(key: str, default: Any = 0.0) -> float:
             v = results.get(key)

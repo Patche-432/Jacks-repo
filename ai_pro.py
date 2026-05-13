@@ -3158,6 +3158,19 @@ class Bot:
                             pause_reason, action="hold")
                 log.info("[%s] New entries paused: %s", symbol, pause_reason)
 
+        # Apply per-pair ML-tuned strategy params before each signal scan so
+        # EURJPY, GBPJPY etc. each use their own backtested SL/TP multipliers
+        # rather than the bot-wide defaults.
+        if _LEARNING_LOOP_OK and get_learning_loop is not None:
+            try:
+                _tp = get_learning_loop().get_tuned_params(symbol)
+                self._strategy.sl_atr_mult             = _tp["sl_atr_mult"]
+                self._strategy.tp_atr_mult             = _tp["tp_atr_mult"]
+                self._strategy.atr_tolerance_multiplier = _tp.get("atr_tolerance_mult", 1.5)
+            except Exception as _tp_exc:
+                log.debug("[%s] tuned-param apply failed, using strategy defaults: %s",
+                          symbol, _tp_exc)
+
         result = self._strategy.run_strategy(
             symbol=symbol,
             auto_trade=auto_trade_effective if rules else self.auto_trade,
