@@ -15,6 +15,8 @@ let equityData = [];
 const marketScanCache = {};
 let lastMarketScanFetchMs = 0;
 const MARKET_SCAN_MIN_INTERVAL_MS = 15000;
+// Keyed by symbol — holds the most recent open position for each pair (null if none)
+const openPositionsBySymbol = {};
 
 window.addEventListener('load', () => {
     autoCheckMt5();
@@ -349,21 +351,91 @@ function _buildConfBar(conf) {
     </div>`;
 }
 
+function _buildActivePositionBlock(pos, pipSize, digits) {
+    const isBuy   = pos.type === 'BUY';
+    const pnl     = Number(pos.profit || 0);
+    const pnlCol  = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    const pnlSign = pnl >= 0 ? '+' : '';
+    const tradeCol = isBuy ? 'var(--green)' : 'var(--red)';
+    const tradeBg  = isBuy ? 'rgba(80,217,99,0.08)' : 'rgba(255,107,107,0.08)';
+    const tradeBorder = isBuy ? 'rgba(80,217,99,0.3)' : 'rgba(255,107,107,0.3)';
+
+    const open    = Number(pos.open_price    || pos.entry || 0);
+    const current = Number(pos.current_price || 0);
+    let movePips = 0;
+    if (open && current && pipSize) {
+        movePips = Math.round((isBuy ? current - open : open - current) / pipSize);
+    }
+    const moveCol = movePips >= 0 ? 'var(--green)' : 'var(--red)';
+
+    const openedAge = pos.open_time
+        ? (() => {
+              // open_time is ISO string from server.py or Unix int from bot internal
+              const d = typeof pos.open_time === 'number'
+                  ? new Date(pos.open_time * 1000)
+                  : new Date(pos.open_time);
+              const s = Math.round((Date.now() - d.getTime()) / 1000);
+              return s < 3600 ? Math.round(s / 60) + 'm' : Math.round(s / 3600) + 'h';
+          })()
+        : null;
+
+    return `<div style="background:${tradeBg};border:1px solid ${tradeBorder};border-radius:6px;padding:10px;margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div style="display:flex;align-items:center;gap:6px">
+                <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${tradeCol};animation:pulse-watch 1.5s infinite"></span>
+                <span style="font-size:9px;font-weight:700;color:${tradeCol};text-transform:uppercase;letter-spacing:.08em">In Trade</span>
+                <span style="font-size:9px;font-weight:700;color:${tradeCol}">${pos.type}</span>
+                <span style="font-size:8px;color:var(--txt3)">${pos.volume} lot</span>
+            </div>
+            <div style="text-align:right">
+                <div style="font-size:13px;font-weight:700;color:${pnlCol};font-family:var(--mono)">${pnlSign}$${Math.abs(pnl).toFixed(2)}</div>
+                ${openedAge ? `<div style="font-size:8px;color:var(--txt3)">${openedAge} open</div>` : ''}
+            </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:6px">
+            <div style="background:var(--bg0);border-radius:4px;padding:5px 7px">
+                <div style="font-size:8px;color:var(--txt3);margin-bottom:2px">Opened</div>
+                <div style="font-family:var(--mono);font-size:10px;color:var(--txt)">${open ? open.toFixed(digits) : '\u2014'}</div>
+            </div>
+            <div style="background:var(--bg0);border-radius:4px;padding:5px 7px">
+                <div style="font-size:8px;color:var(--txt3);margin-bottom:2px">Current</div>
+                <div style="font-family:var(--mono);font-size:10px;color:var(--txt)">${current ? current.toFixed(digits) : '\u2014'}</div>
+            </div>
+            <div style="background:var(--bg0);border-radius:4px;padding:5px 7px">
+                <div style="font-size:8px;color:var(--txt3);margin-bottom:2px">Move</div>
+                <div style="font-family:var(--mono);font-size:10px;font-weight:700;color:${moveCol}">${movePips >= 0 ? '+' : ''}${movePips}p</div>
+            </div>
+        </div>
+        ${(pos.sl || pos.tp) ? `<div style="display:flex;gap:10px;font-size:9px;color:var(--txt3)">
+            ${pos.sl ? `<span>SL <span style="font-family:var(--mono);color:var(--red)">${Number(pos.sl).toFixed(digits)}</span></span>` : ''}
+            ${pos.tp ? `<span>TP <span style="font-family:var(--mono);color:var(--green)">${Number(pos.tp).toFixed(digits)}</span></span>` : ''}
+            <span style="margin-left:auto;color:var(--txt3)">#${pos.ticket}</span>
+        </div>` : ''}
+    </div>`;
+}
+
 function buildSignalCard(symbol, sig) {
     if (!sig) return `<div style="background:var(--bg1);padding:16px;color:var(--txt3);font-size:10px">Loading ${_esc(symbol)}\u2026</div>`;
     if (sig.error) return `<div style="background:var(--bg1);border-left:3px solid var(--red);padding:16px"><div style="font-size:13px;font-weight:700;color:var(--txt);margin-bottom:6px">${_esc(symbol)}</div><div style="font-size:10px;color:var(--red)">${_esc(sig.error)}</div></div>`;
 
-    const bias    = sig.bias || 'neutral';
-    const conf    = sig.confidence || 0;
+    const pos    = openPositionsBySymbol[symbol] || null;
+    const bias   = sig.bias || 'neutral';
+    const conf   = sig.confidence || 0;
     const isLong  = bias === 'LONG';
     const isShort = bias === 'SHORT';
     const isActive = isLong || isShort;
 
-    const biasColor   = isLong ? 'var(--green)' : isShort ? 'var(--red)' : 'var(--txt3)';
-    const borderColor = isLong ? '#2fa538'       : isShort ? '#d63031'    : 'var(--line)';
-    const bgAccent    = isLong ? 'rgba(80,217,99,0.04)' : isShort ? 'rgba(255,107,107,0.04)' : 'transparent';
-    const arrow       = isLong ? '\u2191' : isShort ? '\u2193' : '\u2014';
-    const biasLabel   = isLong ? 'LONG'   : isShort ? 'SHORT'  : 'NO SIGNAL';
+    // Border priority: active trade > signal bias
+    let borderColor, biasColor, arrow, biasLabel;
+    if (pos) {
+        borderColor = pos.type === 'BUY' ? '#2fa538' : '#d63031';
+        biasColor   = pos.type === 'BUY' ? 'var(--green)' : 'var(--red)';
+    } else {
+        borderColor = isLong ? '#2fa538' : isShort ? '#d63031' : 'var(--line)';
+        biasColor   = isLong ? 'var(--green)' : isShort ? 'var(--red)' : 'var(--txt3)';
+    }
+    arrow     = isLong ? '\u2191' : isShort ? '\u2193' : '\u2014';
+    biasLabel = isLong ? 'LONG'  : isShort ? 'SHORT'  : 'NO SIGNAL';
 
     const pipSize = symbol.includes('JPY') ? 0.01 : 0.0001;
     const digits  = symbol.includes('JPY') ? 3 : 5;
@@ -383,7 +455,7 @@ function buildSignalCard(symbol, sig) {
     const levels = sig.level_interaction && sig.level_interaction !== '\u2014' ? sig.level_interaction : null;
     const rrCol  = rr >= 2 ? 'var(--green)' : rr >= 1.5 ? 'var(--amber)' : 'var(--red)';
 
-    const priceBlock = isActive ? `
+    const signalBlock = isActive ? `
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:7px">
             <div style="background:var(--bg0);border-radius:5px;padding:7px 8px">
                 <div style="font-size:8px;color:var(--txt3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px">Entry</div>
@@ -405,12 +477,12 @@ function buildSignalCard(symbol, sig) {
             <span style="font-family:var(--mono);font-weight:700;font-size:13px;color:${rrCol}">${rr.toFixed(1)}R</span>
             <span style="font-size:8px;color:var(--txt3)">${slPips}p \u2192 ${tpPips}p</span>
         </div>` : ''}` :
-        `<div style="display:flex;align-items:center;justify-content:center;gap:8px;padding:18px 0;margin-bottom:8px;opacity:.5">
+        (!pos ? `<div style="display:flex;align-items:center;justify-content:center;gap:8px;padding:18px 0;margin-bottom:8px;opacity:.5">
             <span style="font-size:20px;color:var(--txt3)">&#9711;</span>
             <span style="font-size:9px;color:var(--txt3);letter-spacing:.1em;text-transform:uppercase">Awaiting setup</span>
-        </div>`;
+        </div>` : '');
 
-    return `<div style="background:var(--bg1);${bgAccent ? 'background:var(--bg1)' : ''};border-left:3px solid ${borderColor};padding:14px 15px;display:flex;flex-direction:column">
+    return `<div style="background:var(--bg1);border-left:3px solid ${borderColor};padding:14px 15px;display:flex;flex-direction:column">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
             <div style="display:flex;align-items:baseline;gap:7px">
                 <span style="font-size:15px;font-weight:700;color:var(--txt);letter-spacing:.03em">${symbol}</span>
@@ -422,7 +494,8 @@ function buildSignalCard(symbol, sig) {
             </div>
         </div>
         ${_buildConfBar(conf)}
-        ${priceBlock}
+        ${pos ? _buildActivePositionBlock(pos, pipSize, digits) : ''}
+        ${signalBlock}
         <div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-bottom:6px">
             ${_buildEnvPills(sig.environment)}
         </div>
@@ -442,12 +515,14 @@ function renderMarketScanBreakdown() {
     const longCount  = symbols.filter(s => (marketScanCache[s]||{}).bias === 'LONG').length;
     const shortCount = symbols.filter(s => (marketScanCache[s]||{}).bias === 'SHORT').length;
     const idleCount  = symbols.length - longCount - shortCount;
+    const tradeCount = symbols.filter(s => openPositionsBySymbol[s]).length;
 
     const summaryBar = `<div style="display:flex;align-items:center;gap:14px;padding:9px 16px;background:var(--bg1);border-bottom:1px solid var(--line);font-size:9px;text-transform:uppercase;letter-spacing:.08em;flex-shrink:0">
         <span style="color:var(--txt3)">Signal Board &nbsp;&#xb7;&nbsp; M15</span>
         <span style="color:var(--green)">&#x2191; ${longCount} Long</span>
         <span style="color:var(--red)">&#x2193; ${shortCount} Short</span>
-        <span style="color:var(--txt3)">\u25cb ${idleCount} Idle</span>
+        <span style="color:var(--txt3)">&#9711; ${idleCount} Idle</span>
+        ${tradeCount > 0 ? `<span style="color:var(--amber)">&#9679; ${tradeCount} In Trade</span>` : ''}
         <span style="margin-left:auto;color:var(--txt3)">Auto-refreshes every 5 min</span>
     </div>`;
 
@@ -656,7 +731,17 @@ setInterval(() => {
 }, 2000);
 
 setInterval(() => {
-    fetch('/bot/positions').then(r => r.json()).then(data => updatePortfolioWatch(data.positions || [])).catch(() => {});
+    fetch('/bot/positions').then(r => r.json()).then(data => {
+        const positions = data.positions || [];
+        // Rebuild per-symbol lookup so signal cards can show active trade info
+        const symbols = ['EURUSD','GBPUSD','EURJPY','GBPJPY'];
+        symbols.forEach(s => { openPositionsBySymbol[s] = null; });
+        positions.forEach(p => { if (p.symbol) openPositionsBySymbol[p.symbol] = p; });
+        updatePortfolioWatch(positions);
+        // Re-render signal cards so the active-trade overlay stays current
+        const sigTab = document.getElementById('tab-signals');
+        if (sigTab && sigTab.classList.contains('active')) renderMarketScanBreakdown();
+    }).catch(() => {});
     const posTab = document.getElementById('tab-positions'); if (posTab && posTab.classList.contains('active')) fetchPositions();
 }, 5000);
 
