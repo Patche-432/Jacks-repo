@@ -302,71 +302,160 @@ function updatePairWatch(symbol, data) {
     if (stateEl) stateEl.textContent = bias === 'LONG' ? 'bullish' : bias === 'SHORT' ? 'bearish' : 'neutral';
 }
 
+// Parse ENV1\u20134 statuses from the environment string.
+// Returns array of 4 values: 'on' | 'off' | 'lowconf' | 'unknown'
+function _parseEnvStatuses(envStr) {
+    if (!envStr || /no active environment/i.test(envStr)) return ['off','off','off','off'];
+    const isLowConf = /low confidence/i.test(envStr);
+    return [1,2,3,4].map(n => {
+        const m = new RegExp('ENV\\s*' + n + '\\s*(on|off)', 'i').exec(envStr);
+        if (m) return m[1].toLowerCase() === 'on' ? (isLowConf ? 'lowconf' : 'on') : 'off';
+        // Not explicitly listed \u2014 if string contains at least one ENV reference, treat as unknown
+        return envStr.includes('ENV') ? 'unknown' : (isLowConf ? 'lowconf' : 'off');
+    });
+}
+
+function _buildEnvPills(envStr) {
+    const statuses = _parseEnvStatuses(envStr);
+    const isLowConf = envStr && /low confidence/i.test(envStr);
+    const labels = ['1','2','3','4'];
+    let html = '<span style="font-size:8px;color:var(--txt3);margin-right:3px;text-transform:uppercase;letter-spacing:.08em">ENV</span>';
+    statuses.forEach((s, i) => {
+        let col, bg, border;
+        if (s === 'on')      { col = '#0a0e14'; bg = 'var(--green)';  border = 'transparent'; }
+        else if (s === 'lowconf') { col = '#0a0e14'; bg = 'var(--amber)'; border = 'transparent'; }
+        else                 { col = 'var(--txt3)'; bg = 'var(--bg2)'; border = 'var(--line)'; }
+        html += `<span style="display:inline-flex;align-items:center;justify-content:center;width:22px;height:18px;font-size:8px;font-weight:700;border-radius:3px;color:${col};background:${bg};border:1px solid ${border}">${labels[i]}</span>`;
+    });
+    if (isLowConf) {
+        const m = /low confidence\s*\((\d+)%\s*[<>]\s*(\d+)%\)/i.exec(envStr || '');
+        html += `<span style="font-size:8px;color:var(--amber);margin-left:3px">${m ? m[1]+'% < '+m[2]+'%' : 'low conf'}</span>`;
+    }
+    return html;
+}
+
+function _buildConfBar(conf) {
+    const col = conf >= 75 ? '#50d963' : conf >= 50 ? '#ffc107' : '#ff6b6b';
+    const label = conf >= 75 ? 'STRONG' : conf >= 55 ? 'MODERATE' : 'WEAK';
+    const labelCol = conf >= 75 ? 'var(--green)' : conf >= 55 ? 'var(--amber)' : 'var(--red)';
+    return `<div style="margin-bottom:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+            <span style="font-size:8px;color:var(--txt3);text-transform:uppercase;letter-spacing:.08em">Confidence</span>
+            <span style="font-size:9px;font-weight:700;color:${labelCol}">${conf}% &nbsp;${label}</span>
+        </div>
+        <div style="height:4px;background:var(--bg3);border-radius:2px;overflow:hidden">
+            <div style="height:100%;width:${Math.min(conf,100)}%;background:${col};border-radius:2px"></div>
+        </div>
+    </div>`;
+}
+
+function buildSignalCard(symbol, sig) {
+    if (!sig) return `<div style="background:var(--bg1);padding:16px;color:var(--txt3);font-size:10px">Loading ${_esc(symbol)}\u2026</div>`;
+    if (sig.error) return `<div style="background:var(--bg1);border-left:3px solid var(--red);padding:16px"><div style="font-size:13px;font-weight:700;color:var(--txt);margin-bottom:6px">${_esc(symbol)}</div><div style="font-size:10px;color:var(--red)">${_esc(sig.error)}</div></div>`;
+
+    const bias    = sig.bias || 'neutral';
+    const conf    = sig.confidence || 0;
+    const isLong  = bias === 'LONG';
+    const isShort = bias === 'SHORT';
+    const isActive = isLong || isShort;
+
+    const biasColor   = isLong ? 'var(--green)' : isShort ? 'var(--red)' : 'var(--txt3)';
+    const borderColor = isLong ? '#2fa538'       : isShort ? '#d63031'    : 'var(--line)';
+    const bgAccent    = isLong ? 'rgba(80,217,99,0.04)' : isShort ? 'rgba(255,107,107,0.04)' : 'transparent';
+    const arrow       = isLong ? '\u2191' : isShort ? '\u2193' : '\u2014';
+    const biasLabel   = isLong ? 'LONG'   : isShort ? 'SHORT'  : 'NO SIGNAL';
+
+    const pipSize = symbol.includes('JPY') ? 0.01 : 0.0001;
+    const digits  = symbol.includes('JPY') ? 3 : 5;
+    const entry = sig.entry_price, sl = sig.sl_price, tp = sig.tp_price;
+    let slPips = 0, tpPips = 0, rr = 0;
+    if (entry && sl) slPips = Math.round(Math.abs(entry - sl) / pipSize);
+    if (entry && tp) tpPips = Math.round(Math.abs(tp - entry) / pipSize);
+    if (slPips > 0 && tpPips > 0) rr = tpPips / slPips;
+
+    let timeAgo = 'scanning\u2026';
+    if (sig.ts) {
+        const age = Math.round((Date.now() - new Date(sig.ts).getTime()) / 1000);
+        timeAgo = age < 60 ? age + 's ago' : Math.round(age / 60) + 'm ago';
+    }
+
+    const choch  = sig.choch_status && sig.choch_status !== '\u2014' ? sig.choch_status : null;
+    const levels = sig.level_interaction && sig.level_interaction !== '\u2014' ? sig.level_interaction : null;
+    const rrCol  = rr >= 2 ? 'var(--green)' : rr >= 1.5 ? 'var(--amber)' : 'var(--red)';
+
+    const priceBlock = isActive ? `
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:7px">
+            <div style="background:var(--bg0);border-radius:5px;padding:7px 8px">
+                <div style="font-size:8px;color:var(--txt3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px">Entry</div>
+                <div style="font-family:var(--mono);font-size:11px;color:var(--txt);font-weight:600">${entry ? entry.toFixed(digits) : '\u2014'}</div>
+            </div>
+            <div style="background:rgba(255,107,107,0.07);border-top:2px solid #d63031;border-radius:5px;padding:7px 8px">
+                <div style="font-size:8px;color:var(--txt3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px">Stop Loss</div>
+                <div style="font-family:var(--mono);font-size:11px;color:var(--red);font-weight:600">${sl ? sl.toFixed(digits) : '\u2014'}</div>
+                ${slPips > 0 ? `<div style="font-size:8px;color:var(--red);opacity:.6;margin-top:2px">\u2212${slPips}p</div>` : ''}
+            </div>
+            <div style="background:rgba(80,217,99,0.07);border-top:2px solid #2fa538;border-radius:5px;padding:7px 8px">
+                <div style="font-size:8px;color:var(--txt3);text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px">Take Profit</div>
+                <div style="font-family:var(--mono);font-size:11px;color:var(--green);font-weight:600">${tp ? tp.toFixed(digits) : '\u2014'}</div>
+                ${tpPips > 0 ? `<div style="font-size:8px;color:var(--green);opacity:.6;margin-top:2px">+${tpPips}p</div>` : ''}
+            </div>
+        </div>
+        ${rr > 0 ? `<div style="display:flex;align-items:center;justify-content:space-between;background:var(--bg0);border-radius:5px;padding:6px 10px;margin-bottom:8px">
+            <span style="font-size:8px;color:var(--txt3);text-transform:uppercase;letter-spacing:.07em">Risk / Reward</span>
+            <span style="font-family:var(--mono);font-weight:700;font-size:13px;color:${rrCol}">${rr.toFixed(1)}R</span>
+            <span style="font-size:8px;color:var(--txt3)">${slPips}p \u2192 ${tpPips}p</span>
+        </div>` : ''}` :
+        `<div style="display:flex;align-items:center;justify-content:center;gap:8px;padding:18px 0;margin-bottom:8px;opacity:.5">
+            <span style="font-size:20px;color:var(--txt3)">&#9711;</span>
+            <span style="font-size:9px;color:var(--txt3);letter-spacing:.1em;text-transform:uppercase">Awaiting setup</span>
+        </div>`;
+
+    return `<div style="background:var(--bg1);${bgAccent ? 'background:var(--bg1)' : ''};border-left:3px solid ${borderColor};padding:14px 15px;display:flex;flex-direction:column">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
+            <div style="display:flex;align-items:baseline;gap:7px">
+                <span style="font-size:15px;font-weight:700;color:var(--txt);letter-spacing:.03em">${symbol}</span>
+                <span style="font-size:8px;color:var(--txt3);letter-spacing:.1em">M15</span>
+            </div>
+            <div style="text-align:right">
+                <div style="font-size:11px;font-weight:700;color:${biasColor};letter-spacing:.04em">${arrow} ${biasLabel}</div>
+                <div style="font-size:8px;color:var(--txt3);margin-top:2px">${timeAgo}</div>
+            </div>
+        </div>
+        ${_buildConfBar(conf)}
+        ${priceBlock}
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-bottom:6px">
+            ${_buildEnvPills(sig.environment)}
+        </div>
+        ${choch  ? `<div style="font-size:9px;color:var(--cyan);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px" title="${_esc(choch)}">\u21ba ${_esc(choch)}</div>` : ''}
+        ${levels ? `<div style="font-size:9px;color:var(--txt3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${_esc(levels)}">\u25c6 ${_esc(levels)}</div>` : ''}
+    </div>`;
+}
+
 function renderMarketScanBreakdown() {
     const container = document.getElementById('signal-cards'); if (!container) return;
     const symbols = ['EURUSD', 'GBPUSD', 'EURJPY', 'GBPJPY'];
-    if (!symbols.every(s => marketScanCache[s])) { container.innerHTML = '<div class="empty-state"><div class="icon">\u27f3</div><div class="msg">Scanning markets\u2026</div></div>'; return; }
-    let html = '<div style="display:grid;gap:16px;padding:20px">';
-    symbols.forEach(symbol => {
-        const sig = marketScanCache[symbol]; if (!sig) return;
-        if (sig.error) { html += `<div style="background:var(--bg0);border:1px solid var(--line);border-radius:8px;padding:16px"><strong style="color:var(--txt)">${symbol}</strong> <span style="color:var(--red)">\u2014 ${_esc(sig.error)}</span></div>`; return; }
-        const bias = sig.bias || '\u2014'; const conf = (sig.confidence || 0);
-        const entry = sig.entry_price ? sig.entry_price.toFixed(5) : '\u2014';
-        const sl = sig.sl_price ? sig.sl_price.toFixed(5) : '\u2014';
-        const tp = sig.tp_price ? sig.tp_price.toFixed(5) : '\u2014';
-        const biasColor = bias === 'LONG' ? 'var(--green)' : bias === 'SHORT' ? 'var(--red)' : 'var(--txt2)';
-        const confColor = conf >= 70 ? 'var(--green)' : conf >= 50 ? 'var(--amber)' : 'var(--red)';
-        let pipRiskHtml = '\u2014';
-        if (sig.entry_price && sig.sl_price) {
-            const pipSize = symbol.includes('JPY') ? 0.01 : 0.0001;
-            const slPips = Math.abs(sig.entry_price - sig.sl_price) / pipSize;
-            const tpPips = Math.abs((sig.tp_price || sig.entry_price) - sig.entry_price) / pipSize;
-            pipRiskHtml = `<div style="display:flex;justify-content:space-between;align-items:center"><span style="color:var(--txt3);font-size:10px">SL</span><span style="color:var(--red);font-family:var(--mono);font-weight:600">${slPips.toFixed(1)} pips</span></div><div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px"><span style="color:var(--txt3);font-size:10px">TP</span><span style="color:var(--green);font-family:var(--mono);font-weight:600">${tpPips.toFixed(1)} pips</span></div>`;
-        }
-        let strengthLabel, strengthColor, strengthBg;
-        if (conf >= 75) { strengthLabel = 'STRONG'; strengthColor = 'var(--green)'; strengthBg = 'rgba(0,255,136,0.1)'; }
-        else if (conf >= 50) { strengthLabel = 'MODERATE'; strengthColor = 'var(--amber)'; strengthBg = 'rgba(255,170,0,0.1)'; }
-        else { strengthLabel = 'WEAK'; strengthColor = 'var(--red)'; strengthBg = 'rgba(255,80,80,0.1)'; }
-        html += `<div style="background:var(--bg0);border:1px solid var(--line);border-radius:8px;padding:16px">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--line)">
-                <div><span style="font-size:13px;font-weight:600;color:var(--txt)">${symbol}</span><span style="font-size:10px;color:var(--txt3);margin-left:8px;letter-spacing:.08em">MARKET SCAN</span></div>
-                <div style="display:flex;gap:8px;align-items:center"><span style="font-size:11px;background:${biasColor};color:#000;padding:4px 8px;border-radius:4px;font-weight:600">${bias}</span><span style="font-size:11px;background:${confColor};color:#000;padding:4px 8px;border-radius:4px;font-weight:600">${conf}% conf</span></div>
-            </div>
-            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;font-size:11px;margin-bottom:12px">
-                <div><div style="color:var(--txt3);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px">Entry</div><div style="font-family:var(--mono);color:var(--txt);font-size:12px;font-weight:500">${entry}</div></div>
-                <div><div style="color:var(--txt3);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px">Stop Loss</div><div style="font-family:var(--mono);color:var(--red);font-size:12px;font-weight:500">${sl}</div></div>
-                <div><div style="color:var(--txt3);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px">Take Profit</div><div style="font-family:var(--mono);color:var(--green);font-size:12px;font-weight:500">${tp}</div></div>
-            </div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
-                <div style="background:var(--bg1);border-left:3px solid var(--cyan);border-radius:4px;padding:10px"><div style="font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Pip Risk / Reward</div>${pipRiskHtml}</div>
-                <div style="background:${strengthBg};border:1px solid ${strengthColor};border-radius:4px;padding:10px;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:4px"><div style="font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:.08em">Trend Strength</div><div style="font-size:15px;font-weight:700;color:${strengthColor};letter-spacing:.06em">${strengthLabel}</div></div>
-            </div>
-            <div style="display:grid;gap:8px;font-size:10px">${renderSignalBreakdown(sig)}</div>
-        </div>`;
-    });
-    html += '</div>'; container.innerHTML = html;
-}
+    if (!symbols.every(s => marketScanCache[s])) {
+        container.innerHTML = '<div class="empty-state"><div class="icon">\u27f3</div><div class="msg">Scanning markets\u2026</div></div>';
+        return;
+    }
 
-function renderSignalBreakdown(sig) {
-    let html = '';
-    if (sig.environment && sig.environment !== 'No active environment') {
-        const envNum = (sig.environment.match(/ENV\s*(\d)/i) || [])[1];
-        const envColors = { '1':'var(--green)', '2':'var(--red)', '3':'var(--cyan)', '4':'var(--amber)' };
-        html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid ${envColors[envNum]||'var(--cyan)'}"><span style="color:var(--txt3)">Environment:</span><span style="color:var(--txt);margin-left:8px;font-weight:500">${_esc(sig.environment)}</span></div>`;
-    } else if (sig.environment) {
-        html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid var(--line)"><span style="color:var(--txt3)">Environment:</span><span style="color:var(--txt2);margin-left:8px">${_esc(sig.environment)}</span></div>`;
-    }
-    if (sig.choch_status && sig.choch_status !== '\u2014') {
-        html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid ${sig.choch_status.includes('\u2713')?'var(--green)':'var(--amber)'}"><span style="color:var(--txt3)">CHoCH:</span><span style="color:var(--txt);margin-left:8px;font-weight:500">${_esc(sig.choch_status)}</span></div>`;
-    }
-    if (sig.level_interaction && sig.level_interaction !== '\u2014') {
-        html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid var(--purple)"><span style="color:var(--txt3)">Key Levels:</span><span style="color:var(--txt);margin-left:8px;font-family:var(--mono);font-size:10px">${_esc(sig.level_interaction)}</span></div>`;
-    }
-    if (sig.ts) {
-        const age = Math.round((Date.now() - new Date(sig.ts).getTime()) / 1000);
-        html += `<div style="background:var(--bg0);padding:8px;border-radius:4px;border-left:2px solid var(--line)"><span style="color:var(--txt3)">Last Scan:</span><span style="color:var(--txt2);margin-left:8px;font-family:var(--mono)">${age < 60 ? age + 's ago' : Math.round(age/60) + 'm ago'}</span></div>`;
-    }
-    return html;
+    const longCount  = symbols.filter(s => (marketScanCache[s]||{}).bias === 'LONG').length;
+    const shortCount = symbols.filter(s => (marketScanCache[s]||{}).bias === 'SHORT').length;
+    const idleCount  = symbols.length - longCount - shortCount;
+
+    const summaryBar = `<div style="display:flex;align-items:center;gap:14px;padding:9px 16px;background:var(--bg1);border-bottom:1px solid var(--line);font-size:9px;text-transform:uppercase;letter-spacing:.08em;flex-shrink:0">
+        <span style="color:var(--txt3)">Signal Board &nbsp;&#xb7;&nbsp; M15</span>
+        <span style="color:var(--green)">&#x2191; ${longCount} Long</span>
+        <span style="color:var(--red)">&#x2193; ${shortCount} Short</span>
+        <span style="color:var(--txt3)">\u25cb ${idleCount} Idle</span>
+        <span style="margin-left:auto;color:var(--txt3)">Auto-refreshes every 5 min</span>
+    </div>`;
+
+    const grid = `<div style="display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);flex:1">${
+        symbols.map(s => buildSignalCard(s, marketScanCache[s])).join('')
+    }</div>`;
+
+    container.innerHTML = summaryBar + grid;
 }
 
 function fetchPositions() { fetch('/bot/positions').then(r => r.json()).then(data => renderPositions(data.positions || [])).catch(() => renderPositions([])); }
