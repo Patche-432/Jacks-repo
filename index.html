@@ -6,57 +6,40 @@
 <title>FORTIS AI Pro</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/core/css/dashboard.css?v=20260415c">
+<link rel="stylesheet" href="/core/css/dashboard.css?v=20260504i">
 </head>
 <body>
 
 <header>
-  <div class="logo">
-    <svg width="100%" height="100%" viewBox="0 0 800 100" role="img" preserveAspectRatio="xMinYMid slice" style="position:absolute;top:0;left:0;width:100%;height:100%">
-      <title>Fortis AI Pro wordmark</title>
-      <desc>Fortis AI Pro wordmark with slogan Perfer et vince</desc>
-
-      <!-- Background Shading -->
-      <defs>
-        <linearGradient id="logoBg" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" style="stop-color:#0a1828;stop-opacity:0.92" />
-          <stop offset="100%" style="stop-color:#1a2a42;stop-opacity:0.88" />
-        </linearGradient>
-        <filter id="glow">
-          <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
-          <feMerge>
-            <feMergeNode in="coloredBlur"/>
-            <feMergeNode in="SourceGraphic"/>
-          </feMerge>
-        </filter>
-      </defs>
-      
-      <!-- Shaded Background Box - Fully Rounded -->
-      <rect x="0" y="8" width="750" height="84" rx="18" ry="18" fill="url(#logoBg)" opacity="0.92" filter="url(#glow)"/>
-      <rect x="0" y="8" width="750" height="84" rx="18" ry="18" fill="none" stroke="#2196F3" stroke-width="1.5" opacity="0.25"/>
-
-      <!-- FORTIS -->
-      <text x="12" y="60" text-anchor="start"
-            font-family="'Arial Black', 'Helvetica Neue', sans-serif"
-            font-size="48" font-weight="900"
-            fill="#F0F4F8" letter-spacing="-2"
-            filter="url(#glow)">FORTIS</text>
-
-      <!-- AI PRO (1 space gap after FORTIS) -->
-      <text x="242" y="60" text-anchor="start"
-            font-family="'Arial Black', 'Helvetica Neue', sans-serif"
-            font-size="48" font-weight="900"
-            fill="#1976D2" letter-spacing="-2"
-            filter="url(#glow)">AGENT ZER0</text>
-
-      <!-- Slogan -->
-      <text x="12" y="80" text-anchor="start"
-            font-family="'Helvetica Neue', Arial, sans-serif"
-            font-size="14" font-weight="600"
-            fill="#42A5F5" letter-spacing="4"
-            filter="url(#glow)">PERFER ET VINCE</text>
-
-    </svg>
+  <!-- Command-centre identity block. Replaces the prior oversized glowy
+       wordmark with a sober, monospaced bug bar: ticker symbol + system
+       name + Latin motto + build metadata, separated by hairline rules.
+       Reads as "trading desk" rather than "game launcher". -->
+  <div class="logo cmd-id">
+    <div class="cmd-id-mark">
+      <span class="cmd-id-glyph">❖</span>
+      <span class="cmd-id-tick">FRT</span>
+    </div>
+    <div class="cmd-id-rule"></div>
+    <div class="cmd-id-name">
+      <span class="cmd-id-line1">FORTIS · AGENT ZERO</span>
+      <span class="cmd-id-line2">FX MULTI-AGENT TRADING SYSTEM</span>
+    </div>
+    <div class="cmd-id-rule"></div>
+    <!-- Latin motto, set in italic small-caps mono so it reads as house
+         identity rather than UI chrome. "endure and conquer" -->
+    <div class="cmd-id-motto" title="Perfer et vince — endure and conquer">
+      PERFER ET VINCE
+    </div>
+    <div class="cmd-id-rule"></div>
+    <div class="cmd-id-meta">
+      <span class="cmd-id-meta-k">VER</span>
+      <span class="cmd-id-meta-v">2.6</span>
+      <span class="cmd-id-meta-k">TF</span>
+      <span class="cmd-id-meta-v">M15</span>
+      <span class="cmd-id-meta-k">PAIRS</span>
+      <span class="cmd-id-meta-v">4</span>
+    </div>
   </div>
 
   <div class="hdr-center">
@@ -67,6 +50,7 @@
     <button class="tab-btn" data-tab="performance" onclick="showTab('performance', this)">Performance</button>
     <button class="tab-btn" data-tab="backtest" onclick="showTab('backtest', this)">Backtest</button>
     <button class="tab-btn" data-tab="snapshot" onclick="showTab('snapshot', this)">Market Watch</button>
+    <button class="tab-btn" data-tab="agents" onclick="showTab('agents', this); initAgentsTab()">Agents</button>
   </div>
 
   <div class="hdr-right">
@@ -126,6 +110,72 @@
             <div class="mt5-row"><span class="mt5-key">Trading</span><span class="mt5-val" id="m-trade">—</span></div>
             <div class="mt5-row"><span class="mt5-key">Equity</span><span class="mt5-val" id="m-equity" style="color:var(--green)">—</span></div>
             <div class="mt5-row"><span class="mt5-key">Balance</span><span class="mt5-val" id="m-balance">—</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Agents — 1 LLM orchestrator + 4 deterministic pair bots -->
+      <!-- Top of the card mirrors the previous Agent Zero card (backend
+           reachability + model + learning loop). Below that, a roster of
+           5 agents shows live status per agent: an LLM-backed orchestrator
+           (Agent 0, sees all 4 bot verdicts and applies portfolio veto /
+           override) and four DETERMINISTIC pair bots (Agents 1–4, no
+           Ollama call — each encodes its pair's tactical rules in Python).
+           The roster updates on every Ollama health poll AND every bot
+           status poll, so connection drops and position changes show
+           within ~2s. -->
+      <div class="sb-block">
+        <div class="sb-heading">
+          <div class="sb-heading-icon purple">⧡</div>
+          Agents
+          <span class="sb-heading-count" id="agents-count">5</span>
+        </div>
+        <div id="ollama-meta" class="mt5-card">
+          <div class="mt5-status-bar">
+            <div class="mt5-dot" id="ollama-dot"></div>
+            <span id="ollama-status-txt" style="color:var(--txt2)">checking…</span>
+          </div>
+          <div class="mt5-info" id="ollama-detail" style="display:none">
+            <div class="mt5-row"><span class="mt5-key">URL</span><span class="mt5-val" id="ol-url">—</span></div>
+            <div class="mt5-row"><span class="mt5-key">Model</span><span class="mt5-val" id="ol-model">—</span></div>
+            <div class="mt5-row"><span class="mt5-key">Loaded</span><span class="mt5-val" id="ol-loaded">—</span></div>
+            <div class="mt5-row" id="ol-learning-row" style="display:none">
+              <span class="mt5-key">Learning</span><span class="mt5-val" id="ol-learning" style="color:var(--green)">—</span>
+            </div>
+          </div>
+          <!-- Agent roster — populated by renderAgentRoster() in dashboard.js. -->
+          <div class="agent-roster" id="agent-roster">
+            <!-- Pre-render the rows so the layout is stable on first paint. -->
+            <div class="agent-row" data-agent-id="orchestrator">
+              <div class="agent-dot"></div>
+              <div class="agent-name">Agent 0</div>
+              <div class="agent-role">Orchestrator</div>
+              <div class="agent-meta">LLM</div>
+            </div>
+            <div class="agent-row" data-agent-id="agent-eurusd" data-symbol="EURUSD">
+              <div class="agent-dot"></div>
+              <div class="agent-name">Bot 1</div>
+              <div class="agent-role">EURUSD</div>
+              <div class="agent-meta">—</div>
+            </div>
+            <div class="agent-row" data-agent-id="agent-gbpusd" data-symbol="GBPUSD">
+              <div class="agent-dot"></div>
+              <div class="agent-name">Bot 2</div>
+              <div class="agent-role">GBPUSD</div>
+              <div class="agent-meta">—</div>
+            </div>
+            <div class="agent-row" data-agent-id="agent-gbpjpy" data-symbol="GBPJPY">
+              <div class="agent-dot"></div>
+              <div class="agent-name">Bot 3</div>
+              <div class="agent-role">GBPJPY</div>
+              <div class="agent-meta">—</div>
+            </div>
+            <div class="agent-row" data-agent-id="agent-eurjpy" data-symbol="EURJPY">
+              <div class="agent-dot"></div>
+              <div class="agent-name">Bot 4</div>
+              <div class="agent-role">EURJPY</div>
+              <div class="agent-meta">—</div>
+            </div>
           </div>
         </div>
       </div>
@@ -274,84 +324,32 @@
         </div>
       </div>
 
-      <!-- Strategy -->
+      <!-- Strategy — self-tuning per pair, hardcoded baselines updated
+           after every backtest. The dashboard renders read-only tiles
+           here; the actual values live in agent_learning_loop.py and
+           are pulled by /api/agent/tuning every 8s. -->
       <div class="sb-block">
         <div class="sb-heading">
           <div class="sb-heading-icon purple">⟡</div>
-          Strategy
+          Per-Pair Strategy
+          <span class="sb-heading-count" id="tuning-source-badge">defaults</span>
         </div>
-
-        <div class="slider-field">
-          <div class="slider-header">
-            <span class="slider-lbl">ATR Tolerance Mult</span>
-            <span class="slider-val" id="v-atr-mult">1.5×</span>
-          </div>
-          <input type="range" id="cfg-atr-mult" min="0.5" max="4" step="0.1" value="1.5"
-            oninput="document.getElementById('v-atr-mult').textContent=parseFloat(this.value).toFixed(1)+'×';updateRR()">
+        <div id="tuning-tiles" style="display:flex;flex-direction:column;gap:8px">
+          <div style="font-size:10px;color:var(--txt3);padding:6px 4px">Loading per-pair strategy…</div>
         </div>
-
-        <div class="slider-field">
-          <div class="slider-header">
-            <span class="slider-lbl">SL ATR Mult</span>
-            <span class="slider-val" id="v-sl-mult">2.5×</span>
-          </div>
-          <input type="range" id="cfg-sl-mult" min="0.5" max="5" step="0.1" value="2.5"
-            oninput="document.getElementById('v-sl-mult').textContent=parseFloat(this.value).toFixed(1)+'×';updateRR()">
-        </div>
-
-        <div class="slider-field">
-          <div class="slider-header">
-            <span class="slider-lbl">TP ATR Mult</span>
-            <span class="slider-val" id="v-tp-mult">4.5×</span>
-          </div>
-          <input type="range" id="cfg-tp-mult" min="1" max="8" step="0.1" value="4.5"
-            oninput="document.getElementById('v-tp-mult').textContent=parseFloat(this.value).toFixed(1)+'×';updateRR()">
-        </div>
-
-        <!-- R:R Preview -->
-        <div style="background:var(--bg0);border:1px solid var(--line);border-radius:5px;padding:9px 11px;margin-bottom:11px">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-            <span style="font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:0.08em">Risk / Reward Ratio</span>
-            <span style="font-size:11px;font-weight:600;color:var(--txt)" id="rr-label">1 : 1.8</span>
-          </div>
-          <div class="rr-preview">
-            <div class="rr-sl" id="rr-sl-bar" style="width:33%"></div>
-            <div class="rr-entry"></div>
-            <div class="rr-tp" id="rr-tp-bar"></div>
-          </div>
-          <div class="rr-label">
-            <span style="color:var(--red)">▼ SL</span>
-            <span>entry</span>
-            <span style="color:var(--green)">TP ▲</span>
-          </div>
+        <div id="tuning-meta" style="font-size:9px;color:var(--txt3);text-align:center;margin-top:6px;font-family:var(--mono)">
+          Auto-tunes after each backtest
         </div>
       </div>
 
-      <!-- Risk Management -->
-      <div class="sb-block">
-        <div class="sb-heading">
-          <div class="sb-heading-icon red">⚔</div>
-          Risk Management
-        </div>
-
-        <div class="slider-field">
-          <div class="slider-header">
-            <span class="slider-lbl">Partial Close R:R</span>
-            <span class="slider-val" id="v-pc-rr">1.0R</span>
-          </div>
-          <input type="range" id="cfg-pc-rr" min="0.5" max="3" step="0.1" value="1.0"
-            oninput="document.getElementById('v-pc-rr').textContent=parseFloat(this.value).toFixed(1)+'R'">
-        </div>
-
-        <div class="slider-field" style="margin-bottom:0">
-          <div class="slider-header">
-            <span class="slider-lbl">BE Buffer (pips)</span>
-            <span class="slider-val" id="v-be-buf">1.0p</span>
-          </div>
-          <input type="range" id="cfg-be-buf" min="0" max="5" step="0.5" value="1.0"
-            oninput="document.getElementById('v-be-buf').textContent=parseFloat(this.value).toFixed(1)+'p'">
-        </div>
-      </div>
+      <!-- Hidden inputs preserved so existing form submission code keeps
+           working. Defaults match agent_learning_loop.DEFAULT_PARAMS so
+           the bot trades on sensible values until the first backtest. -->
+      <input type="hidden" id="cfg-atr-mult" value="1.5">
+      <input type="hidden" id="cfg-sl-mult"  value="2.5">
+      <input type="hidden" id="cfg-tp-mult"  value="4.5">
+      <input type="hidden" id="cfg-pc-rr"   value="1.0">
+      <input type="hidden" id="cfg-be-buf"  value="1.0">
 
     </div>
   </div>
@@ -359,23 +357,31 @@
   <!-- ── MAIN ── -->
   <div class="main">
 
-    <!-- SIGNALS -->
+    <!-- SIGNALS — Agent Decision Board -->
     <div class="tab-panel active" id="tab-signals">
-      <div id="signal-cards">
-        <div class="empty-state">
-          <div class="icon">⟳</div>
-          <div class="msg">Waiting for comprehensive market scan…</div>
-        </div>
-      </div>
+      <!-- Portfolio risk strip -->
+      <div id="sig-risk-strip" style="display:flex;gap:10px;padding:10px 16px 0;flex-wrap:wrap"></div>
+      <!-- 4-pair decision cards -->
+      <div id="signal-cards"></div>
     </div>
 
-    <!-- ZERO LOG (formerly AI Log) -->
+    <!-- ZERO LOG — Orchestrator thoughts per pair -->
     <div class="tab-panel" id="tab-thoughts">
-      <div class="thoughts-bar">
-        <span class="thoughts-count" id="thought-count">0 entries</span>
-        <button class="btn" onclick="clearThoughts()">Clear log</button>
+      <!-- Portfolio-level header (preflight, portfolio gate) -->
+      <div id="zl-portfolio-bar" style="padding:10px 16px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span style="font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--txt3)">AGENT 0 · ORCHESTRATOR THOUGHTS</span>
+        <span id="thought-count" style="font-size:9px;color:var(--txt3);margin-left:4px">0 entries</span>
+        <button class="btn" onclick="clearThoughts()" style="margin-left:auto;font-size:9px;padding:4px 10px">Clear</button>
       </div>
-      <div id="thoughts"></div>
+      <!-- 4 pair tiles -->
+      <div id="zl-tiles" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px"></div>
+      <!-- Portfolio-level thought feed (symbol=* events) -->
+      <div id="zl-portfolio-feed" style="margin:0 12px 12px;background:var(--bg1);border:1px solid var(--line);border-radius:8px;overflow:hidden">
+        <div style="padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--line);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--txt3)">
+          PORTFOLIO GATE
+        </div>
+        <div id="zl-portfolio-entries" style="max-height:100px;overflow-y:auto"></div>
+      </div>
     </div>
 
     <!-- POSITIONS -->
@@ -396,55 +402,100 @@
     <!-- PERFORMANCE -->
     <div class="tab-panel" id="tab-performance">
       <div class="kpi-grid">
-        <div class="kpi-card">
+        <!--
+          Every card on this row now follows the same pattern:
+            • headline value (.kpi-value) — coloured by quality
+              threshold (positive / warn / negative classes set on the
+              parent .kpi-card by renderKPIs in dashboard.js).
+            • supporting sub-line (.kpi-sub) — concrete numbers backing
+              the headline (e.g. "2W · 1L", "+$130 / −$53"). Populated
+              from the kpis payload's *_count / *_abs fields.
+            • static descriptor (.kpi-deco) — what the value means.
+          Cards whose value is intrinsically a loss measure (Max DD,
+          Current DD) get the loss-measure class so the headline stays
+          red regardless of magnitude.
+        -->
+        <div class="kpi-card" id="kpi-winrate-card">
           <div class="kpi-label">Win Rate</div>
           <div class="kpi-value" id="kpi-winrate">0.0%</div>
-          <div class="kpi-deco">trades</div>
+          <div class="kpi-sub"   id="kpi-winrate-sub">— W · — L</div>
+          <div class="kpi-deco">closed trades</div>
         </div>
-        <div class="kpi-card">
+        <div class="kpi-card" id="kpi-profitfactor-card">
           <div class="kpi-label">Profit Factor</div>
           <div class="kpi-value" id="kpi-profitfactor">0.00</div>
-          <div class="kpi-deco">gross/loss</div>
+          <div class="kpi-sub"   id="kpi-profitfactor-sub">— gross · — loss</div>
+          <div class="kpi-deco">gross win / gross loss</div>
         </div>
-        <div class="kpi-card">
+        <div class="kpi-card" id="kpi-trades-card">
           <div class="kpi-label">Total Trades</div>
           <div class="kpi-value" id="kpi-trades">0</div>
-          <div class="kpi-deco">executed</div>
+          <div class="kpi-sub"   id="kpi-trades-sub">— closed · — open</div>
+          <div class="kpi-deco">last 90 days</div>
         </div>
-        <div class="kpi-card">
+        <div class="kpi-card" id="kpi-return-card">
           <div class="kpi-label">Equity Return</div>
           <div class="kpi-value" id="kpi-return">0.00%</div>
-          <div class="kpi-deco">ytd</div>
+          <div class="kpi-sub"   id="kpi-return-sub">$0.00 net</div>
+          <div class="kpi-deco">realised since start</div>
         </div>
-        <div class="kpi-card">
+        <div class="kpi-card loss-measure" id="kpi-drawdown-card">
           <div class="kpi-label">Max Drawdown</div>
           <div class="kpi-value" id="kpi-drawdown">0.00%</div>
-          <div class="kpi-deco">peak-trough</div>
+          <div class="kpi-sub"   id="kpi-drawdown-sub">−$0.00 peak-trough</div>
+          <div class="kpi-deco">worst observed</div>
         </div>
-        <div class="kpi-card">
+        <div class="kpi-card" id="kpi-sharpe-card">
           <div class="kpi-label">Sharpe Ratio</div>
           <div class="kpi-value" id="kpi-sharpe">0.00</div>
-          <div class="kpi-deco">risk-adjusted</div>
+          <div class="kpi-sub"   id="kpi-sharpe-sub">no rating</div>
+          <div class="kpi-deco">risk-adjusted, annualised</div>
         </div>
-        <div class="kpi-card">
+        <div class="kpi-card" id="kpi-avgratio-card">
           <div class="kpi-label">Avg Win/Loss</div>
           <div class="kpi-value" id="kpi-avgratio">0.00</div>
-          <div class="kpi-deco">r-multiple</div>
+          <div class="kpi-sub"   id="kpi-avgratio-sub">$0 win / $0 loss</div>
+          <div class="kpi-deco">avg payoff ratio</div>
         </div>
-        <div class="kpi-card">
+        <div class="kpi-card loss-measure" id="kpi-currentdd-card">
           <div class="kpi-label">Current Drawdown</div>
           <div class="kpi-value" id="kpi-currentdd">0.00%</div>
-          <div class="kpi-deco">unrealized</div>
+          <div class="kpi-sub"   id="kpi-currentdd-sub">−$0.00 from peak</div>
+          <div class="kpi-deco">live floating</div>
         </div>
-        <div class="kpi-card">
+        <div class="kpi-card" id="kpi-recovery-card">
           <div class="kpi-label">Recovery Factor</div>
           <div class="kpi-value" id="kpi-recovery">0.00</div>
-          <div class="kpi-deco">profit/drawdown</div>
+          <div class="kpi-sub"   id="kpi-recovery-sub">$0 net / $0 max DD</div>
+          <div class="kpi-deco">net P&L per $ of DD</div>
         </div>
-        <div class="kpi-card">
+        <div class="kpi-card" id="kpi-sortino-card">
           <div class="kpi-label">Sortino Ratio</div>
           <div class="kpi-value" id="kpi-sortino">0.00</div>
-          <div class="kpi-deco">downside risk</div>
+          <div class="kpi-sub"   id="kpi-sortino-sub">no rating</div>
+          <div class="kpi-deco">downside-only risk</div>
+        </div>
+        <!--
+          May 2026 — BUY vs SELL breakdown.
+          Two compact rows (BUY / SELL) showing wins, losses, win-rate
+          and net P&L for closed trades over the same 90-day window the
+          rest of this page reports on. The per-row text is populated
+          by `_renderDirectionBreakdown()` reading from
+          `/bot/performance` → `kpis.direction_breakdown`.
+        -->
+        <div class="kpi-card" id="kpi-direction-card">
+          <div class="kpi-label">BUY vs SELL</div>
+          <div id="kpi-direction-body" style="display:flex;flex-direction:column;gap:4px;margin-top:6px;font-size:12px;line-height:1.45">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+              <span style="color:var(--green,#2ecc71);font-weight:700;letter-spacing:.04em;font-size:11px">BUY</span>
+              <span id="kpi-direction-buy" style="color:var(--txt3)">no data</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+              <span style="color:var(--red,#ff6b6b);font-weight:700;letter-spacing:.04em;font-size:11px">SELL</span>
+              <span id="kpi-direction-sell" style="color:var(--txt3)">no data</span>
+            </div>
+          </div>
+          <div class="kpi-deco">closed trades · 90d</div>
         </div>
       </div>
 
@@ -608,8 +659,13 @@
       </div>
     </div>
 
+    <!-- AGENTS TAB -->
+    <div class="tab-panel" id="tab-agents"></div>
+
   </div>
 </div>
-<script src="/core/js/dashboard.js?v=20260415c"></script>
+<script src="/core/js/dashboard.js?v=20260504h"></script>
+<script src="/core/js/memory-panel.js?v=20260509a"></script>
+<script src="/core/js/agents.js?v=20260504h"></script>
 </body>
 </html>

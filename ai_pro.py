@@ -1,19 +1,25 @@
 """
 ╔════════════════════════════════════════════════════════════════════╗
-║                    ⚡ FORTIS AGENT ZERO ⚡                        ║
-║   CHoCH + Daily Levels Strategy — Agent Zero Edition              ║
+║                    ⚡ FORTIS MULTI-AGENT SYSTEM ⚡                 ║
+║   CHoCH + Daily Levels Strategy — Multi-Agent Edition             ║
 ╚════════════════════════════════════════════════════════════════════╝
 
-Merges the complete FORTIS signal engine (CHoCH + Continuation on 4
-environments, ATR-based SL/TP) with Agent Zero, the single Ollama-backed
-trader persona in ai_agent.py:
+Agent architecture:
 
-  ► Agent Zero       — single Ollama-backed trader (see ai_agent.py) that
-                       reviews every signal on quality grounds AND
-                       actively manages every live position like a real
-                       day trader (tighten / close_early / hold). The
-                       directional bias gate is the strategy's POC bias
-                       filter, applied upstream in generate_trade_signal.
+  ► Agent 0 (Orchestrator) — Portfolio-level risk coordinator. Runs once
+                              per poll cycle BEFORE signal generation.
+                              Collects verdicts from all pair agents,
+                              applies portfolio-wide rules (daily loss,
+                              position caps, verdict ordering), and decides
+                              what actually reaches the broker. No LLM call
+                              — pure Python rule engine in Bot class.
+
+  ► Agent 1 (EURUSD)       — Tight, liquid pair. Aggressive trailing once
+  ► Agent 2 (GBPUSD)         1R in profit. Pair-specific LLM persona via
+  ► Agent 3 (GBPJPY)         PairAgent in ai_agent.py. Sole job: manage
+  ► Agent 4 (EURJPY)         open positions. No signal review. No execution.
+                              Verdicts reported UP to Agent 0.
+
   ► Thought Logger   — thread-safe in-memory AI reasoning log (last 120)
   ► Trade Memory     — JSON persistence (last 100 trades, win/loss stats)
   ► Flask Dashboard  — REST API + embedded UI at http://localhost:5000
@@ -25,13 +31,13 @@ ENV 2 │ CHoCH SELL at PDH — failed Higher High anchored at Previous Day High
 ENV 3 │ Continuation BUY  — broke above PDH, retesting it as support
 ENV 4 │ Continuation SELL — broke below PDL, retesting it as resistance
 
-All environments require level interaction for confirmation.
-CHoCH signals have priority (confidence 85) over Continuation (65-75).
-Auto-trade fires when Agent Zero approves a signal.
+Poll cycle flow (each poll_secs interval):
+  Phase 1: _portfolio_risk_cycle()  — Agent 0 orchestrates all pair agents
+  Phase 2: _tick_signals_only(sym)  — signal gen + entry execution per symbol
 
 Usage:
-    python ai_pro.py              # starts Flask on :5000, Agent Zero idle
-    python ai_pro.py --run        # starts Agent Zero immediately on EURUSD
+    python ai_pro.py              # starts Flask on :5000
+    python ai_pro.py --run        # starts bot immediately on default symbols
 
 Requirements:
     pip install flask flask-cors MetaTrader5 numpy pandas pyyaml
@@ -147,6 +153,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+# ── Load .env file if present (python-dotenv) ─────────────────────────────
+# This means OLLAMA_URL, OLLAMA_MODEL, AI_BACKEND, FORTIS_PORT etc. can be
+# set in a .env file in the repo root and will be available to os.getenv()
+# without any manual export. Falls back silently if dotenv isn't installed
+# so the code keeps working when the package is missing.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _env_file = Path(__file__).resolve().parent / ".env"
+    if _env_file.exists():
+        _load_dotenv(dotenv_path=_env_file, override=False)
+        # override=False: shell environment variables take precedence over .env
+except ImportError:
+    pass  # python-dotenv not installed; env vars must be set manually
+
 import numpy as np
 import pandas as pd
 
@@ -171,6 +191,40 @@ except Exception as _agent_exc:       # pragma: no cover
     print(f"[ai_pro] Failed to import ai_agent: "
           f"{type(_agent_exc).__name__}: {_agent_exc}", file=_sys.stderr)
     _tb.print_exc(file=_sys.stderr)
+
+# Agent learning loop — applies feature-importance weights from the most
+# recent backtest run (backtest_insights.json) to per-signal confidence.
+# Falls back to a no-op if the module or insights file is missing, so the
+# strategy keeps working even on a fresh checkout that has never run a
+# backtest.
+try:
+    from agent_learning_loop import get_learning_loop
+    _LEARNING_LOOP_OK = True
+except Exception as _ll_exc:          # pragma: no cover
+    get_learning_loop = None  # type: ignore[assignment]
+    _LEARNING_LOOP_OK = False
+    import sys as _sys
+    print(f"[ai_pro] Failed to import agent_learning_loop: "
+          f"{type(_ll_exc).__name__}: {_ll_exc}", file=_sys.stderr)
+
+
+def _apply_learning_loop(symbol: str, base_conf: int,
+                          current_price: float, entry: float, sl: float,
+                          poc: Optional[float]) -> int:
+    """Tiny wrapper so each ENV call site stays a single line.
+
+    Returns base_conf untouched if the learning loop isn't importable or
+    raises. The strategy must never crash because of a learning-loop bug.
+    """
+    if not _LEARNING_LOOP_OK or get_learning_loop is None:
+        return base_conf
+    try:
+        return get_learning_loop().apply_learned_weights(
+            symbol, base_conf, current_price, entry, sl, poc=poc,
+        )
+    except Exception as exc:
+        log.debug("learning loop adjustment failed for %s: %s", symbol, exc)
+        return base_conf
 
 logging.basicConfig(
     level=logging.INFO,
@@ -538,6 +592,18 @@ class AgentZeroBot:
         self._ai_last_review_ts: dict      = {}   # ticket -> unix seconds (last Agent Zero risk review)
         self._ai_last_heartbeat_ts: dict   = {}   # ticket -> unix seconds (last "monitoring" log)
 
+        # Per-symbol margin circuit breaker. mt5.order_check() runs before
+        # every order_send so we never hit the broker with a request that
+        # will be rejected for "No money" (retcode 10019). After
+        # _margin_breaker_threshold consecutive pre-check failures on a
+        # symbol, new entries on that symbol are paused until a future
+        # pre-check succeeds or the bot operator calls reset_margin_breaker().
+        # Existing positions are still managed by the orchestrator/agent.
+        self._margin_failure_counts: dict      = {}   # symbol -> int
+        self._margin_breaker_last_reason: dict = {}   # symbol -> str
+        self._margin_breaker_lock              = threading.Lock()
+        self._margin_breaker_threshold         = 3
+
     def mt5_snapshot(self) -> dict:
         return dict(self._mt5_info_cache)
 
@@ -868,7 +934,7 @@ class AgentZeroBot:
             "price":        close_price,
             "deviation":    20,
             "magic":        234000,
-            "comment":      "AgentZero close",
+            "comment":      "Fortis close",
             "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": filling,
         }
@@ -883,6 +949,21 @@ class AgentZeroBot:
                 volume=volume,
                 pnl=float(position.profit),
             )
+            # ── Agent Zero memory: label the decision that managed this ticket ──
+            try:
+                from agent_memory import get_memory as _amem
+                profit_pips = float(position.profit) / max(volume, 0.01) / 10.0
+                _outcome = ("WIN" if float(position.profit) > 0
+                            else "LOSS" if float(position.profit) < 0
+                            else "BE")
+                _amem().record_outcome(
+                    ticket=ticket,
+                    outcome=_outcome,
+                    profit_pips=profit_pips,
+                    profit_usd=float(position.profit),
+                )
+            except Exception:
+                pass
             return {
                 "success": True, "ticket": ticket,
                 "message": f"Closed #{ticket} @ {result.price:.5f}"
@@ -961,17 +1042,20 @@ class AgentZeroBot:
         else:
             fresh_struct = {"fresh_structure": False, "structure_type": None}
 
-        # ---------- Single-path agent risk review ----------
-        # Agent Zero is the sole risk manager. He can only TIGHTEN a stop
-        # or request an EARLY close — never loosen, never override the
-        # broker's hard SL. If he is offline or raises, we HOLD (the
-        # broker's hard SL is always authoritative anyway). There is no
-        # second opinion to consult — that is intentional.
+        # ---------- Pair-bot risk review (deterministic, no LLM) ----------
+        # As of the May 2026 refactor, position management is handled by
+        # 4 deterministic pair bots (one per pair) via
+        # `ai_agent.get_pair_agent(symbol).manage_position(ctx)`. The bot
+        # encodes that pair's tactical rules in Python — no Ollama call,
+        # so this path is now both faster and more predictable.
+        #
+        # If `ai_agent` itself failed to import (e.g. broken install) we
+        # HOLD and let the broker's hard SL do its job.
         if not (_AGENT_IMPORT_OK and _ai_agent is not None):
             why = (f"{type(_agent_import_err).__name__}: {_agent_import_err}"
                    if _agent_import_err else "unknown import error")
             log_thought("ai_risk", symbol, "error",
-                        f"#{ticket} Agent Zero offline — holding "
+                        f"#{ticket} pair bot module offline — holding "
                         f"(broker SL still active).",
                         detail=f"ai_agent import failed: {why}",
                         action="hold")
@@ -980,7 +1064,7 @@ class AgentZeroBot:
         try:
             log_thought(
                 "ai_risk", symbol, "review_start",
-                f"Asking Ollama agent about #{ticket} {direction} "
+                f"Pair bot reviewing #{ticket} {direction} "
                 f"({profit_pts:+.0f}pts, peak {peak:.0f}pts)",
                 detail=(f"entry={entry:.5f} price={cur_price:.5f} "
                         f"SL={cur_sl:.5f} TP={cur_tp:.5f}"),
@@ -996,7 +1080,7 @@ class AgentZeroBot:
                 notes=(f"trend_reason={hh_ll_status.get('reason','')} "
                        f"struct_reason={structure_status.get('reason','')}"),
             )
-            verdict = _ai_agent.get_agent_zero().review(ctx)
+            verdict = _ai_agent.get_pair_agent(symbol).manage_position(ctx)
             action  = str(verdict.get("action", "hold"))
             reason  = str(verdict.get("reason", ""))[:120]
 
@@ -1076,8 +1160,7 @@ class AgentZeroBot:
             price  = float(tick_.bid) if is_buy else float(tick_.ask)
             profit_pts = ((price - entry) / point if is_buy
                           else (entry - price) / point)
-            # Lightweight heartbeat so the dashboard shows continuous AI
-            # supervision between prompt-driven reviews.
+            # Lightweight heartbeat so the dashboard shows continuous supervision.
             now_ts = time.time()
             last_hb = self._ai_last_heartbeat_ts.get(ticket, 0.0)
             if now_ts - last_hb >= self.MONITOR_HEARTBEAT_SECS:
@@ -1089,46 +1172,31 @@ class AgentZeroBot:
                     f"SL={cur_sl:.5f} TP={cur_tp:.5f}",
                 )
 
-            # -- AI review: tick-counter OR time-based, whichever fires first.
-            # Time-based gate ensures reviews still happen across bot restarts
-            # (the in-memory tick counter resets to 0 every time the bot boots,
-            # so prior versions could go forever without reviewing on a flaky
-            # process).
+            # Pair bots are deterministic Python — no Ollama call, so we
+            # run them every poll cycle (no throttle needed). The old
+            # tick/time gate existed to rate-limit expensive LLM calls;
+            # that cost is now gone.
             if self.use_ai:
-                cnt = self._ai_tick_counters.get(ticket, 0) + 1
-                self._ai_tick_counters[ticket] = cnt
-                last_review = self._ai_last_review_ts.get(ticket, 0.0)
-                tick_due = cnt >= self.AI_REVIEW_TICKS
-                time_due = (now_ts - last_review) >= self.AI_REVIEW_MIN_SECS
-                if tick_due or (time_due and last_review > 0):
-                    self._ai_tick_counters[ticket] = 0
-                    self._ai_last_review_ts[ticket] = now_ts
-                    updated = mt5.positions_get(ticket=ticket)
-                    p2 = updated[0] if updated else pos
-                    action = self._ai_risk_review_position(
-                        p2, symbol, point, digits, atr
-                    )
-                    if action:
-                        if action["action"] == "close":
-                            r = self._close_position(p2)
-                            results.append(r)
-                        elif action["action"] == "move_sl":
-                            updated2 = mt5.positions_get(ticket=ticket)
-                            p3 = updated2[0] if updated2 else p2
-                            r = self._modify_sl(p3, action["new_sl"])
-                            results.append(r)
-                elif last_review == 0.0:
-                    # First time seeing this ticket — seed the timer so the
-                    # time-based gate has a baseline.
-                    self._ai_last_review_ts[ticket] = now_ts
+                updated = mt5.positions_get(ticket=ticket)
+                p2 = updated[0] if updated else pos
+                action = self._ai_risk_review_position(
+                    p2, symbol, point, digits, atr
+                )
+                if action:
+                    if action["action"] == "close":
+                        r = self._close_position(p2)
+                        results.append(r)
+                    elif action["action"] == "move_sl":
+                        updated2 = mt5.positions_get(ticket=ticket)
+                        p3 = updated2[0] if updated2 else p2
+                        r = self._modify_sl(p3, action["new_sl"])
+                        results.append(r)
 
-        # Clean up state for closed positions
+        # Clean up state for closed positions.
         active = {int(p.ticket) for p in (mt5.positions_get(symbol=symbol) or [])}
-        for t in list(self._ai_tick_counters):
+        for t in list(self._ai_last_heartbeat_ts):
             if t not in active:
-                del self._ai_tick_counters[t]
                 self._ai_peak_profit.pop(t, None)
-                self._ai_last_review_ts.pop(t, None)
                 self._ai_last_heartbeat_ts.pop(t, None)
 
         return results
@@ -1447,75 +1515,17 @@ class AgentZeroBot:
         }
 
     # ------------------------------------------------------------------ #
-    # Signal Review — Agent Zero approves/rejects raw strategy signal     #
     # ------------------------------------------------------------------ #
-
-    def _ai_review_signal(self, symbol: str, signal: dict,
-                           df: pd.DataFrame) -> dict:
-        """
-        Single-path entry review via Agent Zero (ai_agent.py).
-
-        IMPORTANT — bias gate has moved upstream to the strategy.
-        `generate_trade_signal` now applies the POC bias filter (BUY only
-        above POC, SELL only below POC) BEFORE this method is called, so
-        any signal reaching the agent has already passed the bias gate.
-        Agent Zero is now a pure quality reviewer: he sanity-checks the
-        setup but does not re-apply bias. Returns:
-
-          {"approve": bool, "reason": str, "confidence": float}
-
-        If Agent Zero is offline (module import failed or he raises), we
-        SAFE-REJECT the signal — the broker-side hard SL remains
-        authoritative regardless.
-        """
-        direction = signal.get("signal", "")
-        env       = signal.get("signal_source", "unknown")
-
-        # Hard guard — Agent Zero must be importable.
-        if not (_AGENT_IMPORT_OK and _ai_agent is not None):
-            why = (f"{type(_agent_import_err).__name__}: {_agent_import_err}"
-                   if _agent_import_err else "unknown import error")
-            log_thought(
-                "ai_entry", symbol, "error",
-                "Agent Zero offline — safe-rejecting signal.",
-                detail=f"ai_agent import failed: {why}",
-                action="hold", confidence=0.0,
-            )
-            return {"approve": False,
-                    "reason": f"Agent Zero offline — safe reject ({why})",
-                    "confidence": 0.0}
-
-        try:
-            log_thought(
-                "ai_entry", symbol, "review_start",
-                f"Sending {direction} [{env}] to Ollama agent for review",
-                detail=str(signal.get("reason", ""))[:120],
-                action=direction.lower() if direction else None,
-            )
-            verdict    = _ai_agent.get_agent_zero().review(signal, symbol=symbol, df=df)
-            approve    = bool(verdict.get("approve", False))
-            reason     = str(verdict.get("reason", "")).strip() or "no reason"
-            ai_conf    = float(verdict.get("confidence", 0.0) or 0.0)
-            htf_detail = str(verdict.get("htf_detail", "?"))
-            log_thought(
-                "ai_entry", symbol, "verdict",
-                f"Ollama agent {'APPROVED' if approve else 'REJECTED'}: {reason[:80]}",
-                detail=(f"{direction} [{env}] conf={ai_conf:.2f} | "
-                        f"htf={htf_detail}"),
-                action=direction.lower() if approve else "hold",
-                confidence=ai_conf,
-            )
-            return {"approve": approve, "reason": reason, "confidence": ai_conf}
-        except Exception as exc:
-            log_thought(
-                "ai_entry", symbol, "error",
-                f"Agent Zero raised {type(exc).__name__} — safe-rejecting signal.",
-                detail=str(exc)[:200],
-                action="hold", confidence=0.0,
-            )
-            return {"approve": False,
-                    "reason": f"Agent Zero raised {type(exc).__name__}: {exc!s} — safe reject",
-                    "confidence": 0.0}
+    # Entry-review path was removed in May 2026                         #
+    # ------------------------------------------------------------------ #
+    #
+    # `_ai_review_signal` and the LLM entry-review path were dropped when
+    # the agent layer was restructured around an LLM portfolio orchestrator
+    # plus 4 deterministic pair bots. The strategy's POC bias filter (in
+    # `generate_trade_signal`) is now the sole filter between a triggered
+    # setup and the broker. The legacy `signal["ai_approved"]` field is
+    # still set to True so dashboard code, history JSON, and log readers
+    # don't break, but no LLM is consulted on entries.
 
     # ------------------------------------------------------------------ #
     # HTF bias detection                                                   #
@@ -1675,9 +1685,10 @@ class AgentZeroBot:
                 and near_low_choch and failed_low_at_pdl):
             entry, sl, tp = level_set(True)
             vp_score, vp_note, comps = profile_adjustment(1)
+            base_conf = 85
             triggered.append((1, {
                 "signal": "BUY", "signal_source": "CHoCH-BUY@PDL",
-                "confidence": max(60, min(95, 85 + vp_score)),
+                "confidence": max(60, min(95, base_conf + vp_score)),
                 "reason": (f"ENV1 — CHoCH BUY: failed LL at PDL "
                            f"{daily_levels['low']:.5f} ±{signal['dynamic_zone_pips']}p. "
                            f"{choch_data['reason']}. VP: {vp_note}"),
@@ -1698,9 +1709,10 @@ class AgentZeroBot:
                 and near_high_choch and failed_high_at_pdh):
             entry, sl, tp = level_set(False)
             vp_score, vp_note, comps = profile_adjustment(2)
+            base_conf = 85
             triggered.append((1, {
                 "signal": "SELL", "signal_source": "CHoCH-SELL@PDH",
-                "confidence": max(60, min(95, 85 + vp_score)),
+                "confidence": max(60, min(95, base_conf + vp_score)),
                 "reason": (f"ENV2 — CHoCH SELL: failed HH at PDH "
                            f"{daily_levels['high']:.5f} ±{signal['dynamic_zone_pips']}p. "
                            f"{choch_data['reason']}. VP: {vp_note}"),
@@ -1780,17 +1792,14 @@ class AgentZeroBot:
                 neutral["atr"] = signal.get("atr")
                 return neutral
 
-            # AI review gate (post-POC). Strategy already gated the bias —
-            # the agent is now a pure quality reviewer, not a bias filter.
-            if self.use_ai:
-                review = self._ai_review_signal(symbol, signal, df)
-                signal["ai_approved"]   = review["approve"]
-                signal["ai_reason"]     = review["reason"]
-                signal["ai_confidence"] = review["confidence"]
-            else:
-                signal["ai_approved"]   = True
-                signal["ai_reason"]     = "AI disabled"
-                signal["ai_confidence"] = 1.0
+            # Entry review removed in May 2026 refactor: strategy POC gate
+            # above is the sole bias filter; the LLM now sits at the
+            # orchestrator layer (cross-pair / portfolio decisions only).
+            # Keep the legacy fields in the signal dict so older dashboard
+            # code, log readers, and history JSON files don't break.
+            signal["ai_approved"]   = True
+            signal["ai_reason"]     = "entry review dropped (POC gate is bias filter)"
+            signal["ai_confidence"] = 1.0
         else:
             def _why(env: int) -> str:
                 """
@@ -1886,6 +1895,118 @@ class AgentZeroBot:
                            _fmt(3, env3), _fmt(4, env4)])
 
     # ------------------------------------------------------------------ #
+    # Margin circuit breaker                                              #
+    # ------------------------------------------------------------------ #
+
+    # Retcodes that indicate insufficient margin / funds — fold into the
+    # breaker rather than treating them as transient. Kept narrow so we
+    # don't accidentally swallow unrelated errors.
+    _NO_MONEY_RETCODES: tuple = (10019,)  # TRADE_RETCODE_NO_MONEY
+
+    def is_margin_breaker_armed(self, symbol: str) -> bool:
+        """True if the per-symbol margin breaker is currently suppressing
+        new entries for `symbol`."""
+        with self._margin_breaker_lock:
+            n = int(self._margin_failure_counts.get(symbol, 0))
+            return n >= self._margin_breaker_threshold
+
+    def margin_breaker_status(self) -> dict:
+        """Snapshot of the breaker for the dashboard."""
+        with self._margin_breaker_lock:
+            return {
+                "threshold":       self._margin_breaker_threshold,
+                "failure_counts":  dict(self._margin_failure_counts),
+                "armed_symbols": [
+                    s for s, n in self._margin_failure_counts.items()
+                    if n >= self._margin_breaker_threshold
+                ],
+                "last_reason":     dict(self._margin_breaker_last_reason),
+            }
+
+    def reset_margin_breaker(self, symbol: "Optional[str]" = None) -> None:
+        """Manual reset for the breaker. If `symbol` is None, resets every
+        symbol; otherwise just that one."""
+        with self._margin_breaker_lock:
+            if symbol is None:
+                self._margin_failure_counts.clear()
+                self._margin_breaker_last_reason.clear()
+            else:
+                self._margin_failure_counts.pop(symbol, None)
+                self._margin_breaker_last_reason.pop(symbol, None)
+        log.info("Margin breaker reset%s", f" for {symbol}" if symbol else " (all)")
+
+    def _record_margin_failure(self, symbol: str, reason: str) -> int:
+        """Increment per-symbol failure counter. Returns the new count."""
+        with self._margin_breaker_lock:
+            n = int(self._margin_failure_counts.get(symbol, 0)) + 1
+            self._margin_failure_counts[symbol] = n
+            self._margin_breaker_last_reason[symbol] = reason
+            return n
+
+    def _record_margin_success(self, symbol: str) -> None:
+        """Reset per-symbol failure counter after a clean pre-check."""
+        with self._margin_breaker_lock:
+            if symbol in self._margin_failure_counts:
+                self._margin_failure_counts.pop(symbol, None)
+                self._margin_breaker_last_reason.pop(symbol, None)
+
+    def _margin_pre_check(self, mt5, request: dict) -> "tuple[bool, dict]":
+        """
+        Run mt5.order_check() against the prepared request and decide
+        whether to send it. Returns (ok, info) where info carries the
+        broker's check result for logging.
+
+        ok == True  → safe to call mt5.order_send(request).
+        ok == False → request would be rejected; caller must NOT send.
+
+        We treat result.retcode == TRADE_RETCODE_DONE (10009) AND retcode
+        == 0 (some brokers return 0 from order_check on success) as
+        "ok to send". Anything else aborts the send.
+
+        If order_check itself returns None we treat it as a hard fail so
+        we never silently fall through to order_send.
+        """
+        try:
+            check = mt5.order_check(request)
+        except Exception as exc:
+            return False, {
+                "ok":       False,
+                "retcode":  None,
+                "comment":  f"order_check() raised: {exc}",
+            }
+
+        if check is None:
+            try:
+                code, msg = mt5.last_error()
+            except Exception:
+                code, msg = 0, ""
+            return False, {
+                "ok":       False,
+                "retcode":  None,
+                "comment":  f"order_check() returned None [{code}] {msg}",
+            }
+
+        retcode = int(getattr(check, "retcode", -1))
+        comment = str(getattr(check, "comment", "") or "")
+        info = {
+            "ok":            False,
+            "retcode":       retcode,
+            "comment":       comment,
+            "balance":       float(getattr(check, "balance", 0.0) or 0.0),
+            "equity":        float(getattr(check, "equity", 0.0) or 0.0),
+            "margin":        float(getattr(check, "margin", 0.0) or 0.0),
+            "margin_free":   float(getattr(check, "margin_free", 0.0) or 0.0),
+            "margin_level":  float(getattr(check, "margin_level", 0.0) or 0.0),
+            "no_money":      retcode in self._NO_MONEY_RETCODES,
+        }
+        # TRADE_RETCODE_DONE (10009) means "request is valid"; some brokers
+        # additionally return 0 on a clean check. Either is a green light.
+        if retcode in (0, mt5.TRADE_RETCODE_DONE):
+            info["ok"] = True
+            return True, info
+        return False, info
+
+    # ------------------------------------------------------------------ #
     # Trade execution                                                       #
     # ------------------------------------------------------------------ #
 
@@ -1896,6 +2017,23 @@ class AgentZeroBot:
             return {"success": False, "message": "MT5 not initialized"}
         if signal["signal"] == "neutral":
             return {"success": False, "message": "Neutral — no trade"}
+        # Margin circuit breaker — refuse new entries on a symbol that
+        # has hit the consecutive-failure threshold. Operator must call
+        # reset_margin_breaker(symbol) (or restart the bot) to retry.
+        if self.is_margin_breaker_armed(symbol):
+            with self._margin_breaker_lock:
+                reason = self._margin_breaker_last_reason.get(symbol,
+                          "margin pre-check threshold exceeded")
+            log_thought(
+                "execution", symbol, "breaker_armed",
+                f"Skipping {signal.get('signal','?')} — margin breaker armed: {reason}",
+                action="hold",
+            )
+            return {
+                "success": False,
+                "message": f"Margin breaker armed for {symbol}: {reason}",
+                "breaker": "margin",
+            }
         if not signal.get("stop_loss") or not signal.get("take_profit"):
             return {"success": False, "message": "SL/TP missing"}
         if not self._select_symbol(symbol):
@@ -1966,6 +2104,48 @@ class AgentZeroBot:
             "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": filling,
         }
+
+        # ------------------------------------------------------------- #
+        # Pre-flight margin / validity check.                            #
+        # mt5.order_check() asks the broker to validate the request
+        # WITHOUT routing it to the market. This catches "No money"
+        # (retcode 10019), invalid SL/TP, lot-size violations, etc.
+        # before they become a real order_failed event in the trade
+        # history. On consecutive failures we arm the per-symbol margin
+        # breaker so we stop hammering the broker with rejects.
+        # ------------------------------------------------------------- #
+        ok, check_info = self._margin_pre_check(mt5, request)
+        if not ok:
+            n = self._record_margin_failure(
+                symbol,
+                f"retcode={check_info.get('retcode')} {check_info.get('comment','')[:60]}",
+            )
+            armed = n >= self._margin_breaker_threshold
+            log_thought(
+                "execution", symbol, "pre_check_failed",
+                (f"Pre-flight rejected: retcode={check_info.get('retcode')} "
+                 f"comment='{check_info.get('comment','')}' "
+                 f"margin_free={check_info.get('margin_free',0):.2f} "
+                 f"margin_required={check_info.get('margin',0):.2f} "
+                 f"failures={n}/{self._margin_breaker_threshold}"
+                 f"{' [BREAKER ARMED]' if armed else ''}"),
+                action="hold",
+            )
+            return {
+                "success":      False,
+                "message":      ("Pre-flight margin/validity check failed: "
+                                 f"{check_info.get('comment','unknown')}"),
+                "retcode":      check_info.get("retcode"),
+                "comment":      check_info.get("comment"),
+                "no_money":     bool(check_info.get("no_money")),
+                "margin_free":  check_info.get("margin_free"),
+                "margin":       check_info.get("margin"),
+                "breaker_armed": armed,
+                "consecutive_failures": n,
+            }
+        # Pre-check passed — clear any prior failure streak for this symbol.
+        self._record_margin_success(symbol)
+
         result = mt5.order_send(request)
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             log_thought(
@@ -2034,17 +2214,14 @@ class AgentZeroBot:
         log.info("Agent Zero — %s", symbol)
         log.info("=" * 65)
 
-        df = self._fetch_m15(symbol)
-
         exit_results = []
-
-        # Native code-based trade management removed.
         partial_results = []
 
-        # Step 1 - AI risk manager
-        ai_risk_results = self.run_ai_risk_manager(symbol)
+        # Position risk management now handled by Bot._portfolio_risk_cycle()
+        # before this method is called. ai_risk_results kept for API compat.
+        ai_risk_results = []
 
-        # Step 2+3 - Signal + AI review
+        # Signal + AI entry review
         signal = self.generate_trade_signal(symbol)
 
         log.info("Signal      : %s", signal["signal"])
@@ -2254,33 +2431,63 @@ class Bot:
         self._positions_lock = threading.Lock()
 
     def run(self) -> None:
-        log.info("Bot starting — symbols=%s  poll=%ss  auto_trade=%s  use_ai=%s",
-                 self.symbols, self.poll_secs, self.auto_trade, self.use_ai)
-        # Agent Zero preflight — confirm the one and only brain is reachable
-        # *before* we start polling. Surfaces Ollama outages up front instead
-        # of discovering them on the first signal.
+        # ─────────────────────────────────────────────────────────────────
+        # Startup banner — make the effective execution state IMPOSSIBLE
+        # to miss in the console. After the May 2026 incident where the
+        # bot ran for hours with auto_trade silently False, every operator
+        # session now opens with a loud, pinned summary of whether orders
+        # will actually be sent.
+        # ─────────────────────────────────────────────────────────────────
+        banner_state = "LIVE — orders WILL be sent" if self.auto_trade else \
+                       "DRY-RUN — orders will NOT be sent (auto_trade=False)"
+        log.info("=" * 72)
+        log.info("Bot starting — %s", banner_state)
+        log.info("  symbols     : %s", self.symbols)
+        log.info("  volume      : %s lots", self.volume)
+        log.info("  poll_secs   : %s", self.poll_secs)
+        log.info("  use_ai      : %s", self.use_ai)
+        log.info("  auto_trade  : %s", self.auto_trade)
+        log.info("=" * 72)
+        log_thought(
+            "preflight", "*", "bot_start",
+            (f"Bot started — auto_trade={self.auto_trade} "
+             f"use_ai={self.use_ai} symbols={self.symbols} volume={self.volume}"),
+            action="hold",
+        )
+        # Track the first cycle so we can emit a once-per-cycle summary the
+        # first time the loop runs even if no symbol fires a signal.
+        self._cycle_count = 0
+        # Orchestrator preflight — confirm Ollama is reachable and the
+        # configured model is pulled before starting the poll loop.
+        # The pair bots are deterministic and don't need Ollama, but the
+        # orchestrator (Agent 0) does. If Ollama is down, the orchestrator
+        # falls back to approve-all, so trading continues — but we surface
+        # the issue clearly here rather than discovering it silently later.
         try:
             if self.use_ai and _AGENT_IMPORT_OK and _ai_agent is not None:
                 health = _ai_agent.ollama_health()
                 if health.get("reachable") and health.get("model_loaded"):
-                    log.info("Agent Zero preflight OK — Ollama %s @ %s, model=%s",
+                    log.info("Orchestrator preflight OK — Ollama %s @ %s, model=%s",
                              "reachable", health.get("url"), health.get("model"))
-                    log_thought("ai_entry", "*", "preflight",
-                                f"Agent Zero online — model '{health.get('model')}' loaded at {health.get('url')}",
+                    log_thought("orchestrator", "*", "preflight",
+                                f"Orchestrator online — model '{health.get('model')}' loaded at {health.get('url')}",
                                 action="hold", confidence=1.0)
                 else:
-                    log.warning("Agent Zero preflight FAILED — reachable=%s model_loaded=%s err=%s",
+                    log.warning("Orchestrator preflight FAILED — reachable=%s model_loaded=%s err=%s — "
+                                "pair bots will manage positions; orchestrator in approve-all fallback",
                                 health.get("reachable"), health.get("model_loaded"), health.get("error"))
-                    log_thought("ai_entry", "*", "preflight",
-                                f"Agent Zero offline — auto-trading paused. reachable={health.get('reachable')} model_loaded={health.get('model_loaded')} err={health.get('error') or '—'}",
+                    log_thought("orchestrator", "*", "preflight",
+                                f"Orchestrator offline — approve-all fallback active. "
+                                f"reachable={health.get('reachable')} model_loaded={health.get('model_loaded')} "
+                                f"err={health.get('error') or '—'}",
                                 action="hold", confidence=0.0)
             elif self.use_ai and not _AGENT_IMPORT_OK:
-                log.warning("Agent Zero module failed to import — auto-trading disabled")
-                log_thought("ai_entry", "*", "preflight",
-                            "Agent Zero module missing — auto-trading disabled",
+                log.warning("ai_agent module failed to import — orchestrator unavailable")
+                log_thought("orchestrator", "*", "preflight",
+                            "ai_agent module missing — orchestrator unavailable; pair bots still active",
                             action="hold", confidence=0.0)
         except Exception as exc:
-            log.warning("Agent Zero preflight threw: %s", exc)
+            log.warning("Orchestrator preflight threw: %s", exc)
         if not self._strategy._ensure_mt5():
             raise RuntimeError("MT5 failed to initialize")
         self._running = True
@@ -2316,7 +2523,14 @@ class Bot:
             "auto_trade": self.auto_trade,
             "use_ai":     self.use_ai,
             "strategy":   dict(self.strategy_config),
+            # Margin breaker exposed so the dashboard can show armed
+            # symbols and the operator can hit a "reset" button.
+            "margin_breaker": self._strategy.margin_breaker_status(),
         }
+
+    def reset_margin_breaker(self, symbol: "Optional[str]" = None) -> None:
+        """Operator hook — reset the strategy's per-symbol margin breaker."""
+        self._strategy.reset_margin_breaker(symbol)
 
     def update_config(self, updates: dict) -> dict:
         """Update bot configuration on the fly."""
@@ -2361,7 +2575,7 @@ class Bot:
 
     def _loop(self) -> None:
         while self._running:
-            # Perform periodic connection health check if connection object available
+            # Connection health check
             if self._conn is not None:
                 if not self._conn.check_connection():
                     log.warning("Connection health check failed, attempting reconnection...")
@@ -2369,21 +2583,503 @@ class Bot:
                         log.error("Reconnection failed, pausing bot")
                         self._running = False
                         break
-            
+
+            # Once-per-cycle execution-state line. Cheap, but absolutely
+            # critical: the operator must always be able to glance at the
+            # log and see whether the bot is sending real orders right now.
+            self._cycle_count = getattr(self, "_cycle_count", 0) + 1
+            armed_syms = self._strategy.margin_breaker_status().get("armed_symbols", [])
+            if not self.auto_trade:
+                log.warning(
+                    "[cycle %d] EXECUTION DISABLED — auto_trade=False. "
+                    "Signals will be generated but no orders will be sent.",
+                    self._cycle_count,
+                )
+            elif armed_syms:
+                log.warning(
+                    "[cycle %d] Margin breaker armed for: %s — those symbols "
+                    "will not open new entries until reset.",
+                    self._cycle_count, ", ".join(armed_syms),
+                )
+            else:
+                log.info(
+                    "[cycle %d] Execution LIVE — auto_trade=True, no breakers armed.",
+                    self._cycle_count,
+                )
+
+            import MetaTrader5 as mt5
+            self._refresh_positions(mt5)
+
+            # ----------------------------------------------------------------
+            # PHASE 1: Portfolio-level risk management
+            # Agent 0 orchestrates all pair agents across the full portfolio
+            # before any signal generation runs. This gives Agent 0 a single
+            # view of every open position across all symbols simultaneously.
+            # ----------------------------------------------------------------
+            try:
+                self._portfolio_risk_cycle()
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                log.error("Portfolio risk cycle error: %s", exc)
+
+            # ----------------------------------------------------------------
+            # PHASE 2: Per-symbol signal generation and entry execution
+            # Risk management has already run this cycle — _tick_signals_only
+            # handles hard rules, circuit breakers, signal gen, and entries.
+            # ----------------------------------------------------------------
             for sym in self.symbols:
                 if not self._running:
                     break
                 try:
-                    self._tick(sym)
+                    self._tick_signals_only(sym)
                 except KeyboardInterrupt:
                     raise
                 except Exception as exc:
                     log.error("Tick error [%s]: %s", sym, exc)
+
             if self._running:
                 self._stop.wait(timeout=self.poll_secs)
             self._stop.clear()
 
-    def _tick(self, symbol: str) -> None:
+    # ------------------------------------------------------------------ #
+    # Learning insights application (orchestrator level)                  #
+    # ------------------------------------------------------------------ #
+
+    def _apply_learning_insights_to_signal(self, signal: dict, symbol: str) -> dict:
+        """
+        Apply learned feature weights from backtest_insights.json to
+        adjust entry signal confidence at the orchestrator level, AFTER
+        signal generation but BEFORE execution. This keeps learning logic
+        completely separate from the strategy's raw signal generation.
+
+        Returns the signal dict with confidence potentially adjusted.
+        Failures are silent — raw signal is returned unchanged.
+        """
+        if signal["signal"] == "neutral" or not _LEARNING_LOOP_OK:
+            return signal
+        
+        try:
+            loop = get_learning_loop()
+            entry = float(signal.get("entry_price") or 0.0)
+            sl = float(signal.get("stop_loss") or 0.0)
+            poc = float(signal.get("volume_profile", {}).get("poc") or 0.0)
+            current_price = entry  # Use entry as proxy for current price at signal time
+            
+            base_conf = int(signal.get("confidence", 75))
+            adjusted_conf = loop.apply_learned_weights(
+                symbol, base_conf, current_price, entry, sl, poc=poc
+            )
+            
+            if adjusted_conf != base_conf:
+                signal["confidence"] = adjusted_conf
+                log_thought(
+                    "orchestrator", symbol, "learning_adjusted",
+                    f"Confidence adjusted: {base_conf}% → {adjusted_conf}% "
+                    f"({signal.get('signal_source', '?')})",
+                    action="adjust",
+                )
+        except Exception as exc:
+            log.debug("learning insights adjustment failed for %s: %s", symbol, exc)
+        
+        return signal
+
+    # ------------------------------------------------------------------ #
+    # Portfolio risk management — Agent 0 orchestration                   #
+    # ------------------------------------------------------------------ #
+
+    def _portfolio_risk_cycle(self) -> None:
+        """
+        Agent 0 orchestration: runs once per poll cycle across ALL symbols.
+
+        Flow:
+          1. Collect verdicts from all pair agents (Agents 1-4) for every
+             open position across every symbol.
+          2. Pass all verdicts to _agent_zero_orchestrate which applies
+             portfolio-level rules and returns the approved subset.
+          3. Execute only the approved verdicts via the broker.
+
+        Pair agents never know whether their verdict was suppressed.
+        """
+        if not self.use_ai or not (_AGENT_IMPORT_OK and _ai_agent is not None):
+            return
+
+        raw_verdicts = self._collect_pair_verdicts()
+        if not raw_verdicts:
+            return
+
+        approved = self._agent_zero_orchestrate(raw_verdicts)
+        self._execute_verdicts(approved)
+
+    def _collect_pair_verdicts(self) -> list:
+        """
+        Ask each pair agent about every open position it owns across all
+        symbols. Returns a flat list of raw verdict dicts — nothing executed.
+
+        Each verdict dict: symbol, ticket, action, new_sl, reason, pos, agent
+        """
+        import MetaTrader5 as mt5
+        verdicts = []
+
+        for sym in self.symbols:
+            positions = list(mt5.positions_get(symbol=sym) or [])
+            if not positions:
+                continue
+
+            info   = mt5.symbol_info(sym)
+            if info is None:
+                continue
+            point  = float(getattr(info, "point",  1e-5) or 1e-5)
+            digits = int(getattr(info,   "digits", 5))
+            df     = self._strategy._fetch_m15(sym)
+            atr    = self._strategy._calculate_atr(df) if df is not None else 0.0
+
+            for pos in positions:
+                ticket = int(pos.ticket)
+
+                if not self._is_review_due(ticket):
+                    self._maybe_log_heartbeat(ticket, sym, pos, point)
+                    continue
+
+                ctx = self._build_position_context(pos, sym, point, digits, atr, df)
+                if ctx is None:
+                    continue
+
+                try:
+                    agent   = _ai_agent.get_pair_agent(sym)
+                    verdict = agent.manage_position(ctx)
+                except Exception as exc:
+                    log.warning("[%s] pair agent error ticket #%d: %s — hold",
+                                sym, ticket, exc)
+                    verdict = {"action": "hold", "reason": f"agent error: {exc!s}"}
+
+                verdicts.append({
+                    "symbol": sym,
+                    "ticket": ticket,
+                    "action": verdict.get("action", "hold"),
+                    "new_sl": verdict.get("new_sl"),
+                    "reason": verdict.get("reason", ""),
+                    "pos":    pos,
+                    "agent":  f"{sym}_agent",
+                })
+
+        return verdicts
+
+    def _agent_zero_orchestrate(self, verdicts: list) -> list:
+        """
+        Agent 0 — portfolio-level orchestrator.
+
+        Two-stage process:
+          STAGE 1 (deterministic, pure Python): hard rules that must always
+              hold regardless of LLM availability. Daily loss breach and
+              position-cap enforcement live here. These rules are the
+              floor — the LLM cannot loosen them.
+          STAGE 2 (LLM, best-effort): the orchestrator (ai_agent.Orchestrator)
+              gets the surviving verdicts plus a portfolio snapshot and may
+              VETO any verdict or OVERRIDE a hold to a close. If the LLM is
+              unavailable, this stage is a no-op.
+
+        Result: deterministic safety with optional LLM coordination on top.
+        """
+        import MetaTrader5 as mt5
+
+        # ============================================================
+        # STAGE 1 — deterministic portfolio rules (hard floor)
+        # ============================================================
+        approved   = []
+        suppressed = []
+
+        try:
+            rules = _load_rules()
+        except Exception:
+            rules = None
+
+        daily_breach = _daily_loss_breach(mt5, rules) if rules else None
+        total_open   = _count_all_open_positions(mt5)
+        total_cap    = int(getattr(rules, "max_open_positions_total", 0) or 0) if rules else 0
+        at_cap       = total_cap > 0 and total_open >= total_cap
+
+        closes   = [v for v in verdicts if v["action"] == "close"]
+        tightens = [v for v in verdicts if v["action"] == "move_sl"]
+        holds    = [v for v in verdicts if v["action"] == "hold"]
+
+        if daily_breach:
+            log_thought(
+                "orchestrator", "*", "portfolio_gate",
+                f"Daily loss breach — passing {len(closes)} close(s), "
+                f"suppressing {len(tightens)} tighten(s)",
+                detail=daily_breach, action="hold",
+            )
+            approved.extend(closes)
+            suppressed.extend(tightens)
+
+        elif at_cap:
+            log_thought(
+                "orchestrator", "*", "portfolio_gate",
+                f"Position cap ({total_open}/{total_cap}) — "
+                f"passing {len(closes)} close(s), "
+                f"suppressing {len(tightens)} tighten(s)",
+                action="hold",
+            )
+            approved.extend(closes)
+            suppressed.extend(tightens)
+
+        else:
+            # Normal: forward closes + tightens + holds to the LLM stage
+            # so it can decide if any holds should be overridden to closes.
+            approved.extend(closes)
+            approved.extend(tightens)
+            approved.extend(holds)
+
+        # ============================================================
+        # STAGE 2 — LLM orchestrator (veto + override)
+        # ============================================================
+        # Only run if:
+        #   * the LLM backend is enabled, AND
+        #   * we have at least one verdict for the LLM to decide on, AND
+        #   * we're not already in a Stage-1 lockdown state (where the LLM
+        #     adding more closes is fine, but adding tightens isn't allowed
+        #     anyway because Stage 1 already suppressed them).
+        try:
+            llm_enabled = _AGENT_IMPORT_OK and _ai_agent.agent_backend_enabled()
+        except Exception:
+            llm_enabled = False
+
+        if llm_enabled and approved:
+            try:
+                snapshot = self._build_portfolio_snapshot(mt5, rules,
+                                                           total_open, total_cap,
+                                                           daily_breach)
+                refined = _ai_agent.get_orchestrator().orchestrate(
+                    approved, portfolio=snapshot,
+                )
+            except Exception as exc:
+                log.warning("orchestrator LLM stage failed: %s — "
+                            "falling back to deterministic verdicts", exc)
+                refined = approved
+
+            # Detect what the LLM did so we can log it for the dashboard.
+            refined_by_ticket = {v["ticket"]: v for v in refined}
+            for original in approved:
+                touched = refined_by_ticket.get(original["ticket"], original)
+                orch_reason = touched.get("orchestrator_reason")
+                if orch_reason:
+                    log_thought(
+                        "orchestrator", original["symbol"],
+                        "llm_orchestrator",
+                        f"#{original['ticket']} {original['action']} -> "
+                        f"{touched.get('action', original['action'])}",
+                        detail=orch_reason, action=touched.get("action"),
+                    )
+            approved = refined
+
+        # Filter holds out at the very end — they're no-ops, but we kept
+        # them through Stage 2 so the LLM could see them. The executor
+        # only wants real instructions.
+        approved = [v for v in approved if v["action"] != "hold"]
+
+        # ============================================================
+        # Logging for the dashboard's Zero Log
+        # ============================================================
+        for v in suppressed:
+            log_thought(
+                "orchestrator", v["symbol"], "suppressed",
+                f"#{v['ticket']} {v['action']} suppressed by Agent 0",
+                detail=v["reason"], action="hold",
+            )
+
+        for v in holds:
+            log_thought(
+                "orchestrator", v["symbol"], "hold",
+                f"#{v['ticket']} {v['agent']} holding — broker SL active",
+                detail=v["reason"], action="hold",
+            )
+
+        return approved
+
+    def _build_portfolio_snapshot(self, mt5, rules,
+                                   total_open: int, total_cap: int,
+                                   daily_breach):
+        """Build a PortfolioSnapshot the LLM orchestrator can absorb.
+
+        Best-effort — if any field can't be read we fall back to zero
+        rather than skipping the LLM stage entirely. The LLM tolerates
+        missing fields; what we don't want is the LLM stage silently
+        failing because of a transient MT5 hiccup.
+        """
+        snap = _ai_agent.PortfolioSnapshot(
+            open_positions_count = total_open,
+            max_positions_total  = total_cap,
+            daily_loss_breach    = bool(daily_breach),
+        )
+        try:
+            info = mt5.account_info()
+            if info is not None:
+                snap.equity  = float(getattr(info, "equity",  0.0) or 0.0)
+                snap.balance = float(getattr(info, "balance", 0.0) or 0.0)
+                snap.daily_pl = round(snap.equity - snap.balance, 2)
+        except Exception as exc:
+            log.debug("portfolio snapshot account_info failed: %s", exc)
+
+        try:
+            if rules is not None:
+                limit_pct = float(getattr(rules, "daily_loss_limit_pct", 0.0) or 0.0)
+                if limit_pct > 0 and snap.balance > 0:
+                    snap.daily_loss_limit = round(snap.balance * limit_pct / 100.0, 2)
+        except Exception:
+            pass
+
+        if daily_breach:
+            snap.notes = "daily_loss_breach"
+
+        return snap
+
+    def _execute_verdicts(self, approved: list) -> None:
+        """
+        Execute broker instructions for verdicts approved by Agent 0.
+        Re-fetches each position immediately before touching it for freshness.
+        """
+        import MetaTrader5 as mt5
+
+        for v in approved:
+            updated = mt5.positions_get(ticket=v["ticket"])
+            pos     = updated[0] if updated else v["pos"]
+
+            if v["action"] == "close":
+                result = self._strategy._close_position(pos)
+                log_thought(
+                    "orchestrator", v["symbol"], "close_executed",
+                    f"#{v['ticket']} closed via {v['agent']} — {v['reason'][:80]}",
+                    action="close",
+                )
+                log.info("[Agent 0] Closed #%d %s: %s",
+                         v["ticket"], v["symbol"], result.get("message", ""))
+
+            elif v["action"] == "move_sl":
+                if v.get("new_sl") is None:
+                    continue
+                result = self._strategy._modify_sl(pos, v["new_sl"])
+                log_thought(
+                    "orchestrator", v["symbol"], "tighten_executed",
+                    f"#{v['ticket']} SL->{v['new_sl']} via {v['agent']} "
+                    f"— {v['reason'][:60]}",
+                    action="move_sl",
+                )
+                log.info("[Agent 0] SL tightened #%d %s -> %.5f: %s",
+                         v["ticket"], v["symbol"], v["new_sl"],
+                         result.get("message", ""))
+
+    # ------------------------------------------------------------------ #
+    # Cadence helpers (extracted from run_ai_risk_manager)                #
+    # ------------------------------------------------------------------ #
+
+    def _is_review_due(self, ticket: int) -> bool:
+        """Pair bots are deterministic Python -- no rate limit needed.
+
+        The old tick/time gate existed purely to rate-limit expensive
+        LLM calls (1 call per 3 ticks, min 180s between calls per ticket).
+        Now that pair bots are code-only, every poll cycle is cheap enough
+        to run without gating. This method always returns True so the
+        orchestrated path (_collect_pair_verdicts) mirrors the single-symbol
+        path's every-poll behaviour.
+        """
+        return True
+
+    def _maybe_log_heartbeat(self, ticket: int, sym: str, pos,
+                              point: float) -> None:
+        """Emit a monitoring heartbeat if the heartbeat interval has elapsed."""
+        now_ts  = time.time()
+        last_hb = self._strategy._ai_last_heartbeat_ts.get(ticket, 0.0)
+        if now_ts - last_hb < AgentZeroBot.MONITOR_HEARTBEAT_SECS:
+            return
+        self._strategy._ai_last_heartbeat_ts[ticket] = now_ts
+        import MetaTrader5 as mt5
+        is_buy     = pos.type == mt5.ORDER_TYPE_BUY
+        direction  = "BUY" if is_buy else "SELL"
+        entry      = float(pos.price_open)
+        cur_sl     = float(pos.sl or 0)
+        cur_tp     = float(pos.tp or 0)
+        tick_      = mt5.symbol_info_tick(sym)
+        if tick_ is None:
+            return
+        price      = float(tick_.bid) if is_buy else float(tick_.ask)
+        profit_pts = ((price - entry) / point
+                      if is_buy else (entry - price) / point)
+        log_thought(
+            "orchestrator", sym, "monitor",
+            f"#{ticket} {direction} monitoring — "
+            f"{profit_pts:+.1f}pts "
+            f"(peak {self._strategy._ai_peak_profit.get(ticket, 0):.0f}), "
+            f"SL={cur_sl:.5f} TP={cur_tp:.5f}",
+        )
+
+    def _build_position_context(self, pos, sym: str, point: float,
+                                 digits: int, atr: float,
+                                 df) -> Optional[object]:
+        """Build a PositionContext from an MT5 position object."""
+        import MetaTrader5 as mt5
+        ticket    = int(pos.ticket)
+        is_buy    = pos.type == mt5.ORDER_TYPE_BUY
+        direction = "BUY" if is_buy else "SELL"
+        entry     = float(pos.price_open)
+        cur_sl    = float(pos.sl or 0)
+        cur_tp    = float(pos.tp or 0)
+
+        tick_ = mt5.symbol_info_tick(sym)
+        if tick_ is None:
+            return None
+        cur_price  = float(tick_.bid) if is_buy else float(tick_.ask)
+        profit_pts = ((cur_price - entry) / point
+                      if is_buy else (entry - cur_price) / point)
+
+        self._strategy._ai_peak_profit.setdefault(ticket, 0)
+        self._strategy._ai_peak_profit[ticket] = max(
+            self._strategy._ai_peak_profit[ticket], profit_pts
+        )
+        peak = self._strategy._ai_peak_profit[ticket]
+
+        hh_ll_status     = {"trend_intact": True, "reason": "N/A"}
+        structure_status = {"structure_broken": False, "reason": "N/A"}
+        fresh_struct     = {"fresh_structure": False, "structure_type": None}
+
+        if df is not None:
+            side = "buy" if is_buy else "sell"
+            hh_ll_status     = self._strategy._detect_hh_ll_trend(df, side)
+            structure_status = self._strategy._detect_structure_break(
+                df, entry, side, atr)
+            fresh_struct     = self._strategy._detect_fresh_structure(df, side)
+
+        log_thought(
+            "orchestrator", sym, "review_start",
+            f"Asking {sym} pair agent about #{ticket} {direction} "
+            f"({profit_pts:+.0f}pts, peak {peak:.0f}pts)",
+            detail=(f"entry={entry:.5f} price={cur_price:.5f} "
+                    f"SL={cur_sl:.5f} TP={cur_tp:.5f}"),
+        )
+
+        return _ai_agent.PositionContext(
+            symbol=sym, ticket=ticket, side=direction,
+            entry=entry, cur_price=cur_price, cur_sl=cur_sl,
+            cur_tp=cur_tp, profit_pts=profit_pts, peak_pts=peak,
+            atr=atr, digits=digits,
+            trend_intact=hh_ll_status.get("trend_intact"),
+            structure_broken=structure_status.get("structure_broken"),
+            fresh_structure=fresh_struct.get("fresh_structure"),
+            notes=(f"trend_reason={hh_ll_status.get('reason','')} "
+                   f"struct_reason={structure_status.get('reason','')}"),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Signal-only tick — Phase 2 of the loop                             #
+    # ------------------------------------------------------------------ #
+
+    def _tick_signals_only(self, symbol: str) -> None:
+        """
+        Signal generation and entry execution for one symbol.
+        Portfolio risk management has already run this cycle via
+        _portfolio_risk_cycle() — this method handles only hard rules,
+        circuit breakers, signal gen, and entry execution.
+        """
         import MetaTrader5 as mt5
 
         try:
@@ -2396,11 +3092,9 @@ class Bot:
         positions = list(mt5.positions_get(symbol=symbol) or [])
         records   = _load_memory()
 
-        self._refresh_positions(mt5)
-
-        # Hard rule pre-check
         if rules:
-            block = _check_hard_rules(rules, symbol, positions, tick, info, records)
+            block = _check_hard_rules(
+                rules, symbol, positions, tick, info, records)
             if block:
                 blocked_result = {
                     "signal": self._strategy._neutral(
@@ -2418,12 +3112,7 @@ class Bot:
                     self._results[symbol] = blocked_result
                 return
 
-            # ------------------------------------------------------------
-            # Circuit breakers — block NEW entries only (managers above
-            # keep running). Each check falls through to run_strategy with
-            # auto_trade=False so the UI still sees the signal but no
-            # order fires.
-            # ------------------------------------------------------------
+            # Circuit breakers — block NEW entries only
             auto_trade_effective = self.auto_trade
             pause_reason: Optional[str] = None
 
@@ -2432,26 +3121,24 @@ class Bot:
             if loss_msg:
                 pause_reason = loss_msg
 
-            # (b) Per-symbol cap (0 = unlimited)
+            # (b) Per-symbol cap
             if pause_reason is None:
                 per_cap = int(getattr(rules, "max_open_positions", 0) or 0)
                 if per_cap > 0 and len(positions) >= per_cap:
                     pause_reason = (f"Per-symbol cap reached "
                                     f"({len(positions)}/{per_cap}) — managing only")
 
-            # (c) Account-wide cap (0 = unlimited)
+            # (c) Account-wide cap
             if pause_reason is None:
-                total_cap = int(getattr(rules, "max_open_positions_total", 0) or 0)
+                total_cap = int(
+                    getattr(rules, "max_open_positions_total", 0) or 0)
                 if total_cap > 0:
                     total_open = _count_all_open_positions(mt5)
                     if total_open >= total_cap:
                         pause_reason = (f"Account-wide cap reached "
                                         f"({total_open}/{total_cap}) — managing only")
 
-            # (d) Ollama liveness — if the agent is the backend and Ollama
-            #     is unreachable, pause new entries (agent individually
-            #     rejects, but this gives us a clearer single log line and
-            #     avoids burning 30s timeouts per symbol).
+            # (d) Ollama liveness
             if (pause_reason is None
                     and _AGENT_IMPORT_OK
                     and _ai_agent is not None
@@ -2463,7 +3150,7 @@ class Bot:
                                         f"({health.get('error','?')[:80]}) — "
                                         f"new entries paused")
                 except Exception:
-                    pass  # best-effort; don't block on a probe error
+                    pass
 
             if pause_reason:
                 auto_trade_effective = False
@@ -2480,6 +3167,9 @@ class Bot:
         with self._results_lock:
             self._results[symbol] = result
 
+    # kept for backward compat — routes to _tick_signals_only
+    def _tick(self, symbol: str) -> None:
+        self._tick_signals_only(symbol)
     def _refresh_positions(self, mt5) -> None:
         all_pos = []
         for sym in self.symbols:
@@ -2532,7 +3222,8 @@ def _ensure_shared_mt5_connection():
 _HERE       = Path(__file__).resolve().parent
 _CORE_HTML  = _HERE / "index.html"
 _CORE_CSS   = _HERE / "core" / "css"   / "dashboard.css"
-_CORE_JS    = _HERE / "core" / "js"    / "dashboard.js"
+_CORE_JS       = _HERE / "core" / "js" / "dashboard.js"
+_CORE_AGENTS_JS = _HERE / "core" / "js" / "agents.js"
 
 # Pre-load the HTML at startup (fast inline serve; refreshes on process restart)
 def _load_dashboard_html() -> str:
@@ -2852,9 +3543,16 @@ def serve_js():
     return Response("/* js not found */", mimetype="application/javascript", status=404)
 
 
+@app.route("/core/js/agents.js")
+def serve_agents_js():
+    if _CORE_AGENTS_JS.exists():
+        return send_file(_CORE_AGENTS_JS, mimetype="application/javascript")
+    return Response("/* agents.js not found */", mimetype="application/javascript", status=404)
+
+
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "version": "AgentZero"})
+    return jsonify({"ok": True, "version": "Fortis/multi-agent"})
 
 
 @app.route("/bot/status")
@@ -3305,6 +4003,239 @@ def ai_init():
     return jsonify({"ok": ok, "message": "Ollama agent probed", "health": health})
 
 
+@app.route("/api/agent/matrix")
+def api_agent_matrix():
+    """Agent Matrix: live status of all 5 agents + last-cycle verdicts.
+
+    Used by the new Agents tab's Agent Matrix and Pair-Bot Diagnostics panels.
+    Aggregates data from the last bot cycle without triggering a new MT5 call.
+    """
+    bot, thread = _get_bot()
+    running = bool(thread and thread.is_alive())
+
+    # Pair-bot registry info (class + tunables)
+    bots_info = {}
+    if _AGENT_IMPORT_OK and _ai_agent:
+        try:
+            for sym in ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]:
+                b = _ai_agent.get_pair_agent(sym)
+                bots_info[sym] = {
+                    "symbol":              sym,
+                    "class":               type(b).__name__,
+                    "min_atr_to_tighten": getattr(b, "MIN_ATR_PROFIT_TO_TIGHTEN", 1.0),
+                    "trail_atr_mult":      getattr(b, "TRAIL_ATR_MULT", 1.0),
+                    "close_on_trend":      getattr(b, "CLOSE_ON_TREND_BROKEN", False),
+                    "close_on_structure":  getattr(b, "CLOSE_ON_STRUCTURE_BROKEN", True),
+                }
+        except Exception as exc:
+            log.debug("agent matrix bot info error: %s", exc)
+
+    # Orchestrator memory + heatmap
+    heatmap = {}
+    memory_text = ""
+    orch_conf_last = None
+    if _AGENT_IMPORT_OK and _ai_agent:
+        try:
+            orch = _ai_agent.get_orchestrator()
+            heatmap = orch.memory.heatmap_data()
+            memory_text = orch.memory.summary_text()
+            entries = list(orch.memory._entries)
+            if entries:
+                last_decs = entries[-1].decisions
+                if last_decs:
+                    confs = [d.get("orch_confidence", 0.8) for d in last_decs
+                             if "orch_confidence" in d]
+                    orch_conf_last = round(sum(confs) / len(confs), 3) if confs else None
+        except Exception as exc:
+            log.debug("agent matrix orch info error: %s", exc)
+
+    # Ollama health (with latency for LLM Health Panel)
+    ollama = {}
+    if _AGENT_IMPORT_OK and _ai_agent:
+        try:
+            ollama = _ai_agent.ollama_health()
+        except Exception:
+            pass
+
+    # Latest verdicts from the running bot (cached in bot.latest_results)
+    latest_verdicts = {}
+    if bot and running:
+        try:
+            for sym, res in (bot.latest_results() or {}).items():
+                verdict = (res or {}).get("last_verdict")
+                if verdict:
+                    latest_verdicts[sym] = verdict
+        except Exception:
+            pass
+
+    # Directives
+    directives_json = {"freeze": [], "close": [], "notes": ""}
+    if _AGENT_IMPORT_OK and _ai_agent:
+        try:
+            d = _ai_agent.get_directives()
+            directives_json = {
+                "freeze":          sorted(d.freeze_symbols),
+                "close":           sorted(d.close_symbols),
+                "max_exposure_pct": d.max_exposure_pct,
+                "notes":           d.notes,
+            }
+        except Exception:
+            pass
+
+    return jsonify({
+        "running":          running,
+        "bots":             bots_info,
+        "heatmap":          heatmap,
+        "memory_summary":   memory_text,
+        "orch_confidence":  orch_conf_last,
+        "ollama":           ollama,
+        "latest_verdicts":  latest_verdicts,
+        "directives":       directives_json,
+    })
+
+
+@app.route("/api/agent/portfolio")
+def api_agent_portfolio():
+    """Portfolio risk snapshot for the Risk Dial and KPI panels.
+
+    Builds a PortfolioSnapshot from live MT5 data and returns it as JSON.
+    Includes risk budget (sum of SL distances as fraction of equity),
+    correlation load, and cross-pair alignment.
+    """
+    import MetaTrader5 as mt5
+
+    out = {
+        "equity":             0.0,
+        "balance":            0.0,
+        "daily_pl":           0.0,
+        "daily_loss_limit":   0.0,
+        "daily_loss_breach":  False,
+        "open_count":         0,
+        "max_positions":      0,
+        "risk_budget_used":   0.0,
+        "risk_budget_total":  0.0,
+        "risk_budget_pct":    0.0,
+        "alignment_score":    0.0,
+        "correlation_load":   0.0,
+        "pair_exposure":      {},
+        "error":              None,
+    }
+
+    try:
+        if not mt5.initialize():
+            out["error"] = "MT5 not connected"
+            return jsonify(out)
+
+        info = mt5.account_info()
+        if info:
+            out["equity"]   = round(float(getattr(info, "equity",   0) or 0), 2)
+            out["balance"]  = round(float(getattr(info, "balance",  0) or 0), 2)
+            out["daily_pl"] = round(out["equity"] - out["balance"],  2)
+
+        positions = list(mt5.positions_get() or [])
+        out["open_count"] = len(positions)
+
+        # Risk budget: sum of (SL distance in price) * volume
+        risk_used = 0.0
+        sides: list[str] = []
+        trend_intacts: list = []
+        pair_exp: dict[str, dict] = {}
+
+        for pos in positions:
+            sym   = str(pos.symbol)
+            entry = float(pos.price_open or 0)
+            sl    = float(pos.sl or 0)
+            vol   = float(pos.volume or 0)
+            is_buy = pos.type == 0   # ORDER_TYPE_BUY
+            side  = "BUY" if is_buy else "SELL"
+            sides.append(side)
+
+            sl_dist = abs(entry - sl) if sl else 0.0
+            risk_used += sl_dist * vol
+
+            pip_size = 0.01 if "JPY" in sym else 0.0001
+            sl_pips  = sl_dist / pip_size if pip_size > 0 else 0
+
+            pair_exp.setdefault(sym, {"lots": 0.0, "sl_pips": 0.0,
+                                       "risk_pct": 0.0, "side": side})
+            pair_exp[sym]["lots"]   += vol
+            pair_exp[sym]["sl_pips"] = max(pair_exp[sym]["sl_pips"], sl_pips)
+
+        # Correlation load: fraction of positions on the same side
+        if sides:
+            majority = max(sides.count("BUY"), sides.count("SELL"))
+            out["correlation_load"] = round(
+                (majority - 1) / len(sides) if len(sides) > 1 else 0.0, 2
+            )
+
+        # Risk budget as fraction of equity (simple dollar-value approximation)
+        if out["equity"] > 0:
+            out["risk_budget_used"] = round(risk_used, 4)
+            # Cap is 1% of equity per trade * max_positions (simple heuristic)
+            rules = _load_rules() if callable(_load_rules) else None
+            max_pos = int(getattr(rules, "max_open_positions_total", 20) or 20)
+            out["risk_budget_total"] = round(out["equity"] * 0.01 * max_pos, 2)
+            if out["risk_budget_total"] > 0:
+                out["risk_budget_pct"] = round(
+                    risk_used / out["risk_budget_total"] * 100, 1
+                )
+
+        # Alignment: fraction of BUYs minus fraction of SELLs
+        if sides:
+            buy_frac  = sides.count("BUY")  / len(sides)
+            sell_frac = sides.count("SELL") / len(sides)
+            out["alignment_score"] = round(buy_frac - sell_frac, 2)
+
+        out["pair_exposure"] = pair_exp
+
+    except Exception as exc:
+        out["error"] = str(exc)[:200]
+
+    return jsonify(out)
+
+
+@app.route("/api/agent/directives", methods=["GET", "POST"])
+def api_agent_directives():
+    """GET: return current directives. POST: update directives.
+
+    POST body (all fields optional):
+        {"freeze": ["GBPJPY"],
+         "close":  [],
+         "max_exposure_pct": 50.0,
+         "notes": "Operator note shown in LLM prompt"}
+    """
+    if not (_AGENT_IMPORT_OK and _ai_agent):
+        return jsonify({"error": "ai_agent module not loaded"}), 503
+
+    if request.method == "GET":
+        d = _ai_agent.get_directives()
+        return jsonify({
+            "freeze":           sorted(d.freeze_symbols),
+            "close":            sorted(d.close_symbols),
+            "max_exposure_pct": d.max_exposure_pct,
+            "notes":            d.notes,
+        })
+
+    # POST — update
+    try:
+        payload = request.get_json(silent=True) or {}
+        freeze  = set(str(s).upper() for s in (payload.get("freeze") or []))
+        close_  = set(str(s).upper() for s in (payload.get("close")  or []))
+        max_exp = float(payload.get("max_exposure_pct") or 0.0)
+        notes   = str(payload.get("notes") or "")[:200]
+        new_d   = _ai_agent.GlobalDirectives(
+            freeze_symbols=freeze,
+            close_symbols=close_,
+            max_exposure_pct=max_exp,
+            notes=notes,
+        )
+        _ai_agent.set_directives(new_d)
+        log.info("Directives updated: %s", new_d.summary())
+        return jsonify({"ok": True, "summary": new_d.summary()})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
 @app.route("/bot/signal/<symbol>")
 def manual_signal(symbol: str):
     """Run a one-shot signal check without a running bot (for testing)."""
@@ -3493,9 +4424,9 @@ if __name__ == "__main__":
 
         print("=" * 55)
         chosen_port = _choose_http_port()
-        print(f"  FORTIS Agent Zero Dashboard -> http://localhost:{chosen_port}")
+        print(f"  FORTIS Multi-Agent Dashboard -> http://localhost:{chosen_port}")
         print(f"  LAN: http://<your-ip>:{chosen_port}")
         print("  API:  /bot/start  /bot/stop  /bot/status")
-        print("  Test: /bot/signal/EURUSD")
+        print("  New:  /api/agent/matrix  /api/agent/portfolio  /api/agent/directives")
         print("=" * 55)
         app.run(host="0.0.0.0", port=chosen_port, debug=False, threaded=True)

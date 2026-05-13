@@ -1,0 +1,113 @@
+# .github/workflows/ci.yml
+# Runs on every push and pull request to main.
+#
+# Three jobs:
+#   * lint  — ruff in check mode (fails on any rule violation defined in
+#             pyproject.toml). Cheap; ~10s. Run first so style errors don't
+#             waste a 2-minute test job.
+#   * test  — pytest on Ubuntu (Linux runners are free + faster than Windows
+#             ones). Skips the MT5-only smoke test automatically.
+#   * test-windows — same pytest run on Windows so the MT5 import test is
+#             actually exercised (the bot's production target IS Windows).
+#             Runs only on push-to-main and PRs touching critical files,
+#             so we don't burn Windows runner minutes on doc changes.
+#
+# CI does NOT touch Ollama, MT5 broker connectivity, or the live bot
+# subprocess. Those need a real environment; CI verifies the bits we can
+# verify cheaply: imports, unit tests, lint.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Cancel in-flight runs when a new commit lands on the same branch — keeps
+# the Actions queue moving when you push fix-typo commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # Lint — fast, runs first
+  # ─────────────────────────────────────────────────────────────────────
+  lint:
+    name: ruff lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff
+        # Lint check (no formatting changes). Reads config from pyproject.toml.
+        run: ruff check .
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Tests — Linux. MT5 isn't available; affected tests skip themselves.
+  # ─────────────────────────────────────────────────────────────────────
+  test-linux:
+    name: pytest (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        # Install runtime + backtest deps. MetaTrader5 is Windows-only,
+        # so we skip requirements.txt's MT5 line by hand. The agent layer
+        # uses stdlib for Ollama HTTP, so no Ollama Python package needed.
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask flask-cors numpy pandas requests
+          pip install scikit-learn matplotlib   # backtest extras
+          pip install pytest
+
+      - name: Run pytest
+        run: pytest
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Tests — Windows. Same pytest run, but MetaTrader5 IS importable here,
+  # so the ai_pro import smoke test runs for real.
+  # ─────────────────────────────────────────────────────────────────────
+  test-windows:
+    name: pytest (Windows)
+    runs-on: windows-latest
+    # Skip on doc-only PRs to save Windows-runner minutes.
+    if: |
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.changed_files || '', '.py') ||
+      contains(github.event.pull_request.changed_files || '', '.toml')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-backtest.txt
+          pip install pytest
+
+      - name: Run pytest
+        run: pytest

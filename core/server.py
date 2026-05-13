@@ -52,6 +52,41 @@ def _shutdown_monitor() -> None:
 atexit.register(_shutdown_monitor)
 
 
+def _auto_connect_mt5() -> None:
+    """
+    Attempt to attach to the already-running MT5 terminal on startup.
+
+    If MT5 is open and logged in, mt5.initialize() (with no credentials)
+    attaches silently and the dashboard is immediately usable without the
+    operator having to click "Connect MT5" after every server restart.
+
+    Runs in a background thread so it never delays server startup — the
+    dashboard comes up instantly, and signals start working within a few
+    seconds once MT5 is detected.
+    """
+    import time
+    def _try() -> None:
+        global mt5_conn
+        time.sleep(2)
+        if mt5_conn is not None and mt5_conn.is_connected():
+            return
+        log.info("Auto-connect: attempting to attach to running MT5 terminal…")
+        try:
+            conn = MT5Connection({})
+            if conn.connect():
+                conn.start_monitor()
+                mt5_conn = conn
+                _sync_mt5_status()
+                log.info("Auto-connect: MT5 attached successfully")
+            else:
+                log.info("Auto-connect: MT5 not reachable yet — use Connect MT5 button")
+        except Exception as exc:
+            log.debug("Auto-connect: skipped (%s)", exc)
+    _threading.Thread(target=_try, name="mt5-auto-connect", daemon=True).start()
+
+_auto_connect_mt5()
+
+
 def _compute_atr(df: pd.DataFrame, period: int = 14) -> float:
     if df is None or df.empty:
         return float("nan")
@@ -271,6 +306,69 @@ def api_mt5_status():
         "error": None,
     })
 
+
+@app.route('/api/ollama/health', methods=['GET'])
+def api_ollama_health():
+    """Lightweight status probe for the local Ollama server.
+
+    Surfaces ai_agent.ollama_health() to the dashboard so the operator can
+    see at a glance whether the agent layer is ready (server reachable,
+    configured model pulled) without starting the bot. Also includes a
+    summary of the learning loop's current state — whether
+    backtest_insights.json exists, how many pairs are loaded — so the
+    sidebar can show "Learning: N pairs" once a backtest has been run.
+
+    Never raises — on import failure we report a structured error so the
+    dashboard can render a useful message.
+    """
+    try:
+        from ai_agent import ollama_health
+    except Exception as exc:
+        log.error("ollama_health import failed: %s", exc)
+        return jsonify({
+            "reachable": False,
+            "model_loaded": False,
+            "url": None,
+            "model": None,
+            "learning": None,
+            "error": f"agent module import failed: {exc}",
+        }), 500
+
+    try:
+        payload = ollama_health()
+    except Exception as exc:
+        log.error("ollama_health probe failed: %s", exc)
+        return jsonify({
+            "reachable": False,
+            "model_loaded": False,
+            "url": None,
+            "model": None,
+            "learning": None,
+            "error": f"probe failed: {exc}",
+        }), 500
+
+    # Append a compact learning-loop summary so the dashboard can render a
+    # single row instead of needing a second endpoint. Best-effort — if the
+    # learning loop module isn't importable, we return null and the
+    # sidebar simply hides the Learning row.
+    learning_summary = None
+    try:
+        from agent_learning_loop import get_learning_loop
+        st = get_learning_loop().status()
+        learning_summary = {
+            "file_exists":  bool(st.get("file_exists")),
+            "pairs":        list(st.get("pairs") or []),
+            "pair_count":   len(st.get("pairs") or []),
+            "last_mtime":   st.get("last_mtime"),
+        }
+    except Exception as exc:
+        # Don't fail the whole probe just because the learning loop is offline.
+        log.debug("learning loop status probe failed: %s", exc)
+
+    payload["learning"] = learning_summary
+    return jsonify(payload)
+
+
 @app.route('/api/config', methods=['GET'])
 def api_config():
     """Verify backtested configuration baseline"""
@@ -343,6 +441,42 @@ def bot_start():
     try:
         payload = request.get_json(silent=True) or {}
         _apply_bot_config_payload(payload)
+
+        # ── Preflight: if AI review is on, Ollama must be reachable + model pulled.
+        # Failing fast here is much friendlier than letting every poll cycle log
+        # transport errors after the bot has launched.
+        if bool(_bot_config.get('ai_review', True)):
+            try:
+                from ai_agent import ollama_health
+                health = ollama_health()
+            except Exception as exc:
+                log.error("Ollama preflight import failed: %s", exc)
+                return jsonify({
+                    'ok': False,
+                    'error': (
+                        f"Agent layer (ai_agent) failed to import: {exc}. "
+                        f"Run `python scripts/preflight.py` for details, or "
+                        f"disable AI review in the sidebar to start strategy-only."
+                    ),
+                }), 500
+            if not health.get('reachable'):
+                return jsonify({
+                    'ok': False,
+                    'error': (
+                        f"Ollama is not reachable at {health.get('url')}: "
+                        f"{health.get('error') or 'unknown error'}. "
+                        f"Run scripts/setup_ollama.ps1, or disable AI review "
+                        f"in the sidebar to start strategy-only."
+                    ),
+                }), 503
+            if not health.get('model_loaded'):
+                return jsonify({
+                    'ok': False,
+                    'error': (
+                        f"Ollama model '{health.get('model')}' is not pulled. "
+                        f"Run: ollama pull {health.get('model')}"
+                    ),
+                }), 503
 
         ai_pro_path = os.path.join(root_path, 'ai_pro.py')
         env = os.environ.copy()
@@ -510,7 +644,12 @@ def bot_signal(symbol: str):
 
         snap = _mt5_signal_snapshot(symbol)
         if snap.get("error"):
-            return jsonify(snap), 400
+            # 503 (Service Unavailable) is semantically correct here: the
+            # client's request is well-formed, but the upstream MT5 terminal
+            # isn't connected yet. 400 (Bad Request) would falsely imply
+            # the client sent something malformed, and turns the normal
+            # "haven't connected yet" state into red console spam.
+            return jsonify(snap), 503
         return jsonify(snap)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -651,6 +790,21 @@ def _empty_kpis() -> dict:
         'equity_return': 0.0, 'max_drawdown': 0.0, 'sharpe': 0.0,
         'avg_win_loss_ratio': 0.0, 'current_drawdown': 0.0,
         'recovery_factor': 0.0, 'sortino': 0.0,
+        # Same shape as the populated path so the dashboard can read it
+        # without null-checks. Both buckets default to a clean zero row.
+        'direction_breakdown': {
+            'BUY':  {'count': 0, 'wins': 0, 'losses': 0,
+                     'win_rate': 0.0, 'total_pnl': 0.0},
+            'SELL': {'count': 0, 'wins': 0, 'losses': 0,
+                     'win_rate': 0.0, 'total_pnl': 0.0},
+        },
+        # Supporting numbers for the KPI subtitle lines.
+        'wins_count': 0, 'losses_count': 0,
+        'gross_profit': 0.0, 'gross_loss': 0.0,
+        'total_pnl': 0.0,
+        'max_drawdown_abs': 0.0, 'current_drawdown_abs': 0.0,
+        'avg_win_abs': 0.0, 'avg_loss_abs': 0.0,
+        'open_positions': 0, 'open_pnl': 0.0,
     }
 
 
@@ -690,36 +844,96 @@ def bot_positions():
 
 @app.route('/bot/history', methods=['GET'])
 def bot_history():
-    """Return recent closed-trade history from MT5 (last 30 days)."""
+    """Return recent closed-trade history from MT5 (last 30 days).
+
+    Implementation note (May 2026 fix)
+    ----------------------------------
+    Earlier versions iterated `history_deals_get(...)` and emitted one
+    row per closing deal (DEAL_ENTRY_OUT). That row reported:
+      * `type`  from the closing deal — which is the *opposite* of the
+                position's direction. Closing a BUY needs a SELL order,
+                so every BUY trade was rendered as "SELL" in the UI.
+      * `price` from the closing deal — which is the *exit* (SL/TP fill),
+                not the entry.
+
+    Both numbers correctly described "the order that closed the position",
+    but the dashboard widget (and the operator) reads them as "the trade
+    you took" — entry direction at entry price. So we now pair every
+    closing deal (`entry ∈ {OUT, OUT_BY, INOUT}`) with the opening deal
+    (`entry == IN`) sharing the same `position_id` and surface:
+      * `type`        from the IN deal       (original direction)
+      * `entry_price` from the IN deal       (actual fill at entry)
+      * `exit_price`  from the OUT deal      (SL / TP / market close)
+      * `time`        = exit_time            (when the trade closed)
+      * `entry_time`  = IN deal's time
+      * `profit/swap/commission` summed across all OUT deals for the
+        position so a partial-close + final-close still reports total P&L.
+    """
     global mt5_conn
     if not mt5_conn or not mt5_conn.is_connected():
         return jsonify({'ok': True, 'trades': []})
     try:
         import MetaTrader5 as mt5
         from datetime import timedelta
+        from collections import defaultdict
+
         date_from = datetime.now(timezone.utc) - timedelta(days=30)
-        date_to = datetime.now(timezone.utc)
+        date_to   = datetime.now(timezone.utc)
         deals = mt5.history_deals_get(date_from, date_to)
         if deals is None:
             return jsonify({'ok': True, 'trades': []})
+
+        # MT5 deal.entry codes — name them so the intent is obvious.
+        DEAL_ENTRY_IN     = 0
+        DEAL_ENTRY_OUT    = 1
+        DEAL_ENTRY_INOUT  = 2   # netting close-and-reverse
+        DEAL_ENTRY_OUT_BY = 3   # close by opposite position
+        OUT_CODES = {DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY}
+
+        # Group every deal by position_id so we can pair entries to exits.
+        by_position: "dict[int, list]" = defaultdict(list)
+        for d in deals:
+            pid = int(getattr(d, "position_id", 0) or 0)
+            if pid:
+                by_position[pid].append(d)
+
         trades = []
-        for deal in deals:
-            # DEAL_ENTRY_OUT (1) = normal close / partial close
-            # DEAL_ENTRY_OUT_BY (3) = close by opposite position (netting)
-            if deal.entry in (1, 3):
-                trades.append({
-                    'ticket': deal.ticket,
-                    'order': deal.order,
-                    'symbol': deal.symbol,
-                    'type': 'BUY' if deal.type == 0 else 'SELL',
-                    'volume': deal.volume,
-                    'price': round(deal.price, 5),
-                    'profit': round(deal.profit, 2),
-                    'swap': round(deal.swap, 2),
-                    'commission': round(deal.commission, 2),
-                    'time': datetime.fromtimestamp(deal.time, tz=timezone.utc).isoformat(),
-                    'comment': deal.comment,
-                })
+        for pid, plist in by_position.items():
+            ins  = [d for d in plist if d.entry == DEAL_ENTRY_IN]
+            outs = [d for d in plist if d.entry in OUT_CODES]
+            if not ins or not outs:
+                # Position is still open (no OUT yet) or otherwise
+                # malformed — skip; open positions are surfaced by
+                # /bot/positions, not /bot/history.
+                continue
+
+            in_deal   = min(ins,  key=lambda d: d.time)   # earliest IN
+            out_deal  = max(outs, key=lambda d: d.time)   # last OUT (final close)
+
+            trades.append({
+                'ticket':       int(pid),                    # broker position id
+                'order':        int(getattr(out_deal, "order", 0) or 0),
+                'symbol':       in_deal.symbol,
+                # Direction comes from the OPENING deal — that's what
+                # the operator placed. (deal.type: 0=BUY, 1=SELL.)
+                'type':         'BUY' if in_deal.type == 0 else 'SELL',
+                'volume':       float(in_deal.volume),
+                # Entry price = where the trade actually filled.
+                'price':        round(float(in_deal.price), 5),
+                'entry_price':  round(float(in_deal.price), 5),
+                'exit_price':   round(float(out_deal.price), 5),
+                # Sum P&L across every OUT deal so partial closes are
+                # included in the total.
+                'profit':       round(sum(float(d.profit or 0)     for d in outs), 2),
+                'swap':         round(sum(float(d.swap or 0)       for d in outs), 2),
+                'commission':   round(sum(float(d.commission or 0) for d in outs), 2),
+                # `time` is the close time so the dashboard's "recent
+                # trades" sort keeps the most-recently-closed first.
+                'time':         datetime.fromtimestamp(out_deal.time, tz=timezone.utc).isoformat(),
+                'entry_time':   datetime.fromtimestamp(in_deal.time,  tz=timezone.utc).isoformat(),
+                'comment':      in_deal.comment or out_deal.comment,
+            })
+
         trades.sort(key=lambda x: x['time'], reverse=True)
         return jsonify({'ok': True, 'trades': trades[:100]})
     except Exception as exc:
@@ -806,6 +1020,71 @@ def bot_performance():
         # misleading positive number.
         recovery = (running / max_dd) if max_dd > 0 else 0.0
 
+        # ── Direction breakdown (BUY vs SELL) ─────────────────────────
+        # Pair every closing deal with its opening deal (same logic the
+        # /bot/history fix uses) so we can attribute each closed trade
+        # to its ENTRY direction. Reading `closing_deal.type` directly
+        # gives the inverse — closing a BUY emits a SELL order.
+        from collections import defaultdict
+        DEAL_ENTRY_IN     = 0
+        DEAL_ENTRY_OUT    = 1
+        DEAL_ENTRY_INOUT  = 2
+        DEAL_ENTRY_OUT_BY = 3
+        OUT_CODES = {DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY}
+
+        by_position: "dict[int, list]" = defaultdict(list)
+        for d in deals:
+            pid = int(getattr(d, "position_id", 0) or 0)
+            if pid:
+                by_position[pid].append(d)
+
+        dir_buckets = {
+            "BUY":  {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0},
+            "SELL": {"count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0},
+        }
+        for pid, plist in by_position.items():
+            ins  = [d for d in plist if d.entry == DEAL_ENTRY_IN]
+            outs = [d for d in plist if d.entry in OUT_CODES]
+            if not ins or not outs:
+                continue   # still open or malformed — skip
+            in_deal = min(ins, key=lambda d: d.time)
+            side = "BUY" if in_deal.type == 0 else "SELL"
+            pnl  = sum(float(d.profit or 0)
+                       + float(d.swap or 0)
+                       + float(d.commission or 0) for d in outs)
+            b = dir_buckets[side]
+            b["count"]     += 1
+            b["total_pnl"] += pnl
+            if pnl > 0:
+                b["wins"] += 1
+            elif pnl < 0:
+                b["losses"] += 1
+            # zero P&L (rare — exact BE) is counted but not as win or loss
+
+        # Round + add win-rate so the UI doesn't have to compute it.
+        for side, b in dir_buckets.items():
+            decided = b["wins"] + b["losses"]
+            b["win_rate"]  = round((b["wins"] / decided * 100), 1) if decided else 0.0
+            b["total_pnl"] = round(b["total_pnl"], 2)
+
+        # Open-positions count — surfaced on the Total Trades card so the
+        # operator can see "3 closed · 1 live" at a glance instead of just
+        # the closed count.
+        try:
+            open_positions = list(mt5.positions_get() or [])
+            open_count = len(open_positions)
+            open_pnl   = float(sum(getattr(p, "profit", 0.0) or 0.0
+                                    for p in open_positions))
+        except Exception:
+            open_count = 0
+            open_pnl   = 0.0
+
+        # Current floating drawdown in $: distance from the equity peak
+        # to the current realised + floating equity. The percentage in
+        # current_dd_pct above is computed against equity peak only;
+        # we also surface the raw $ figure for the subtitle.
+        current_dd_abs = max(0.0, peak - current_val)
+
         kpis = {
             'win_rate': round(win_rate, 1),
             'profit_factor': round(profit_factor, 2),
@@ -817,6 +1096,27 @@ def bot_performance():
             'current_drawdown': round(current_dd_pct, 2),
             'recovery_factor': round(recovery, 2),
             'sortino': round(sortino, 2),
+            # Per-direction wins/losses/P&L. Rendered as a "BUY vs SELL"
+            # KPI card on the Performance page so the operator can see
+            # at a glance whether the edge is symmetric or one-sided.
+            'direction_breakdown': dir_buckets,
+            # ── Supporting numbers for the KPI subtitle lines ────────
+            # Each existing card now has a "WW/LL", "+$X / -$Y", etc.
+            # row beneath the headline value. These fields feed those
+            # rows. Kept on the same payload (vs. a second endpoint) so
+            # the dashboard renders the whole Performance page from one
+            # request — no flicker, no extra network round-trip.
+            'wins_count':           len(wins),
+            'losses_count':         len(losses),
+            'gross_profit':         round(gross_profit, 2),
+            'gross_loss':           round(gross_loss,   2),
+            'total_pnl':            round(running,      2),     # net realised $
+            'max_drawdown_abs':     round(max_dd,       2),     # peak-to-trough $
+            'current_drawdown_abs': round(current_dd_abs, 2),   # peak-to-now $
+            'avg_win_abs':          round(avg_win,      2),
+            'avg_loss_abs':         round(avg_loss,     2),
+            'open_positions':       int(open_count),
+            'open_pnl':             round(open_pnl,     2),     # floating $
         }
         return jsonify({'ok': True, 'kpis': kpis, 'equity_curve': cumulative[-200:]})
     except Exception as exc:
@@ -863,6 +1163,247 @@ def bot_config_apply():
     except Exception as exc:
         log.error("Config apply error: %s", exc)
         return jsonify({'ok': False, 'error': 'Failed to apply configuration'}), 500
+
+
+# ─── Agent (Orchestrator + pair bots) endpoints ────────────────────────────
+#
+# These three endpoints feed the Agents tab and are also referenced by the
+# Signals tab and Zero Log header. They were missing from the server, which
+# caused the dashboard to show "invalid response from /api/ollama/h…" — the
+# frontend's fetch wrapper falls back to that string when /api/ollama/health
+# fetches alongside these missing endpoints fail to parse JSON.
+#
+# All three are READ-only views of state already maintained by ai_agent.py:
+#   /api/agent/matrix     → bot config + last verdicts + heatmap + memory
+#   /api/agent/portfolio  → portfolio snapshot (risk, alignment, exposure)
+#   /api/agent/directives → POST to update freeze/close/exposure/notes
+
+PAIR_SYMBOLS = ("EURUSD", "GBPUSD", "GBPJPY", "EURJPY")
+
+# Cache the latest verdicts the orchestrator received, keyed by symbol. The
+# bot subprocess writes verdicts via the thought log; we mirror them here so
+# the dashboard's matrix tab can show the most recent verdict per pair
+# without re-running the strategy.
+_latest_verdicts_by_symbol: dict = {}
+_last_orch_confidence: float = None
+
+
+def _bot_config_for_symbol(sym: str) -> dict:
+    """Read pair-bot tunables from ai_agent so the dashboard can render
+    per-pair diagnostics (min ATR threshold, trail multiplier, etc.)."""
+    try:
+        from ai_agent import _PAIR_BOT_CLASSES
+        cls = _PAIR_BOT_CLASSES.get(sym.upper())
+        if cls is None:
+            return {}
+        return {
+            "min_atr_to_tighten": float(cls.MIN_ATR_PROFIT_TO_TIGHTEN),
+            "trail_atr_mult":     float(cls.TRAIL_ATR_MULT),
+            "close_on_trend":     bool(cls.CLOSE_ON_TREND_BROKEN),
+            "close_on_structure": bool(cls.CLOSE_ON_STRUCTURE_BROKEN),
+        }
+    except Exception:
+        return {}
+
+
+@app.route('/api/agent/matrix', methods=['GET'])
+def api_agent_matrix():
+    """Snapshot of the multi-agent system: config, verdicts, heatmap, memory."""
+    global bot_process, _latest_verdicts_by_symbol, _last_orch_confidence
+
+    running = bool(bot_process and bot_process.poll() is None)
+
+    bots = {sym: _bot_config_for_symbol(sym) for sym in PAIR_SYMBOLS}
+
+    # Heatmap + memory + directives come from the orchestrator singleton.
+    heatmap = {"vetoes": {s: 0 for s in PAIR_SYMBOLS},
+               "overrides": {s: 0 for s in PAIR_SYMBOLS}}
+    memory_summary = "No prior decisions this session."
+    directives_payload = {"freeze": [], "close": [], "max_exposure_pct": 0.0, "notes": ""}
+
+    try:
+        from ai_agent import get_orchestrator, get_directives
+        orch = get_orchestrator()
+        try:
+            heatmap = orch.memory.heatmap_data()
+        except Exception as exc:
+            log.debug("heatmap fetch failed: %s", exc)
+        try:
+            memory_summary = orch.memory.summary_text()
+        except Exception as exc:
+            log.debug("memory summary failed: %s", exc)
+
+        d = get_directives()
+        directives_payload = {
+            "freeze":           sorted(d.freeze_symbols),
+            "close":            sorted(d.close_symbols),
+            "max_exposure_pct": float(d.max_exposure_pct),
+            "notes":            d.notes,
+        }
+    except Exception as exc:
+        log.debug("orchestrator state fetch failed: %s", exc)
+
+    # Mirror the latest Ollama health into the matrix so the frontend can
+    # render the orchestrator's LLM-readiness in one shot.
+    ollama_payload = {"reachable": False, "model_loaded": False,
+                      "model": None, "latency_ms": None}
+    try:
+        from ai_agent import ollama_health
+        ollama_payload = ollama_health()
+    except Exception as exc:
+        log.debug("ollama_health for matrix failed: %s", exc)
+
+    return jsonify({
+        "running":          running,
+        "bots":             bots,
+        "latest_verdicts":  _latest_verdicts_by_symbol,
+        "orch_confidence":  _last_orch_confidence,
+        "heatmap":          heatmap,
+        "memory_summary":   memory_summary,
+        "directives":       directives_payload,
+        "ollama":           ollama_payload,
+    })
+
+
+@app.route('/api/agent/portfolio', methods=['GET'])
+def api_agent_portfolio():
+    """Live PortfolioSnapshot for the risk dial / alignment / exposure cards."""
+    global mt5_conn
+
+    payload = {
+        "equity":             0.0,
+        "balance":            0.0,
+        "daily_pl":           0.0,
+        "daily_loss_limit":   0.0,
+        "daily_loss_breach":  False,
+        "open_count":         0,
+        "max_positions_total":0,
+        "risk_budget_pct":    0.0,
+        "alignment_score":    0.0,
+        "correlation_load":   0.0,
+        "pair_exposure":      {},
+    }
+
+    if not mt5_conn or not mt5_conn.is_connected():
+        return jsonify(payload)
+
+    try:
+        import MetaTrader5 as mt5
+        account = mt5.account_info()
+        if account:
+            payload["equity"]  = float(getattr(account, "equity", 0.0))
+            payload["balance"] = float(getattr(account, "balance", 0.0))
+            payload["daily_pl"] = round(payload["equity"] - payload["balance"], 2)
+
+        positions = mt5.positions_get() or []
+        payload["open_count"] = len(positions)
+
+        # Per-pair exposure: lots, SL distance in pips, % equity at risk.
+        pair_exp = {}
+        sides = []
+        for pos in positions:
+            sym = pos.symbol.upper()
+            digits = 3 if "JPY" in sym else 5
+            pip = 10 ** -(digits - 1)
+            sl_dist_pips = (abs(pos.price_open - pos.sl) / pip) if pos.sl else 0.0
+            entry = pair_exp.setdefault(sym, {"lots": 0.0, "sl_pips": 0.0,
+                                              "risk_pct": 0.0, "profit": 0.0})
+            entry["lots"]    += float(pos.volume)
+            entry["sl_pips"]  = max(entry["sl_pips"], sl_dist_pips)
+            entry["profit"]  += float(pos.profit + pos.swap)
+            sides.append("BUY" if pos.type == 0 else "SELL")
+
+        payload["pair_exposure"] = pair_exp
+
+        # Correlation load: fraction of positions on the dominant side.
+        if sides:
+            dom = max(sides.count("BUY"), sides.count("SELL"))
+            payload["correlation_load"] = round(
+                (dom - 1) / len(sides) if len(sides) > 1 else 0.0, 2)
+    except Exception as exc:
+        log.debug("portfolio snapshot failed: %s", exc)
+
+    return jsonify(payload)
+
+
+@app.route('/api/agent/directives', methods=['POST'])
+def api_agent_directives():
+    """Update GlobalDirectives from the dashboard's Directives form."""
+    try:
+        from ai_agent import GlobalDirectives, set_directives
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"agent module import failed: {exc}"}), 500
+
+    try:
+        data = request.get_json(silent=True) or {}
+        freeze = {str(s).upper() for s in (data.get("freeze") or []) if s}
+        close_ = {str(s).upper() for s in (data.get("close")  or []) if s}
+        try:
+            max_exp = float(data.get("max_exposure_pct") or 0)
+        except Exception:
+            max_exp = 0.0
+        notes = str(data.get("notes") or "")[:300]
+
+        d = GlobalDirectives(
+            freeze_symbols=freeze,
+            close_symbols=close_,
+            max_exposure_pct=max(0.0, max_exp),
+            notes=notes,
+        )
+        set_directives(d)
+        return jsonify({"ok": True, "summary": d.summary()})
+    except Exception as exc:
+        log.error("directives update failed: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route('/api/agent/tuning', methods=['GET'])
+def api_agent_tuning():
+    """Per-pair self-tuning strategy params, keyed by symbol.
+
+    Reads the live values the bot uses each poll cycle. When a backtest
+    finishes, agent_learning_loop auto-reloads the new tunings, so this
+    endpoint always reflects the currently-active per-pair strategy.
+
+    Response shape:
+        {
+          "loaded":     bool,                     # any insights loaded?
+          "file_exists": bool,
+          "last_mtime": ISO timestamp | null,
+          "pairs": {
+            "EURUSD": {
+              "params": {
+                "atr_tolerance_mult": 1.5,
+                "sl_atr_mult":        2.5,
+                ...
+              },
+              "source":      "backtest" | "default",
+              "backtest_at": ISO timestamp | null,
+              "trade_count": int | null,
+              "win_rate":    float | null
+            },
+            ...
+          }
+        }
+    """
+    payload = {
+        "loaded":      False,
+        "file_exists": False,
+        "last_mtime":  None,
+        "pairs":       {},
+    }
+    try:
+        from agent_learning_loop import get_learning_loop
+        loop = get_learning_loop()
+        st = loop.status()
+        payload["loaded"]      = bool(loop.has_insights())
+        payload["file_exists"] = bool(st.get("file_exists"))
+        payload["last_mtime"]  = st.get("last_mtime")
+        payload["pairs"]       = loop.get_all_tuned_params()
+    except Exception as exc:
+        log.debug("agent tuning fetch failed: %s", exc)
+        payload["error"] = str(exc)
+    return jsonify(payload)
 
 
 # ─── Backtest endpoint ─────────────────────────────────────────────────────
@@ -1193,6 +1734,12 @@ def api_backtest_stream():
                     "by_side":             result.get("by_side") or {},
                     "by_hour":             result.get("by_hour") or {},
                     "by_dow":              result.get("by_dow") or {},
+                    # Calendar window this pair's trades came from. The
+                    # dashboard renders it in the panel subtitles so the
+                    # operator can see WHICH dates each "Mon"/"Tue" bar
+                    # represents — a 4-Monday sample tells you very
+                    # different things from a 26-Monday sample.
+                    "date_range":          result.get("date_range") or None,
                     "confidence_buckets":  result.get("confidence_buckets") or {},
                     "pnl_distribution":    result.get("pnl_distribution") or {},
                     "component_correlations": result.get("component_correlations") or {},
@@ -1321,6 +1868,61 @@ def api_backtest_stream():
             'Connection': 'keep-alive',
         },
     )
+
+
+# ── Agent Zero Memory API ─────────────────────────────────────────────────────
+@app.route('/api/agent/memory')
+def agent_memory_stats():
+    """Return Agent Zero memory stats for the Agents tab."""
+    try:
+        from agent_memory import get_memory as _gam
+        mem = _gam()
+        stats = mem.stats()
+        ctx   = mem.build_context()
+        return jsonify({"ok": True, "stats": stats, "context_preview": ctx[:600]})
+    except ImportError:
+        return jsonify({"ok": False, "error": "agent_memory not available"}), 503
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+# ── Trade Memory API ─────────────────────────────────────────────────────────
+@app.route('/api/backtest/memory')
+def backtest_memory():
+    """
+    Return cumulative trade-memory stats from SQLite for all four pairs.
+    Called by the dashboard's memory panel on the Backtest tab.
+    Response shape:
+        {
+          "ok": true,
+          "pairs": {
+            "EURUSD": {n_runs, total_trades, wins, losses, win_rate,
+                        total_pnl, earliest, latest, importances, tuned_params},
+            ...
+          }
+        }
+    """
+    PAIRS = ["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"]
+    try:
+        from odl.trade_memory import get_memory as _gm
+        mem = _gm()
+    except ImportError:
+        return jsonify({"ok": False, "error": "trade_memory not available"}), 503
+
+    result = {}
+    for sym in PAIRS:
+        try:
+            stats = mem.get_cumulative_stats(sym)
+            # Also pull latest aggregated importances & tuned params
+            agg = mem.aggregate_insights(sym)
+            stats["importances"] = agg.get("importances") or {}
+            stats["tuned_params"] = agg.get("tuned_params") or {}
+            stats["n_runs"] = agg.get("n_runs", stats.get("n_runs", 0))
+            result[sym] = stats
+        except Exception as exc:
+            result[sym] = {"symbol": sym, "error": str(exc), "n_runs": 0}
+
+    return jsonify({"ok": True, "pairs": result})
 
 
 if __name__ == '__main__':

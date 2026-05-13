@@ -1,0 +1,100 @@
+# pyproject.toml — project config for the Fortis multi-agent trading bot
+#
+# This file does three jobs:
+#   1. Declares minimal project metadata so tooling (ruff, mypy, IDEs) can
+#      find the package roots without guessing.
+#   2. Configures pytest so `pytest` from the repo root discovers tests in
+#      both tests/ and odl/ (the latter has the legacy backtester suite).
+#   3. Configures ruff so CI runs the same lint as you would locally.
+
+[project]
+name        = "fortis-trading-bot"
+version     = "0.1.0"
+description = "CHoCH + daily-levels multi-agent FX trading bot with Ollama-backed Agent Zero"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+# Discover tests in the dedicated tests/ directory and in odl/ (which holds
+# the original backtester smoke tests). Two locations is the price of not
+# moving odl/test_backtest_management.py — it works as a script too, so
+# leaving it where it is preserves the `python odl/test_backtest_management.py`
+# workflow that's documented in its docstring.
+testpaths = ["tests", "odl"]
+
+# Belt-and-braces: prevent pytest from descending into virtualenvs or vendor
+# trees. testpaths above already scopes collection, but norecursedirs also
+# protects fixture / tempdir cleanup paths from following symlinks into
+# .venv/Lib/site-packages — that produced an infinite recursion on at
+# least one operator's mounted-Windows-FS sandbox.
+norecursedirs = [
+    ".git", ".venv", "venv", "__pycache__",
+    "*.egg-info", "build", "dist", "_to_delete",
+]
+
+# Default match — keeps standard pytest naming so we don't pick up unrelated
+# files like odl/backtest.py itself.
+python_files     = ["test_*.py"]
+python_classes   = ["Test*"]
+python_functions = ["test_*"]
+
+# Surface the slowest tests so we can keep CI fast as the suite grows.
+addopts = "-ra --strict-markers --durations=10"
+
+# Markers used in the suite — declaring them silences `--strict-markers`
+# warnings for tests that opt into them.
+markers = [
+    "slow: tests that take more than ~5s (skipped in PR-fast mode)",
+    "requires_mt5: tests that need MetaTrader5 importable (Windows only)",
+    "requires_ollama: tests that need a live Ollama server",
+]
+
+# Capture stdout per-test by default; use `pytest -s` to see prints during
+# the run (handy for the backtester's PASS/FAIL row output).
+log_cli       = false
+log_cli_level = "INFO"
+
+
+[tool.ruff]
+# Match the Python target the bot actually runs on.
+target-version = "py310"
+line-length    = 100
+
+# Don't lint things we don't own / shouldn't touch.
+extend-exclude = [
+    ".venv",
+    "venv",
+    "_to_delete",
+    "__pycache__",
+    "*.bak",
+]
+
+[tool.ruff.lint]
+# Start with the conservative default rule set; expand later. The aim of
+# CI lint here is "catch obvious mistakes", not enforce a style guide.
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes (unused imports/vars, undefined names)
+    "W",    # pycodestyle warnings
+    "B",    # flake8-bugbear (likely bugs)
+    "I",    # isort (import ordering)
+    "UP",   # pyupgrade (modern syntax suggestions)
+]
+ignore = [
+    "E501",  # line too long — let Black/ruff format handle this if/when adopted
+    "B008",  # function call in default arg — Flask/FastAPI patterns trip this
+    "UP007", # `Optional[X]` vs `X | None` — keep both in mixed-version code
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests can be looser — long inline data, fixture imports, etc.
+"tests/**/*.py"      = ["E402", "F401", "F811"]
+"odl/test_*.py"      = ["E402", "F401", "F811"]
+# Backtester has long argparse docstrings & big inline tables.
+"odl/backtest.py"    = ["E741"]  # ambiguous var names in math-heavy code
+
+[tool.ruff.format]
+# Wire ruff's formatter to Black-compatible defaults so `ruff format` is
+# safe to run if the user wants it. CI does not currently enforce format.
+quote-style                = "preserve"
+indent-style               = "space"
+docstring-code-format      = false

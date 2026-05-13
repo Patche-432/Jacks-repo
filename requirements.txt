@@ -1,17 +1,46 @@
-# Core runtime dependencies for Jack's trading repo
+# ============================================================================
+# requirements.txt — Fortis multi-agent trading bot
+# ============================================================================
 #
-# Install:
+# Install from the repo root with your .venv activated:
+#   .\.venv\Scripts\Activate.ps1
 #   pip install -r requirements.txt
 #
-# Optional extras:
-#   pip install -r requirements-backtest.txt
+# After installing, run the preflight check:
+#   python scripts\preflight.py
 #
-# Agent Zero runs against a local Ollama server (install separately:
-# https://ollama.com). No in-process LLM dependencies are required.
+# ── OLLAMA (not a pip package) ───────────────────────────────────────────────
+# The Orchestrator (Agent 0) talks to a local Ollama HTTP server using only
+# Python stdlib (urllib). There is NO pip package for Ollama here.
+# Install Ollama separately:
+#   winget install Ollama.Ollama          (Windows)
+#   .\scripts\setup_ollama.ps1           (then pull the model + smoke test)
+# ============================================================================
 
+# ── Web server ────────────────────────────────────────────────────────────────
 Flask>=2.3
 flask-cors>=4.0
+
+# ── Production WSGI server (replaces Flask dev-server warning) ────────────────
+# Waitress is pure-Python and Windows-friendly (gunicorn doesn't support Windows).
+# Entry point: python scripts\serve.py
+waitress>=3.0
+
+# ── Data / numerics ───────────────────────────────────────────────────────────
 numpy>=1.24
 pandas>=2.0
+
+# ── ML (backtester feature-importance, agent learning loop) ───────────────────
+scikit-learn>=1.3
+
+# ── HTTP (used by some legacy callers; agent layer uses stdlib urllib) ────────
 requests>=2.31
+
+# ── Broker bridge (Windows only) ──────────────────────────────────────────────
+# Requires the MetaTrader 5 desktop terminal installed and logged in.
 MetaTrader5>=5.0
+
+# ── Environment variable loading ──────────────────────────────────────────────
+# Loads .env file automatically at startup so OLLAMA_URL, OLLAMA_MODEL,
+# AI_BACKEND etc. are picked up without manual export.
+python-dotenv>=1.0

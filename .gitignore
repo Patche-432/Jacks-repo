@@ -1,11 +1,42 @@
+# ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
-*.venv
+*.egg-info/
+.pytest_cache/
+
+# ── Virtual environments ──────────────────────────────────────────────────
+# (Previously *.venv, which was the wrong glob — that pattern matches
+# files ending in .venv, not directories named .venv or venv.)
+.venv/
+venv/
+env/
+
+# ── Editor / OS noise ─────────────────────────────────────────────────────
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Excel lock files (created when a workbook in the repo is open)
+.~lock.*#
+
+# ── Secrets ───────────────────────────────────────────────────────────────
+.env
 core/.mt5_key
 core/mt5_credentials_config.json
+mt5_credentials.json
 
-# Backtest helpers and temp files
+# ── Runtime artefacts (regenerated each run; should never be tracked) ─────
+ai_thoughts.jsonl
+ai_pro_trade_log.json
+backtest_insights.json
+*.log
+
+# ── Quarantine for files staged for deletion ──────────────────────────────
+_to_delete/
+
+# ── Backtest helpers and temp files ───────────────────────────────────────
 backtest_fast_eurusd.py
 backtest_result.txt
 capture_backtest.py

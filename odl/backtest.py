@@ -1,68 +1,61 @@
 """
-╔════════════════════════════════════════════════════════════════════╗
-║        Agent Zero Backtester — Historical Signal Validation        ║
-║        Measure component score correlation with trade outcomes     ║
-╚════════════════════════════════════════════════════════════════════╝
-
-Tests the Agent Zero Bot strategy engine (structure detection, level
-states, momentum scoring, weighted confidence) against historical M15
-data.
-
-Tracks:
-  ► Signal generation metrics (by component)
-  ► Trade performance (wins/losses, R:R achieved)
-  ► Correlation: which components predict winning trades?
-  ► False reversals caught vs. before (for comparison)
-
-Usage:
-    python backtest.py --symbol EURUSD --days 30 --plot
-    python backtest.py --symbol GBPUSD --days 7 --export
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  Fortis AI Pro — Back-tester                                                 ║
+║                                                                              ║
+║  Runs the deterministic AgentZeroBot strategy over a historical window and  ║
+║  produces per-pair results: P&L, win-rate, feature importances, tuned       ║
+║  strategy params, and ML metrics.                                            ║
+║                                                                              ║
+║  Design principles                                                            ║
+║  ─────────────────                                                            ║
+║  • Zero look-ahead: signal generated at bar[i] close; entry at bar[i+1]     ║
+║    open.  The last-forming bar is never used as a signal bar.                ║
+║  • Conservative intrabar: when both TP and SL are touched in the same       ║
+║    OHLC candle the SL is assumed to have been hit first.                     ║
+║  • Realism gates: spread widening, position-overlap deduplication,           ║
+║    Asian-session JPY filter, last-bar skip.                                  ║
+║  • Single-exit RAW model: the whole position exits at the first SL/TP       ║
+║    touch or at the final bar's close on timeout.  No partial close,         ║
+║    no breakeven trail, no runner — this isolates the raw signal edge.        ║
+║    Live trade-management overlay belongs in the live bot, not here.          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 """
+from __future__ import annotations
 
-import json
 import logging
+import os
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import List, Optional, Dict, Tuple, Callable, Any
-import sys
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 
-# Optional: sklearn for feature-importance diagnostics
+log = logging.getLogger(__name__)
+
+# ── Optional imports ──────────────────────────────────────────────────────────
+
+# trade_memory is imported lazily so the backtester works even when SQLite is
+# unavailable. The _get_memory() call is only inside _save_insights_for_pair.
+HAS_TRADE_MEMORY: bool = False
+_get_memory = None   # type: ignore[assignment]
 try:
-    from sklearn.ensemble import RandomForestClassifier
+    from odl.trade_memory import get_memory as _get_memory
+    HAS_TRADE_MEMORY = True
+except ImportError:
+    try:
+        from trade_memory import get_memory as _get_memory  # type: ignore[no-redef]
+        HAS_TRADE_MEMORY = True
+    except ImportError:
+        pass
+
+HAS_SKLEARN: bool = False
+try:
+    from sklearn.ensemble import RandomForestClassifier   # noqa: F401
     HAS_SKLEARN = True
 except ImportError:
-    HAS_SKLEARN = False
+    pass
 
-# Optional: for plotting
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
-
-# Optional: AgentZeroBot (only needed for live backtesting)
-try:
-    from ai_pro import AgentZeroBot, _mt5_initialize
-    HAS_AI_PRO = True
-except ImportError:
-    HAS_AI_PRO = False
-    AgentZeroBot = None
-    _mt5_initialize = None
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-log = logging.getLogger("backtest")
-
-# ============================================================ #
-# UTILITY FUNCTIONS                                            #
-# ============================================================ #
+# ── Pip helpers ───────────────────────────────────────────────────────────────
 
 def get_pip_value(symbol: str) -> float:
     """Return pip size: 0.0001 for most pairs, 0.01 for JPY pairs."""
@@ -71,47 +64,84 @@ def get_pip_value(symbol: str) -> float:
     return 0.0001   # Standard pairs: 4 decimal places
 
 
+class _TradeProxy:
+    """
+    Lightweight read-only proxy that wraps a flat dict row from
+    TradeMemory.query_trades() so it looks like a Trade object to
+    compute_feature_importance(). Only the fields that function
+    actually reads are implemented.
+    """
+    __slots__ = ('outcome', 'entry_time', 'signal', 'rr_achieved', 'profit_pips', 'profit')
+
+    class _SignalProxy:
+        __slots__ = ('source', 'symbol', 'signal', 'confidence', 'rr_ratio',
+                     'entry_price', 'stop_loss', 'take_profit', 'atr', 'poc', 'ts', 'environment')
+        def __init__(self, row: dict) -> None:
+            self.source      = row.get('source', '')
+            self.symbol      = row.get('symbol', '')
+            self.signal      = row.get('signal', 'BUY')
+            self.confidence  = float(row.get('confidence', 0.0) or 0.0)
+            self.rr_ratio    = float(row.get('rr_ratio',   0.0) or 0.0)
+            self.entry_price = float(row.get('entry_price', 0.0) or 0.0)
+            self.stop_loss   = float(row.get('sl',  0.0) or 0.0)
+            self.take_profit = float(row.get('tp',  0.0) or 0.0)
+            self.atr         = float(row.get('atr', 0.0) or 0.0)
+            self.poc         = float(row.get('poc', 0.0) or 0.0)
+            self.environment = row.get('source', '')
+            raw_ts = row.get('entry_time')
+            try:
+                from datetime import datetime as _dt
+                self.ts = _dt.fromisoformat(str(raw_ts)) if raw_ts else None
+            except Exception:
+                self.ts = None
+
+    def __init__(self, row: dict) -> None:
+        self.outcome     = row.get('outcome', '')
+        self.profit_pips = float(row.get('profit_pips', 0.0) or 0.0)
+        self.profit      = float(row.get('profit_usd',  0.0) or 0.0)
+        self.rr_achieved = float(row.get('rr_achieved', 0.0) or 0.0)
+        raw_et = row.get('entry_time')
+        try:
+            from datetime import datetime as _dt
+            self.entry_time = _dt.fromisoformat(str(raw_et)) if raw_et else None
+        except Exception:
+            self.entry_time = None
+        self.signal = _TradeProxy._SignalProxy(row)
+
+
 def get_pip_usd_value(symbol: str, lot_size: float = 1.0,
                       jpy_quote_rate: float = 150.0) -> float:
     """
     USD value of one pip for `lot_size` lots.
 
-    For pairs quoted in USD (xxx/USD): exactly $10 per pip per 1.0 lot.
-    For pairs quoted in JPY (xxx/JPY): ~1000 JPY per pip per 1.0 lot, then
-    converted to USD by dividing by the USD/JPY rate. We use a fixed
-    `jpy_quote_rate` (default ~150) for repeatability — exact value moves
-    with the market but ~$6.67/pip is a far better approximation than the
-    flat $10 used previously.
+    For USD-quote pairs (EURUSD, GBPUSD):
+        1 pip = 0.0001 price units × 100,000 units/lot × lot_size
+              = $10 per standard lot
 
-    For other quote currencies, this is still approximate; extend as
-    needed.
+    For JPY-quote pairs (EURJPY, GBPJPY):
+        1 pip = 0.01 JPY × 100,000 units/lot × lot_size
+        Convert: ÷ jpy_quote_rate  (≈ 150 USDJPY → ~$6.67/pip/lot)
+
+    Parameters
+    ----------
+    symbol         : e.g. "EURUSD", "GBPJPY"
+    lot_size       : number of lots (0.5 = mini lot × 5)
+    jpy_quote_rate : approximate USDJPY rate for conversion (default 150)
     """
-    sym = symbol.upper()
-    # Standard contract size for forex = 100,000 units of base currency
-    contract = 100_000.0 * lot_size
-    if sym.endswith("JPY"):
-        pip_in_quote = contract * 0.01           # 1000 JPY per pip per lot
-        return pip_in_quote / max(1.0, jpy_quote_rate)
-    if sym.endswith("USD"):
-        return contract * 0.0001                  # $10 per pip per lot
-    # Fallback for cross pairs we don't model (CHF, AUD, etc.) — keep the
-    # historical $10 default but make it explicit so the caller can override.
-    return 10.0 * lot_size
+    pip = get_pip_value(symbol)
+    units_per_lot = 100_000.0
+
+    if "JPY" in symbol.upper():
+        # JPY-quoted pair: pip value in JPY, convert to USD
+        pip_usd = (pip * units_per_lot * lot_size) / jpy_quote_rate
+    else:
+        # USD-quoted pair (EURUSD, GBPUSD, etc.)
+        pip_usd = pip * units_per_lot * lot_size
+
+    return pip_usd
 
 
-def default_spread_pips(symbol: str) -> float:
-    """Typical retail-broker spread for the major pairs we trade.
-
-    Used as a cost on entry. Override via AgentZeroBacktester(spread_pips=...).
-    """
-    sym = symbol.upper()
-    if "JPY" in sym:
-        return 2.0   # GBPJPY / EURJPY are wider
-    return 1.0       # EURUSD / GBPUSD are typically <=1 pip on majors
-
-# ============================================================ #
-# DATA STRUCTURE                                               #
-# ============================================================ #
+# ── Domain objects ────────────────────────────────────────────────────────────
 
 @dataclass
 class Signal:
@@ -187,7 +217,7 @@ class Trade:
             self.outcome = "LOSS"
         else:
             self.outcome = "BE"
-        
+
         if risk_pips > 0:
             self.rr_achieved = abs(self.profit_pips) / risk_pips
         else:
@@ -195,366 +225,443 @@ class Trade:
 
 
 # ============================================================ #
-# BACKTESTER                                                   #
+# Backtester                                                   #
 # ============================================================ #
 
-class AgentZeroBacktester:
+class Backtester:
     """
-    Backtester for Agent Zero Bot trading signals.
+    Runs the deterministic AgentZeroBot strategy over a look-back window.
 
-    Requires:
-    1. MT5 to be running with credentials configured
-    2. Historical M15 data accessible via MT5
-
-    Runs:
-    1. Fetches M15 candles for period
-    2. For each candle, generates AgentZeroBot signals
-    3. Tracks opening/closing of positions
-    4. Measures correlation between component scores and outcomes
+    Usage
+    -----
+    bt = Backtester(strategy=live_strategy_instance)
+    results = bt.run_backtest(symbol="EURUSD", days=30, lot_size=0.5)
     """
-    
+
+    # ── Default / fallback param values (mirrors live defaults) ──────────────
+    _TUNED_PARAM_DEFAULTS: Dict[str, float] = {
+        "atr_tolerance_mult": 1.5,
+        "sl_atr_mult":        2.5,
+        "tp_atr_mult":        4.5,
+        "partial_close_rr":   1.0,
+        "be_buffer_pips":     1.0,
+        "min_atr_to_tighten": 1.0,
+        "trail_atr_mult":     1.0,
+    }
+
+    # ── Clamp ranges (guards against outlier tuning results) ──────────────────
+    _TUNED_PARAM_CLAMPS: Dict[str, Tuple[float, float]] = {
+        "atr_tolerance_mult": (1.0, 2.5),
+        "sl_atr_mult":        (1.0, 5.0),
+        "tp_atr_mult":        (1.5, 10.0),
+        "partial_close_rr":   (0.5, 3.0),
+        "be_buffer_pips":     (0.3, 5.0),
+        "min_atr_to_tighten": (0.5, 3.0),
+        "trail_atr_mult":     (0.5, 2.0),
+    }
+
     def __init__(
         self,
-        symbols: List[str] = None,
-        lookback_bars: int = 200,
-        max_trade_duration_bars: int = 96,  # 24 hours on M15
-        risk_per_trade_pips: float = 50.0,  # How many pips SL represents
-        lot_size: float = 1.0,  # Lot size (0.50, 1.0, etc.)
-        # ── Accuracy knobs ────────────────────────────────────────────
-        # Typical broker spread charged on entry (in pips). None = use
-        # default_spread_pips(symbol). Set to 0.0 to disable.
-        spread_pips: Optional[float] = None,
-        # When both TP and SL are touched in the same candle we can't
-        # tell from OHLC which hit first. "conservative" assumes SL
-        # (worst realistic outcome), "optimistic" assumes TP (old
-        # behaviour), "neutral" splits 50/50.
+        strategy=None,
         intrabar_policy: str = "conservative",
-    ):
-        self.symbols = symbols or ["EURUSD"]
-        self.lookback_bars = lookback_bars
-        self.max_trade_duration_bars = max_trade_duration_bars
-        self.risk_per_trade_pips = risk_per_trade_pips
-        self.lot_size = lot_size
-        self.spread_pips_override = spread_pips
-        self.intrabar_policy = intrabar_policy if intrabar_policy in {
-            "conservative", "optimistic", "neutral"
-        } else "conservative"
-        
-        # Import AgentZeroBot lazily to avoid MT5 requirement if just analyzing
-        self._strategy = None
-        self._mt5 = None
-        
-        self.signals: List[Signal] = []
-        self.trades: List[Trade] = []
-        self.candle_history: Dict[str, pd.DataFrame] = {}
-    
-    def _ensure_mt5(self):
-        """Lazy-load MT5 and AgentZeroBot strategy."""
-        if self._strategy is not None:
-            return  # Already initialized
+        lot_size: float = 0.5,
+        # ── Realism params ───────────────────────────────────────────────────
+        # Typical broker spread (in price points, not pips) added on BUY entry.
+        # EURUSD: 1 point = 0.00001 → 1.0 point spread ≈ 1 pip (0.0001 / 0.00001)
+        # GBPJPY: 1 point = 0.001  → 2.0 point spread ≈ 2 pips
+        default_spread_points_major: float = 1.0,
+        default_spread_points_jpy:   float = 2.0,
+        # Asian-session spread widening multiplier applied on top of the above.
+        # GBPJPY ~17 pt typical → 33–35 pt during Asian session, while
+        # EURUSD widens to ~1.4 pt — realistic but not catastrophic.
+        asian_session_jpy_multiplier: float = 2.2,
+        asian_session_other_multiplier: float = 1.4,
+        # Maximum spread (points) that a signal is allowed to trade through.
+        # Signals with estimated spread above this are silently skipped, the
+        # same way the live bot rejects them.
+        max_spread_points_jpy:   float = 30.0,
+        max_spread_points_major: float = 3.0,
+    ) -> None:
+        self._strategy  = strategy
+        self.intrabar_policy = intrabar_policy
+        self.lot_size   = float(lot_size)
 
-        if not HAS_AI_PRO:
-            log.error("AgentZeroBot module not available. Run: pip install MetaTrader5")
-            return
+        self.default_spread_points_major    = float(default_spread_points_major)
+        self.default_spread_points_jpy      = float(default_spread_points_jpy)
+        self.asian_session_jpy_multiplier   = float(asian_session_jpy_multiplier)
+        self.asian_session_other_multiplier = float(asian_session_other_multiplier)
+        self.max_spread_points_jpy          = float(max_spread_points_jpy)
+        self.max_spread_points_major        = float(max_spread_points_major)
 
-        try:
-            # Try to import MetaTrader5
-            try:
-                import MetaTrader5 as mt5
-            except ImportError:
-                log.error("MetaTrader5 not installed. Run: pip install MetaTrader5")
-                return
+        # Set by simulate_trades; inspected by tests and the SSE stream handler.
+        self._last_skip_stats: Dict[str, int] = {}
+        self._active_until: Dict[str, datetime] = {}
 
-            # Initialize MT5
-            if not _mt5_initialize():
-                log.warning("MT5 initialization failed. Ensure MT5 terminal is running with credentials configured.")
-                return
+    # ── Public API ────────────────────────────────────────────────────────────
 
-            # Create strategy without the Agent Zero review (raw signals, for speed)
-            self._strategy = AgentZeroBot(use_ai=False, lookback_candles=200)
-            self._mt5 = mt5
-            log.info("MT5 and AgentZeroBot initialized successfully")
-
-        except Exception as e:
-            log.error("Failed to initialize MT5/AgentZeroBot: %s", e)
-    
-    def fetch_data(self, symbol: str, days: int = 30) -> Optional[pd.DataFrame]:
+    def run_backtest(
+        self,
+        symbol: str,
+        days: int = 7,
+        lot_size: Optional[float] = None,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> Dict[str, Any]:
         """
-        Fetch M15 historical data covering the **most recent `days`
-        calendar days**, ending at the current UTC moment.
+        Run the full back-test pipeline for one symbol.
 
-        Uses `copy_rates_range(start, end)` so the window rolls forward
-        with real time — every run gets fresh data ending now. We pull
-        two extra days of warm-up so the strategy has 50+ bars of
-        swing-point context before the first backtested bar.
-
-        Falls back to `copy_rates_from_pos(0, N)` if the range query
-        returns nothing (some broker feeds balk on narrow ranges over
-        weekends).
+        Returns a results dict consumed by the SSE stream handler and
+        the dashboard's per-pair breakdown panel.
         """
-        self._ensure_mt5()
-
-        if self._mt5 is None:
-            log.warning("MT5 not available; cannot fetch live data")
-            return None
-
-        try:
-            now_utc   = datetime.now(timezone.utc)
-            warmup_d  = 2  # ~192 M15 bars → plenty of lookback for ENV logic
-            start_utc = now_utc - timedelta(days=int(days) + warmup_d)
-
-            rates = self._mt5.copy_rates_range(
-                symbol, self._mt5.TIMEFRAME_M15, start_utc, now_utc
-            )
-            if rates is None or len(rates) < 50:
-                # Broker returned nothing meaningful — fall back to the
-                # bar-count query. Over-request slightly to cover the
-                # weekend-gap shortfall vs. `days * 96`.
-                bars_needed = max(self.lookback_bars,
-                                  int((int(days) + warmup_d) * 96))
-                log.info(
-                    "copy_rates_range returned %s; falling back to "
-                    "copy_rates_from_pos(0, %d) for %s",
-                    "None" if rates is None else f"{len(rates)} bars",
-                    bars_needed, symbol,
-                )
-                rates = self._mt5.copy_rates_from_pos(
-                    symbol, self._mt5.TIMEFRAME_M15, 0, bars_needed
-                )
-
-            if rates is None or len(rates) < 50:
-                log.warning("Not enough data for %s (need 50+ M15 bars)", symbol)
-                return None
-
-            df = pd.DataFrame(rates)
-            df["time"] = pd.to_datetime(df["time"], unit="s")
-            df = df.sort_values("time").reset_index(drop=True)
-
-            first_ts = df.iloc[0]["time"]
-            last_ts  = df.iloc[-1]["time"]
-            log.info(
-                "Fetched %d M15 bars for %s  window=[%s → %s]  (rolling "
-                "%d-day request + %d-day warm-up)",
-                len(df), symbol, first_ts, last_ts, int(days), warmup_d,
-            )
-            return df
-
-        except Exception as e:
-            log.error("Data fetch error [%s]: %s", symbol, e)
-            return None
-    
-    def _fetch_daily(self, symbol: str, bars: int = 90) -> pd.DataFrame:
-        """Fetch daily candles ending NOW. `bars` is treated as the
-        calendar-day lookback (we always over-fetch a bit to be safe).
-        """
-        if self._mt5 is None:
-            log.warning("MT5 not available; cannot fetch daily data")
-            return pd.DataFrame()
-
-        try:
-            # Always fetch at least 90 days of D1 context — the strategy
-            # only ever reads previous days, so extra history is free.
-            count = max(int(bars), 90)
-            rates = self._mt5.copy_rates_from_pos(
-                symbol, self._mt5.TIMEFRAME_D1, 0, count
-            )
-            if rates is None or len(rates) < 1:
-                log.warning("Not enough daily data for %s", symbol)
-                return pd.DataFrame()
-
-            df = pd.DataFrame(rates)
-            df["time"] = pd.to_datetime(df["time"], unit="s")
-            df = df.sort_values("time").reset_index(drop=True)
-
-            log.info("Fetched %d daily candles for %s (ending %s)",
-                     len(df), symbol, df.iloc[-1]["time"])
-            return df
-
-        except Exception as e:
-            log.error("Daily data fetch error [%s]: %s", symbol, e)
-            return pd.DataFrame()
-
-    def _fetch_weekly(self, symbol: str, bars: int = 52) -> pd.DataFrame:
-        """Fetch weekly candles ending NOW."""
-        if self._mt5 is None:
-            log.warning("MT5 not available; cannot fetch weekly data")
-            return pd.DataFrame()
-
-        try:
-            count = max(int(bars), 52)
-            rates = self._mt5.copy_rates_from_pos(
-                symbol, self._mt5.TIMEFRAME_W1, 0, count
-            )
-            if rates is None or len(rates) < 1:
-                log.warning("Not enough weekly data for %s", symbol)
-                return pd.DataFrame()
-
-            df = pd.DataFrame(rates)
-            df["time"] = pd.to_datetime(df["time"], unit="s")
-            df = df.sort_values("time").reset_index(drop=True)
-
-            log.info("Fetched %d weekly candles for %s (ending %s)",
-                     len(df), symbol, df.iloc[-1]["time"])
-            return df
-
-        except Exception as e:
-            log.error("Weekly data fetch error [%s]: %s", symbol, e)
-            return pd.DataFrame()
-    
-    def generate_signals(self, symbol: str, df: pd.DataFrame,
-                         progress_cb: Optional[Callable[[dict], None]] = None,
-                         window_start: Optional[datetime] = None) -> List[Signal]:
-        """
-        Generate signals for each candle in history.
-
-        If `window_start` is provided, only bars at or after that UTC
-        timestamp are evaluated as signal candidates — earlier bars are
-        treated as warm-up context for the strategy's swing detection
-        (which needs at least 50 prior bars). This keeps the reported
-        backtest window tight to what the user asked for.
-        """
-        self._ensure_mt5()
-
-        if self._strategy is None:
-            log.error("Strategy not initialized")
-            return []
+        if lot_size is not None:
+            self.lot_size = float(lot_size)
 
         def _emit(payload: dict) -> None:
             if progress_cb is not None:
                 try:
                     progress_cb(payload)
                 except Exception:
-                    pass  # never let a progress hook break the backtest
-        
-        # Fetch daily and weekly data once before the loop
-        df_daily = self._fetch_daily(symbol, bars=90)
-        if df_daily.empty:
-            log.warning("No daily data available; continuing without daily level mocking")
-            df_daily = None
-        
-        df_weekly = self._fetch_weekly(symbol, bars=52)
-        if df_weekly.empty:
-            log.warning("No weekly data available; continuing without weekly level mocking")
-            df_weekly = None
-        
-        signals = []
-        # Skip the very last bar — MT5 includes the currently-forming
-        # candle whose close is a partial tick. Stop one bar early so
-        # every bar we evaluate is fully closed (lookahead safety).
-        last_closed_idx = len(df) - 1  # exclusive upper bound below
+                    pass
 
-        # Find the first bar inside the user's requested window. Earlier
-        # bars serve as warm-up for the strategy (need 50+ swing points),
-        # but they don't contribute signals. This keeps the reported
-        # period honest: if the user asks for "7 days", signals come
-        # from the last 7 days, not the 9-day fetch window.
-        if window_start is not None:
-            # df["time"] is naive UTC; strip tzinfo on window_start to compare
-            ws = (window_start.replace(tzinfo=None)
-                  if window_start.tzinfo is not None else window_start)
-            mask = df["time"] >= ws
-            first_in_window = int(mask.values.argmax()) if mask.any() else last_closed_idx
-        else:
-            first_in_window = 50
-        start_idx = max(50, first_in_window)
+        _emit({"type": "stage", "symbol": symbol, "stage": "fetching_data"})
 
-        total_bars = max(1, last_closed_idx - start_idx)
-        _emit({"type": "signals_begin", "symbol": symbol, "total_bars": total_bars})
+        # ── 1. Fetch historical data ─────────────────────────────────────────
+        try:
+            df = self._fetch_historical(symbol, days)
+        except Exception as exc:
+            log.error("Historical data fetch failed for %s: %s", symbol, exc)
+            return {"symbol": symbol, "error": str(exc)}
 
-        # Simulate walking through history
-        for i in range(start_idx, last_closed_idx):  # warm-up is [0..start_idx)
-            # Emit progress every ~5% of the run so the UI can update live
-            bars_done = i - start_idx
-            if bars_done > 0 and bars_done % max(1, total_bars // 20) == 0:
-                _emit({
-                    "type": "bar",
-                    "symbol": symbol,
-                    "bar": bars_done,
-                    "total": total_bars,
-                    "signals_so_far": len(signals),
-                })
+        if df is None or df.empty:
+            return {"symbol": symbol, "error": "No historical data returned"}
+
+        _emit({"type": "stage", "symbol": symbol, "stage": "generating_signals"})
+
+        # ── 2. Generate signals ──────────────────────────────────────────────
+        try:
+            signals = self.generate_signals(symbol, df, days, progress_cb=progress_cb)
+        except Exception as exc:
+            log.error("Signal generation failed for %s: %s", symbol, exc)
+            return {"symbol": symbol, "error": f"Signal generation failed: {exc}"}
+
+        if not signals:
+            return {
+                "symbol": symbol,
+                "error": "No signals generated — strategy found no setups in this window",
+            }
+
+        _emit({"type": "stage", "symbol": symbol, "stage": "simulating_trades"})
+
+        # ── 3. Simulate trades ───────────────────────────────────────────────
+        try:
+            trades = self.simulate_trades(symbol, df, signals, progress_cb=progress_cb)
+        except Exception as exc:
+            log.error("Trade simulation failed for %s: %s", symbol, exc)
+            return {"symbol": symbol, "error": f"Simulation failed: {exc}"}
+
+        skip_stats   = dict(self._last_skip_stats)
+        realism_stats = {
+            "raw_signals": skip_stats.get("raw_signals", len(signals)),
+            "skipped_overlap": skip_stats.get("skipped_overlap", 0),
+            "skipped_spread":  skip_stats.get("skipped_spread",  0),
+            "simulated":       len(trades),
+            "closed":          sum(1 for t in trades if t.exit_time is not None),
+        }
+
+        log.info(
+            "Simulated %d trades, closed %d "
+            "(spread=%.1fp, intrabar=%s, skipped: overlap=%d spread=%d of %d raw)",
+            len(trades), realism_stats["closed"],
+            (self.default_spread_points_jpy if "JPY" in symbol
+             else self.default_spread_points_major),
+            self.intrabar_policy,
+            realism_stats["skipped_overlap"],
+            realism_stats["skipped_spread"],
+            realism_stats["raw_signals"],
+        )
+
+        _emit({"type": "stage", "symbol": symbol, "stage": "analysing_results"})
+
+        # ── 4. Analyse results ───────────────────────────────────────────────
+        try:
+            results = self.analyze_results(symbol, trades, df)
+        except Exception as exc:
+            log.error("Analysis failed for %s: %s", symbol, exc)
+            return {"symbol": symbol, "error": f"Analysis failed: {exc}"}
+
+        results["symbol"] = symbol
+        results["period"] = (f"{df.iloc[0]['time'].date()} to "
+                             f"{df.iloc[-1]['time'].date()}")
+        results["window_start_utc"] = df.iloc[0]["time"].isoformat()
+        results["window_end_utc"]   = df.iloc[-1]["time"].isoformat()
+        results["requested_days"]   = int(days)
+        results["vp_filter"]        = {}          # kept for API compat
+        results["realism_filters"]  = realism_stats
+
+        # ── ML: train on current run + deduplicated historical trades ──
+        # Current run is saved to DB AFTER this point, so querying
+        # returns only previous runs — no risk of double-counting.
+        # Dedup on (entry_time, exit_time, outcome) so the same
+        # simulated trade from overlapping backtest windows is only
+        # counted once — prevents RF bias toward repeated patterns.
+        all_trades_for_ml = list(trades)
+        if HAS_TRADE_MEMORY and _get_memory is not None:
             try:
-                # Create a slice of data up to this candle
-                df_slice = df.iloc[:i+1].copy()
-                bar_time = df_slice.iloc[-1]["time"]
-                bar_date = bar_time.date()
-                
-                # Get historically correct daily levels
-                correct_levels = None
-                if df_daily is not None and len(df_daily) > 0:
-                    prev_days = df_daily[df_daily["time"].dt.date < bar_date]
-                    
-                    if len(prev_days) > 0:
-                        prev_day = prev_days.iloc[-1]
-                        correct_levels = {
-                            "date":  prev_day["time"].date(),
-                            "high":  float(prev_day["high"]),
-                            "low":   float(prev_day["low"]),
-                            "range": float(prev_day["high"]) - float(prev_day["low"]),
-                        }
-                
-                # Get historically correct weekly levels
-                correct_weekly = None
-                if df_weekly is not None and len(df_weekly) > 0:
-                    prev_weeks = df_weekly[df_weekly["time"].dt.date < bar_date]
-                    
-                    if len(prev_weeks) > 0:
-                        prev_week = prev_weeks.iloc[-1]
-                        correct_weekly = {
-                            "date":  prev_week["time"].date(),
-                            "high":  float(prev_week["high"]),
-                            "low":   float(prev_week["low"]),
-                            "range": float(prev_week["high"]) - float(prev_week["low"]),
-                        }
-                
-                # Temporarily override the strategy's fetch methods so each
-                # replayed bar sees only its own historical context.
-                #
-                # Note: the strategy no longer applies a daily-bias gate
-                # (that filter has moved to Agent Zero — see ai_agent.py).
-                # The backtester therefore tests RAW signals — no bias —
-                # and the previous `_get_daily_trend_bias` lookahead patch
-                # is no longer needed.
-                original_fetch = self._strategy._fetch_m15
-                original_levels = self._strategy.get_previous_day_levels
+                mem_for_ml = _get_memory()
+                rows = mem_for_ml.query_trades(symbol=symbol, limit=5000)
+                if rows:
+                    seen: set = set()
+                    extra: list = []
+                    for row in rows:
+                        key = (
+                            str(row.get('entry_time') or ''),
+                            str(row.get('exit_time')  or ''),
+                            str(row.get('outcome')    or ''),
+                        )
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        extra.append(_TradeProxy(row))
+                    if extra:
+                        all_trades_for_ml = list(trades) + extra
+                        log.info(
+                            "%s: ML training on %d trades "
+                            "(%d this run + %d unique historical, %d dupes removed)",
+                            symbol, len(all_trades_for_ml),
+                            len(trades), len(extra),
+                            len(rows) - len(extra),
+                        )
+            except Exception as exc:
+                log.warning("%s: could not load historical trades for ML: %s", symbol, exc)
 
-                def mock_fetch(sym):
-                    return df_slice
+        fi = self.compute_feature_importance(all_trades_for_ml)
+        if fi is not None:
+            results["feature_importance"] = fi
 
-                def mock_levels(sym):
-                    if correct_levels:
-                        return correct_levels
-                    return {"date": bar_date, "high": 0.0, "low": 0.0, "range": 0.0}
+        try:
+            fi_for_save = fi if (fi and "error" not in fi) else None
+            self._save_insights_for_pair(
+                symbol=symbol,
+                feature_importance=fi_for_save,
+                results=results,
+                trades=trades,
+            )
+        except Exception as exc:
+            log.warning("Could not save insights for %s: %s", symbol, exc)
 
-                self._strategy._fetch_m15 = mock_fetch
-                self._strategy.get_previous_day_levels = mock_levels
+        return results
 
-                # Also set these directly as a safety net. Always assign
-                # (even when levels are missing) so a stale value from a
-                # previous iteration can't leak into the current bar.
-                if correct_levels:
-                    self._strategy.previous_day_high = correct_levels["high"]
-                    self._strategy.previous_day_low  = correct_levels["low"]
-                else:
-                    self._strategy.previous_day_high = None
-                    self._strategy.previous_day_low  = None
+    # ── Data fetching ─────────────────────────────────────────────────────────
 
-                if correct_weekly:
-                    self._strategy.previous_week_high = correct_weekly["high"]
-                    self._strategy.previous_week_low  = correct_weekly["low"]
-                else:
-                    self._strategy.previous_week_high = None
-                    self._strategy.previous_week_low  = None
+    def _fetch_historical(self, symbol: str, days: int):
+        """Fetch M15 OHLCV bars for the look-back window."""
+        import pandas as pd
 
+        if self._strategy is None:
+            raise RuntimeError("No strategy attached — cannot fetch data")
+
+        # How many bars do we need?
+        # days × 24h × 4 bars/h = bars in window, plus a warm-up buffer
+        # so the strategy can build swing points / structure before trading.
+        bars_needed = int(days * 24 * 4) + 200   # 200-bar warm-up
+
+        try:
+            df = self._strategy._fetch_m15(symbol, bars_needed)
+        except Exception as exc:
+            raise RuntimeError(f"_fetch_m15 failed for {symbol}: {exc}") from exc
+
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            raise RuntimeError(f"_fetch_m15 returned empty data for {symbol}")
+
+        # Ensure datetime column
+        if "time" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["time"]):
+            df["time"] = pd.to_datetime(df["time"])
+
+        # ATR column (needed for spread estimation and signal sizing)
+        if "atr" not in df.columns:
+            close = df["close"].astype(float)
+            high  = df["high"].astype(float)
+            low   = df["low"].astype(float)
+            tr = pd.concat([
+                high - low,
+                (high - close.shift(1)).abs(),
+                (low  - close.shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            df["atr"] = tr.ewm(span=14, adjust=False).mean()
+
+        return df
+
+    # ── Realism helpers ───────────────────────────────────────────────────────
+
+    def _estimate_spread_points(self, symbol: str, bar_time: datetime) -> float:
+        """
+        Return the estimated bid-ask spread in price *points* for this bar.
+
+        Session multiplier widens the spread during the Asian session
+        (21:00–07:00 UTC) to match realistic broker conditions:
+          GBPJPY ~17 pt typical → 33–35 pt during Asian session, while
+          EURUSD widens to ~1.4 pt.  Without this the backtester happily
+          sails through Asian-session JPY signals that live would have
+          rejected due to wide spread.
+        """
+        is_jpy = "JPY" in symbol.upper()
+        base   = (self.default_spread_points_jpy if is_jpy
+                  else self.default_spread_points_major)
+
+        # Session multiplier
+        hour = bar_time.hour if hasattr(bar_time, "hour") else 0
+        is_asian = (hour >= 21) or (hour < 7)
+        if not is_asian:
+            return base
+        mult = (self.asian_session_jpy_multiplier if is_jpy
+                else self.asian_session_other_multiplier)
+        return base * mult
+
+    def _apply_vp_filter(
+        self,
+        sig,
+        spread_price: float,
+    ) -> bool:
+        """
+        Point-of-Control bias filter.
+
+        Returns True (keep the signal) when the signal's direction is
+        consistent with the POC bias computed at signal time, or when POC
+        data is unavailable.  Returns False to skip.
+
+        BUY signals want price > POC (bullish bias — price trading above
+        the volume-weighted fair-value level).
+        SELL signals want price < POC (bearish bias).
+
+        A tolerance band of ±atr_tolerance_mult × ATR is applied so we
+        don't reject signals that are only marginally on the wrong side.
+        """
+        poc = float(getattr(sig, "poc", 0.0) or 0.0)
+        if poc <= 0.0:
+            return True   # no POC data — don't filter
+
+        entry = float(getattr(sig, "entry_price", 0.0) or 0.0)
+        if entry <= 0.0:
+            return True
+
+        atr = float(getattr(sig, "atr", 0.0) or 0.0)
+        if atr <= 0.0:
+            return True
+
+        # Get tolerance from strategy (respects live tuned value)
+        tol_mult = 1.5
+        if self._strategy is not None:
+            try:
+                tol_mult = float(getattr(self._strategy, "atr_tolerance_mult", 1.5))
+            except Exception:
+                pass
+        tolerance = atr * tol_mult
+
+        side = str(getattr(sig, "signal", "")).upper()
+        if side == "BUY":
+            return (entry + spread_price) >= (poc - tolerance)
+        if side == "SELL":
+            return (entry - spread_price) <= (poc + tolerance)
+        return True
+
+    # ── Signal generation ─────────────────────────────────────────────────────
+
+    def generate_signals(
+        self,
+        symbol: str,
+        df,
+        days: int,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> List[Signal]:
+        """
+        Walk the bar array and generate one Signal per bar where the
+        strategy would have triggered.
+
+        Key design choices
+        ------------------
+        • Bar i is the *signal* bar (its close triggers the decision).
+        • Entry is taken at bar i+1 open — zero look-ahead.
+        • The last-forming bar (df.iloc[-1]) is never used as a signal bar
+          to avoid partially-formed OHLC data influencing results.
+        • Historical daily / weekly levels are reconstructed from df up to
+          bar i so the strategy sees the same data it would have live.
+        """
+        import pandas as pd
+
+        def _emit(payload: dict) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(payload)
+                except Exception:
+                    pass
+
+        signals: List[Signal] = []
+
+        # We only trade the last `days` calendar days.  Everything before
+        # that is warm-up so the strategy can build its swing-point context.
+        now_utc     = datetime.now(timezone.utc).replace(tzinfo=None)
+        window_start = pd.Timestamp(now_utc) - pd.Timedelta(days=days)
+
+        if self._strategy is None:
+            return signals
+
+        # Save the strategy's original live data fetchers so we can restore
+        # them after mocking for historical replay.
+        original_fetch  = self._strategy._fetch_m15
+        original_levels = self._strategy.get_previous_day_levels
+
+        total_bars = len(df)
+        _emit({"type": "bar", "symbol": symbol,
+               "bar": 0, "total": total_bars, "signals_so_far": 0})
+
+        for i in range(12, total_bars - 1):   # -1: skip last-forming bar
+            bar_time = df.iloc[i]["time"]
+            if pd.Timestamp(bar_time) < window_start:
+                continue
+
+            # Slice up to and including bar i (no look-ahead)
+            df_slice = df.iloc[:i + 1].copy()
+
+            # Mock data fetcher so the strategy only sees history up to bar i
+            def mock_fetch(sym, n, _df=df_slice):   # noqa: E731
+                return _df.iloc[-min(n, len(_df)):]
+
+            # Reconstruct daily / weekly levels from bars up to this point
+            from_day  = df_slice["time"].dt.date
+            prev_days = df_slice[from_day < from_day.iloc[-1]].groupby(from_day)
+            prev_weeks = (
+                df_slice.assign(_w=df_slice["time"].dt.isocalendar().week)
+                        .groupby("_w")
+            )
+
+            if len(prev_days) > 0:
+                last_day  = sorted(prev_days.groups.keys())[-1]
+                day_group = prev_days.get_group(last_day)
+                correct_levels = {
+                    "high": float(day_group["high"].max()),
+                    "low":  float(day_group["low"].min()),
+                }
+            else:
+                correct_levels = {"high": 0.0, "low": 0.0}
+
+            if len(prev_weeks) > 0:
+                last_week  = sorted(prev_weeks.groups.keys())[-1]
+                week_group = prev_weeks.get_group(last_week)
+                self._strategy.previous_week_high = float(week_group["high"].max())
+                self._strategy.previous_week_low  = float(week_group["low"].min())
+
+            self._strategy._fetch_m15 = mock_fetch
+            self._strategy.get_previous_day_levels = lambda s, **kw: correct_levels
+            self._strategy.previous_day_high = correct_levels["high"]
+            self._strategy.previous_day_low  = correct_levels["low"]
+
+            try:
                 try:
                     # Generate signal at this point
                     raw_signal = self._strategy.generate_trade_signal(symbol)
 
                     if raw_signal.get("signal") != "neutral":
                         # Compute POC from the no-lookahead window the
-                        # strategy just saw. Used by _apply_vp_filter to
-                        # gate trades by VP bias (price > POC = bullish,
-                        # price < POC = bearish). Strategy is untouched.
+                        # strategy just saw.
                         poc_value = self._compute_poc(df_slice)
                         sig = Signal(
                             ts=df_slice.iloc[-1]["time"],
@@ -579,30 +686,62 @@ class AgentZeroBacktester:
                     # Restore original methods
                     self._strategy._fetch_m15 = original_fetch
                     self._strategy.get_previous_day_levels = original_levels
-            
+
             except Exception as e:
                 log.error("Signal gen error at bar %d: %s", i, str(e)[:200])
                 if i < 55:  # Print first few errors
                     import traceback
                     traceback.print_exc()
                 continue
-        
+
+            if i % 20 == 0:
+                _emit({"type": "bar", "symbol": symbol,
+                       "bar": i, "total": total_bars,
+                       "signals_so_far": len(signals)})
+
         log.info("Generated %d signals for %s", len(signals), symbol)
         _emit({"type": "signals_done", "symbol": symbol, "signals": len(signals)})
         return signals
-    
-    def simulate_trades(self, symbol: str, signals: List[Signal],
-                        df: pd.DataFrame,
-                        progress_cb: Optional[Callable[[dict], None]] = None) -> List[Trade]:
+
+    # ── Realism helpers — used by simulate_trades ─────────────────────────────
+
+    def _compute_poc(self, df_slice) -> float:
         """
-        Simulate trade execution and exit with realistic assumptions.
+        Compute the Point-of-Control (price of highest-volume bar) from
+        the last 96 bars (≈24 h of M15 data).
+
+        Returns 0.0 when volume data is unavailable or the window is too
+        short to be meaningful.
+        """
+        window = df_slice.tail(96)
+        if len(window) < 12:
+            return 0.0
+        if "volume" not in window.columns:
+            return 0.0
+        vols = window["volume"].astype(float)
+        if vols.sum() <= 0:
+            return 0.0
+        idx = vols.idxmax()
+        poc = float(window.loc[idx, "close"])
+        return poc
+
+    # ── Trade simulation ──────────────────────────────────────────────────────
+
+    def simulate_trades(
+        self,
+        symbol: str,
+        df,
+        signals: List[Signal],
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> List[Trade]:
+        """
+        Forward-simulate each signal against the OHLC data.
 
         Entry model
         -----------
-        Signal fires at close of bar i; order fills at open of bar i+1.
-        MT5 OHLC is BID-priced, so:
-            BUY  fills at open + full spread   (ask fill)
-            SELL fills at open                 (bid fill)
+        BUY  fills at bar[i+1] open + spread  (ask-priced, worst-case fill).
+        SELL fills at bar[i+1] open            (bid-priced, fills at open).
+
         This matches the round-trip cost a retail account pays.
 
         Exit model
@@ -633,15 +772,19 @@ class AgentZeroBacktester:
         total_sigs = max(1, len(signals))
         _emit({"type": "sim_begin", "symbol": symbol, "total_signals": total_sigs})
 
-        times = df["time"].to_list()
-        pip_size = get_pip_value(symbol)
-        spread_pips = (self.spread_pips_override
-                       if self.spread_pips_override is not None
-                       else default_spread_pips(symbol))
-        spread_price = spread_pips * pip_size
-
-        import bisect
-        times_sorted = times  # df already sorted by time
+        # ── Realism-gate bookkeeping ─────────────────────────────────────
+        # `_active_until[symbol]` = exit_time of the last live trade on
+        # this symbol. Subsequent signals before that timestamp are
+        # rejected by the position-overlap dedupe (live can't open a
+        # second trade while #N is still running). Reset per call so a
+        # fresh simulate_trades() invocation doesn't carry state across
+        # symbols / windows.
+        self._active_until: Dict[str, "datetime"] = {}
+        self._last_skip_stats = {
+            "raw_signals":     len(signals),
+            "skipped_overlap": 0,
+            "skipped_spread":  0,
+        }
 
         def _resolve_intrabar(c_open: float, tp: float, sl: float,
                               sl_price: float, tp_price: float) -> Tuple[float, str]:
@@ -649,33 +792,67 @@ class AgentZeroBacktester:
             if self.intrabar_policy == "optimistic":
                 return tp_price, "tp"
             if self.intrabar_policy == "neutral":
-                return (tp_price, "tp") if abs(tp - c_open) < abs(sl - c_open) \
-                    else (sl_price, "sl")
-            return sl_price, "sl"  # conservative (default)
+                if abs(c_open - tp) <= abs(c_open - sl):
+                    return tp_price, "tp"
+                return sl_price, "sl"
+            # conservative (default): SL wins
+            return sl_price, "sl"
 
-        for idx, sig in enumerate(signals):
-            if idx > 0 and idx % max(1, total_sigs // 10) == 0:
-                _emit({
-                    "type": "sim_progress",
-                    "symbol": symbol,
-                    "done": idx,
-                    "total": total_sigs,
-                })
+        bar_times = df["time"].tolist()
+        bar_map   = {t: i for i, t in enumerate(bar_times)}
+        df_records = df.to_dict("records")
 
-            # Find the first bar whose time >= sig.ts; entry is the next bar.
-            pos = bisect.bisect_left(times_sorted, sig.ts)
-            if pos >= len(df) - 1:
+        for sig_idx, sig in enumerate(signals):
+            side = str(sig.signal).upper()
+            if side not in ("BUY", "SELL"):
                 continue
 
-            entry_idx  = pos + 1
-            entry_row  = df.iloc[entry_idx]
-            entry_open = float(entry_row["open"])
-            entry_time = entry_row["time"]
-            side       = str(sig.signal).upper()
+            # ── Find entry bar ───────────────────────────────────────────
+            sig_bar_idx = bar_map.get(sig.ts)
+            if sig_bar_idx is None:
+                # Fuzzy match — find nearest bar
+                for idx, t in enumerate(bar_times):
+                    if t >= sig.ts:
+                        sig_bar_idx = idx
+                        break
+            if sig_bar_idx is None or sig_bar_idx + 1 >= len(df_records):
+                continue
 
-            # MT5 OHLC is bid-priced → BUY fills at ask (+full spread),
-            # SELL fills at bid (no adjust). Charges spread once per round
-            # trip in the correct direction.
+            entry_bar = df_records[sig_bar_idx + 1]
+            entry_open = float(entry_bar["open"])
+            entry_time = entry_bar["time"]
+
+            # ── Spread estimation ────────────────────────────────────────
+            spread_pts   = self._estimate_spread_points(symbol, entry_time)
+            is_jpy       = "JPY" in symbol.upper()
+            max_spread   = (self.max_spread_points_jpy if is_jpy
+                            else self.max_spread_points_major)
+            pip_size     = get_pip_value(symbol)
+            # Convert spread from points to price units
+            # Points for majors: 1 pt = 0.00001 (5-digit broker)
+            # Points for JPY:    1 pt = 0.001   (3-digit broker)
+            point_size   = 0.001 if is_jpy else 0.00001
+            spread_price = spread_pts * point_size
+
+            if spread_pts > max_spread:
+                self._last_skip_stats["skipped_spread"] += 1
+                continue
+
+            # ── POC-bias filter ──────────────────────────────────────────
+            # the backtester takes Asian-session JPY signals that live
+            # would have rejected because the entry price already pays the
+            # broker spread at this bar (typical × session multiplier)
+            if not self._apply_vp_filter(sig, spread_price):
+                self._last_skip_stats["skipped_spread"] += 1
+                continue
+
+            # ── Position-overlap gate ────────────────────────────────────
+            active_until = self._active_until.get(symbol)
+            if active_until is not None and entry_time <= active_until:
+                self._last_skip_stats["skipped_overlap"] += 1
+                continue
+
+            # ── Entry price ──────────────────────────────────────────────
             if side == "BUY":
                 entry_price = entry_open + spread_price
             elif side == "SELL":
@@ -712,24 +889,25 @@ class AgentZeroBacktester:
                 continue
 
             # Risk distance — used for skip-on-bad-signal guard only.
-            if side == "BUY":
-                risk_abs = entry_price - sl_price
-            else:
-                risk_abs = sl_price - entry_price
-
-            if risk_abs <= 0:
+            risk_pips_check = abs(entry_price - sl_price) / pip_size
+            if risk_pips_check < 1.0 or risk_pips_check > 500.0:
                 continue
 
-            trade = Trade(signal=sig, entry_price=entry_price, entry_time=entry_time)
+            # ── Forward scan for exit ────────────────────────────────────
+            trade = Trade(
+                signal=sig,
+                entry_price=entry_price,
+                entry_time=entry_time,
+            )
 
-            max_exit_idx = min(entry_idx + self.max_trade_duration_bars,
-                               len(df) - 1)
+            max_bars      = int(days * 24 * 4)   # max hold = look-back window
+            max_exit_idx  = min(sig_bar_idx + 2 + max_bars, len(df_records) - 1)
+            resolved      = False
 
-            # ── RAW exit loop — first SL/TP wins; timeout otherwise ──
-            resolved = False
-            for j in range(entry_idx, max_exit_idx + 1):
-                c = df.iloc[j]
-                c_high = float(c["high"]); c_low = float(c["low"])
+            for j in range(sig_bar_idx + 2, max_exit_idx + 1):
+                c = df_records[j]
+                c_high = float(c["high"])
+                c_low  = float(c["low"])
                 c_time = c["time"]
 
                 if side == "BUY":
@@ -739,232 +917,123 @@ class AgentZeroBacktester:
                     tp_hit = c_low  <= tp_price
                     sl_hit = c_high >= sl_price
 
+                # Exit spread correction for SELL trades:
+                # MT5 OHLC is bid-priced. Closing a SELL requires buying
+                # at the ASK (= bid + spread). Without this the backtest
+                # overstates SELL P&L by ~1-2 pips per trade.
+                exit_spread = spread_price if side == "SELL" else 0.0
+
                 if tp_hit and sl_hit:
                     exit_price, reason = _resolve_intrabar(
                         float(c["open"]), tp_price, sl_price, sl_price, tp_price)
-                    trade.calculate_exit(exit_price, c_time, reason, self.lot_size)
+                    trade.calculate_exit(exit_price + exit_spread, c_time, reason, self.lot_size)
                     resolved = True; break
                 if tp_hit:
-                    trade.calculate_exit(tp_price, c_time, "tp", self.lot_size)
+                    trade.calculate_exit(tp_price + exit_spread, c_time, "tp", self.lot_size)
                     resolved = True; break
                 if sl_hit:
-                    trade.calculate_exit(sl_price, c_time, "sl", self.lot_size)
+                    trade.calculate_exit(sl_price + exit_spread, c_time, "sl", self.lot_size)
                     resolved = True; break
 
             if not resolved:
-                close_candle = df.iloc[max_exit_idx]
+                close_candle = df_records[max_exit_idx]
                 exit_price = float(close_candle.get("close", entry_price))
-                trade.calculate_exit(exit_price, close_candle["time"],
+                # Apply exit spread correction for SELL on timeout too
+                exit_spread_timeout = spread_price if side == "SELL" else 0.0
+                trade.calculate_exit(exit_price + exit_spread_timeout, close_candle["time"],
                                      "timeout", self.lot_size)
 
             if trade.profit_pips <= -20:
                 log.warning(
                     "LARGE LOSS: %s %s | Entry: %.5f | SL: %.5f | TP: %.5f | "
-                    "Exit: %.5f at %s | P&L: %+.1f pips | Reason: %s | Env: %s",
-                    side, symbol, entry_price, sl_price, tp_price,
-                    trade.exit_price, trade.exit_time, trade.profit_pips,
-                    trade.exit_reason, sig.environment
+                    "Exit: %.5f at %s | P&L: %.1f pips | Reason: %s | Env: %s",
+                    side, symbol,
+                    entry_price, sl_price, tp_price,
+                    trade.exit_price, trade.exit_time,
+                    trade.profit_pips,
+                    trade.exit_reason,
+                    sig.environment or "?",
                 )
 
             trades.append(trade)
+            if trade.exit_time:
+                self._active_until[symbol] = trade.exit_time
 
-        log.info("Simulated %d trades, closed %d  (spread=%.1fp, intrabar=%s)",
-                 len(trades),
-                 len([t for t in trades if t.outcome != "open"]),
-                 spread_pips, self.intrabar_policy)
+            if sig_idx % 10 == 0:
+                _emit({"type": "sim_progress", "symbol": symbol,
+                       "done": sig_idx + 1, "total": total_sigs})
+
+        log.info(
+            "Simulated %d trades, closed %d "
+            "(spread=%.1fp, intrabar=%s, skipped: overlap=%d spread=%d of %d raw)",
+            len(trades),
+            sum(1 for t in trades if t.exit_time),
+            spread_pts,
+            self.intrabar_policy,
+            self._last_skip_stats["skipped_overlap"],
+            self._last_skip_stats["skipped_spread"],
+            self._last_skip_stats["raw_signals"],
+        )
         _emit({"type": "sim_done", "symbol": symbol, "trades": len(trades)})
         return trades
 
-    # ---------------------------------------------------------------- #
-    # Volume-profile POC bias filter                                   #
-    # ---------------------------------------------------------------- #
-    # Backtest-only POC bias gate. The volume profile gives us context:
-    # whichever side of the Point of Control we're on is our bias.
-    #
-    #   price > POC  →  bullish bias  →  only BUY signals are kept
-    #   price < POC  →  bearish bias  →  only SELL signals are kept
-    #
-    # Strategy still emits the full PDH/PDL + VP setups; the backtester
-    # filters them down to those that align with POC bias.
-    #
-    # POC is computed from the same no-lookahead bar window the strategy
-    # just saw (typical-price weighted by volume), so the filter never
-    # peeks at future bars.
-    POC_BIAS_LOOKBACK = 96   # M15 bars ≈ 24h profile window
-    POC_BIAS_BINS     = 32   # histogram resolution
+    # ── Analysis ──────────────────────────────────────────────────────────────
 
-    def _compute_poc(self, df_slice: "pd.DataFrame") -> float:
-        """
-        Return the price of the highest-volume bin in the histogram of
-        typical price weighted by volume over the trailing window.
-        Returns 0.0 when data is insufficient or degenerate.
-        """
-        if df_slice is None or len(df_slice) < 12:
-            return 0.0
-        window = df_slice.tail(self.POC_BIAS_LOOKBACK)
-        if len(window) < 12:
-            return 0.0
-        try:
-            vols = self._strategy._volume_series(window)
-        except Exception:
-            for col in ("real_volume", "tick_volume", "volume"):
-                if col in window.columns:
-                    vols = pd.to_numeric(window[col], errors="coerce").fillna(0.0)
-                    if float(vols.sum()) > 0:
-                        break
-            else:
-                vols = pd.Series(np.ones(len(window), dtype=float), index=window.index)
-        if float(vols.sum()) <= 0.0:
-            return 0.0
-        low_min = float(window["low"].min())
-        high_max = float(window["high"].max())
-        if high_max <= low_min:
-            return 0.0
-        typical = (
-            window["high"].astype(float)
-            + window["low"].astype(float)
-            + window["close"].astype(float)
-        ) / 3.0
-        try:
-            hist, edges = np.histogram(
-                typical.to_numpy(dtype=float),
-                bins=self.POC_BIAS_BINS,
-                range=(low_min, high_max),
-                weights=vols.to_numpy(dtype=float),
-            )
-        except Exception:
-            return 0.0
-        if hist.sum() <= 0:
-            return 0.0
-        idx = int(np.argmax(hist))
-        return float((edges[idx] + edges[idx + 1]) / 2.0)
+    def analyze_results(
+        self,
+        symbol: str,
+        trades: List[Trade],
+        df=None,
+    ) -> Dict[str, Any]:
+        """Compute per-symbol statistics from the simulated trade list."""
 
-    def _apply_vp_filter(self, signals: List[Signal]) -> Tuple[List[Signal], Dict[str, Any]]:
-        """
-        Keep only signals that align with POC bias.
-
-        BUY  signals are kept if entry_price > POC (price is above value).
-        SELL signals are kept if entry_price < POC (price is below value).
-        Signals with missing POC or entry price pass through unchanged
-        (defensive — don't silently drop on data hiccups).
-
-        Returns the filtered signals and a stats dict.
-        """
-        kept: List[Signal] = []
-        dropped_buy_below_poc = 0
-        dropped_sell_above_poc = 0
-        passthrough_no_poc = 0
-        sample_reasons: List[str] = []
-
-        def _record(reason: str) -> None:
-            if len(sample_reasons) < 25:
-                sample_reasons.append(reason)
-
-        for sig in signals:
-            poc = float(sig.poc or 0.0)
-            price = float(sig.entry_price or 0.0)
-            side = (sig.signal or "").upper()
-
-            if poc <= 0.0 or price <= 0.0:
-                # Insufficient data → don't filter (don't penalise the
-                # strategy for our own missing context).
-                passthrough_no_poc += 1
-                kept.append(sig)
-                continue
-
-            if side == "BUY":
-                if price > poc:
-                    kept.append(sig)
-                else:
-                    dropped_buy_below_poc += 1
-                    _record(f"BUY dropped: price {price:.5f} ≤ POC {poc:.5f}")
-            elif side == "SELL":
-                if price < poc:
-                    kept.append(sig)
-                else:
-                    dropped_sell_above_poc += 1
-                    _record(f"SELL dropped: price {price:.5f} ≥ POC {poc:.5f}")
-            else:
-                # Unknown side → pass through.
-                kept.append(sig)
-
-        stats = {
-            "mode":                    "poc_bias_only",
-            "input":                   len(signals),
-            "kept":                    len(kept),
-            "dropped":                 len(signals) - len(kept),
-            "dropped_buy_below_poc":   dropped_buy_below_poc,
-            "dropped_sell_above_poc":  dropped_sell_above_poc,
-            "passthrough_no_poc":      passthrough_no_poc,
-            "lookback_bars":           self.POC_BIAS_LOOKBACK,
-            "bins":                    self.POC_BIAS_BINS,
-            "sample_reasons":          sample_reasons[:10],
-        }
-        return kept, stats
-
-    def analyze_early_exits(self, trades: List[Trade]) -> Dict:
-        """Analyze trades that exit quickly (early reversals)."""
-        early_exits = {}
-        
-        for threshold_minutes in [75, 150, 300]:  # 5, 10, 20 candles
-            threshold_candles = threshold_minutes // 15
-            early = []
-            
-            for t in trades:
-                if t.duration_minutes <= threshold_minutes and t.outcome == "LOSS":
-                    early.append(t)
-            
-            if early:
-                early_exits[f"within_{threshold_candles}_candles"] = {
-                    "count": len(early),
-                    "pct_of_losses": len(early) / sum(1 for t in trades if t.outcome == "LOSS"),
-                    "avg_loss_pips": sum(t.profit_pips for t in early) / len(early),
-                    "exit_reasons": dict(
-                        (reason, sum(1 for t in early if t.exit_reason == reason))
-                        for reason in ["sl", "timeout"]
-                    ),
-                }
-        
-        return early_exits
-    
-    def analyze_results(self, trades: List[Trade]) -> Dict:
-        """Compute statistics and correlations."""
         if not trades:
-            return {"error": "No trades"}
-        
-        outcomes = [t.outcome for t in trades]
-        wins = sum(1 for t in trades if t.outcome == "WIN")
-        losses = sum(1 for t in trades if t.outcome == "LOSS")
-        win_rate = wins / len(trades) if trades else 0
-        
+            return {
+                "total_trades": 0, "wins": 0, "losses": 0,
+                "win_rate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0,
+                "profit_factor": 0.0, "avg_rr_achieved": 0.0,
+                "avg_win_rr": 0.0, "avg_loss_rr": 0.0,
+                "avg_win_pips": 0.0, "avg_loss_pips": 0.0,
+                "max_drawdown": 0.0, "max_drawdown_pct": 0.0,
+                "equity_curve": [],
+                "by_quality": {}, "by_exit_reason": {},
+                "by_env": {}, "by_side": {}, "by_hour": {}, "by_dow": {},
+                "confidence_buckets": {}, "pnl_distribution": {},
+                "component_correlations": {},
+                "early_exits": {},
+                "assumptions": self._build_assumptions(symbol),
+            }
+
+        wins   = [t for t in trades if t.outcome == "WIN"]
+        losses = [t for t in trades if t.outcome == "LOSS"]
+        decided = wins + losses
+        win_rate = wins.__len__() / len(trades) if trades else 0
+
+        win_pips  = sum(t.profit_pips for t in wins)
+        loss_pips = abs(sum(t.profit_pips for t in losses))
+
         total_pnl = sum(t.profit for t in trades)
-        avg_pnl = total_pnl / len(trades) if trades else 0
-        
-        win_pips = sum(t.profit_pips for t in trades if t.outcome == "WIN")
-        loss_pips = sum(t.profit_pips for t in trades if t.outcome == "LOSS")
-        avg_win = win_pips / wins if wins > 0 else 0
-        avg_loss = loss_pips / losses if losses > 0 else 0
-        
-        early_exits = self.analyze_early_exits(trades)
-        
-        # Correlation: component scores vs outcome
-        correlations = {}
-        for component in ["structure_strength", "level_interaction", 
-                         "momentum_quality", "spread_volatility", "environment_fit"]:
-            scores = []
-            outcomes_binary = []
-            for t in trades:
-                if component in t.signal.component_scores:
-                    scores.append(t.signal.component_scores[component])
-                    outcomes_binary.append(1 if t.outcome == "WIN" else 0)
-            
-            if len(scores) > 1:
-                corr = np.corrcoef(scores, outcomes_binary)[0, 1]
-                correlations[component] = float(corr) if not np.isnan(corr) else 0.0
-        
-        # Breakdown by signal quality
-        by_quality = {}
-        for quality in ["weak", "fair", "good", "strong"]:
+        avg_pnl   = total_pnl / len(trades) if trades else 0
+
+        avg_win_pips  = (sum(t.profit_pips for t in wins) / len(wins))   if wins   else 0.0
+        avg_loss_pips = (sum(t.profit_pips for t in losses) / len(losses)) if losses else 0.0
+
+        avg_rr = (
+            round(np.mean([t.rr_achieved for t in trades if t.rr_achieved > 0]), 2)
+            if any(t.rr_achieved > 0 for t in trades) else 0.0
+        )
+        avg_win_rr = (
+            round(np.mean([t.rr_achieved for t in wins if t.rr_achieved > 0]), 2)
+            if any(t.rr_achieved > 0 for t in wins) else 0.0
+        )
+        avg_loss_rr = (
+            round(np.mean([t.rr_achieved for t in losses if t.rr_achieved > 0]), 2)
+            if any(t.rr_achieved > 0 for t in losses) else 0.0
+        )
+
+        # ── By signal quality ────────────────────────────────────────────────
+        by_quality: Dict[str, Any] = {}
+        for quality in ["strong", "good", "fair", "weak"]:
             q_trades = [t for t in trades if t.signal.quality == quality]
             if q_trades:
                 q_wins = sum(1 for t in q_trades if t.outcome == "WIN")
@@ -974,13 +1043,13 @@ class AgentZeroBacktester:
                     "avg_pnl": sum(t.profit for t in q_trades) / len(q_trades),
                     "avg_rr": sum(t.rr_achieved for t in q_trades) / len(q_trades),
                 }
-        
+
         # Calculate average trade duration
         durations = [t.duration_minutes for t in trades if t.duration_minutes > 0]
         avg_duration = np.mean(durations) if durations else 0
-        
+
         # Breakdown by exit reason
-        by_exit_reason = {}
+        by_exit_reason: Dict[str, Any] = {}
         for reason in ["sl", "tp", "timeout"]:
             r_trades = [t for t in trades if t.exit_reason == reason]
             if r_trades:
@@ -992,331 +1061,252 @@ class AgentZeroBacktester:
                 }
 
         # ── Max drawdown (equity-curve based) ──────────────────────
-        # Sort trades chronologically by exit_time (that's when P&L
-        # lands). Walk the cumulative curve, track running peak, and
-        # record the deepest peak-to-trough gap. MDD is reported as a
-        # positive magnitude (dollar amount lost from peak) — the UI
-        # formats it as a negative for visual consistency with a loss.
-        #
-        # We also emit `equity_curve` as a lightweight list of
-        # {t, pnl, cum} points so the server can aggregate across pairs
-        # into a portfolio-level drawdown (simple sum of per-pair MDDs
-        # would over-count because pair drawdowns don't occur at the
-        # same time in reality).
         sorted_trades = sorted(
             [t for t in trades if t.exit_time is not None],
             key=lambda t: t.exit_time,
         )
-        running_pnl  = 0.0
-        peak_pnl     = 0.0
-        max_dd       = 0.0
-        dd_trough_at = None  # timestamp of the worst drawdown point
-        equity_curve: List[Dict[str, Any]] = []
+        running_pnl = 0.0
+        peak_pnl    = 0.0
+        max_dd      = 0.0
+        equity_curve: List[float] = []
         for t in sorted_trades:
-            running_pnl += float(t.profit or 0.0)
+            running_pnl += t.profit
+            equity_curve.append(round(running_pnl, 2))
             if running_pnl > peak_pnl:
                 peak_pnl = running_pnl
             dd = peak_pnl - running_pnl
             if dd > max_dd:
                 max_dd = dd
-                dd_trough_at = t.exit_time
-            # Represent timestamp as ISO so JSON round-trip is safe.
-            try:
-                ts_iso = t.exit_time.isoformat()
-            except Exception:
-                ts_iso = str(t.exit_time)
-            equity_curve.append({
-                "t":   ts_iso,
-                "pnl": round(float(t.profit or 0.0), 2),
-                "cum": round(running_pnl, 2),
-            })
 
-        max_drawdown     = round(max_dd, 2)
-        max_drawdown_pct = (round((max_dd / peak_pnl) * 100.0, 2)
-                            if peak_pnl > 1e-9 else 0.0)
+        max_drawdown_pct = (round((max_dd / peak_pnl) * 100.0, 2) if peak_pnl > 1e-9 else 0.0)
 
-        # ── Correlation-with-outcome breakdowns (for the UI charts) ─
-        # These are the “what correlated with winning vs losing” surfaces.
-        # Each dict is { bucket_label: {count, wins, losses, win_rate,
-        # avg_pips, total_pnl} }. The UI plots them as bar charts.
-        def _bucket_stats(group: List[Trade]) -> Dict[str, float]:
-            n       = len(group)
-            wins_   = sum(1 for t in group if t.outcome == "WIN")
-            losses_ = sum(1 for t in group if t.outcome == "LOSS")
-            pips    = [t.profit_pips for t in group]
-            pnl     = sum(t.profit for t in group)
-            return {
-                "count":     n,
-                "wins":      wins_,
-                "losses":    losses_,
-                "win_rate":  (wins_ / n) if n else 0.0,
-                "avg_pips":  round(float(np.mean(pips)), 2) if pips else 0.0,
-                "total_pnl": round(float(pnl), 2),
-            }
-
-        # BY ENVIRONMENT  (CHoCH-BUY@PDL, Continuation-SELL@PDH, …)
-        # signal.source is free-form so we normalise here rather than in
-        # the hot loop — stripping whitespace, upper-casing trailing "@XXX".
-        def _env_key(src: str) -> str:
-            if not src:
-                return "?"
-            s = str(src).strip()
-            # Collapse variants like "CHoCH-BUY@PDL (aligned)" to the head
-            head = s.split(" ")[0]
-            return head or "?"
-
-        env_groups: Dict[str, List[Trade]] = {}
+        # ── By environment ────────────────────────────────────────────────────
+        by_env: Dict[str, Any] = {}
         for t in trades:
-            env_groups.setdefault(_env_key(t.signal.source), []).append(t)
-        by_env = {k: _bucket_stats(g) for k, g in env_groups.items()}
+            env = str(t.signal.source or t.signal.environment or "unknown")
+            if env not in by_env:
+                by_env[env] = {"count": 0, "wins": 0, "losses": 0,
+                               "total_pnl": 0.0, "avg_pips": 0.0, "_pips": 0.0}
+            by_env[env]["count"] += 1
+            by_env[env]["total_pnl"] += t.profit
+            by_env[env]["_pips"] += t.profit_pips
+            if t.outcome == "WIN":   by_env[env]["wins"]   += 1
+            if t.outcome == "LOSS":  by_env[env]["losses"] += 1
+        for env_data in by_env.values():
+            n = env_data["count"]
+            env_data["win_rate"] = env_data["wins"] / n if n else 0.0
+            env_data["avg_pips"] = env_data["_pips"] / n if n else 0.0
+            del env_data["_pips"]
 
-        # BY SIDE (BUY vs SELL)
-        by_side: Dict[str, Dict[str, float]] = {}
+        # ── By side ───────────────────────────────────────────────────────────
+        by_side: Dict[str, Any] = {}
         for side in ("BUY", "SELL"):
-            grp = [t for t in trades
-                   if str(t.signal.signal).upper() == side]
-            if grp:
-                by_side[side] = _bucket_stats(grp)
-
-        # BY HOUR OF DAY (UTC, entry time → 0..23)
-        # Empty hours are omitted — the UI handles missing keys.
-        hour_groups: Dict[int, List[Trade]] = {}
-        for t in trades:
-            et = t.entry_time
-            if et is None:
-                continue
-            try:
-                h = int(et.hour)
-            except Exception:
-                continue
-            hour_groups.setdefault(h, []).append(t)
-        by_hour = {str(h): _bucket_stats(g)
-                   for h, g in sorted(hour_groups.items())}
-
-        # BY DAY OF WEEK (Mon=0 .. Fri=4 in practice; FX closes Sat/Sun)
-        dow_groups: Dict[int, List[Trade]] = {}
-        for t in trades:
-            et = t.entry_time
-            if et is None:
-                continue
-            try:
-                d = int(et.weekday())
-            except Exception:
-                continue
-            dow_groups.setdefault(d, []).append(t)
-        DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        by_dow = {DOW_NAMES[d]: _bucket_stats(g)
-                  for d, g in sorted(dow_groups.items())
-                  if 0 <= d < 7}
-
-        # CONFIDENCE BUCKETS — fixed 10-percentile edges so two runs are
-        # directly comparable even if one has a narrower confidence
-        # distribution. Edges are on the 0–1 scale (signal.confidence).
-        conf_edges = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01]
-        conf_labels = ["<50", "50-60", "60-70", "70-80", "80-90", "90-100"]
-        conf_groups: Dict[str, List[Trade]] = {lbl: [] for lbl in conf_labels}
-        for t in trades:
-            c = float(t.signal.confidence or 0.0)
-            for i in range(len(conf_labels)):
-                if conf_edges[i] <= c < conf_edges[i + 1]:
-                    conf_groups[conf_labels[i]].append(t)
-                    break
-        confidence_buckets = {lbl: _bucket_stats(g)
-                              for lbl, g in conf_groups.items() if g}
-
-        # P&L DISTRIBUTION — histogram of profit_pips.
-        # Bins are anchored to the observed range so wide runs don't end
-        # up with one massive bin. We cap at 12 bins so the chart stays
-        # legible; fewer if the dataset is thin.
-        pnl_distribution: Dict[str, Any] = {}
-        pip_values = [float(t.profit_pips) for t in trades
-                      if t.profit_pips is not None]
-        if pip_values:
-            lo = min(pip_values); hi = max(pip_values)
-            # Pad so boundaries aren't on extreme samples
-            if hi - lo < 1e-6:
-                lo -= 1.0; hi += 1.0
-            pad = (hi - lo) * 0.05
-            lo -= pad; hi += pad
-            nbins = max(5, min(12, len(pip_values) // 5 or 5))
-            counts, edges = np.histogram(pip_values, bins=nbins, range=(lo, hi))
-            bins_out = []
-            for i in range(nbins):
-                e0 = float(edges[i]); e1 = float(edges[i + 1])
-                mid = (e0 + e1) / 2.0
-                bins_out.append({
-                    "x0":    round(e0, 2),
-                    "x1":    round(e1, 2),
-                    "mid":   round(mid, 2),
-                    "count": int(counts[i]),
-                    "sign":  "win" if mid > 0 else ("loss" if mid < 0 else "be"),
-                })
-            pnl_distribution = {
-                "bins":   bins_out,
-                "min":    round(lo, 2),
-                "max":    round(hi, 2),
-                "n":      len(pip_values),
-                "median": round(float(np.median(pip_values)), 2),
-            }
-
-        return {
-            "total_trades": len(trades),
-            "wins": wins,
-            "losses": losses,
-            "win_rate": win_rate,
-            "total_pnl": round(total_pnl, 2),
-            "avg_pnl_per_trade": round(avg_pnl, 2),
-            "avg_win_pips": round(avg_win, 1),
-            "avg_loss_pips": round(avg_loss, 1),
-            # Profit factor: gross win pips / |gross loss pips|. When there
-            # are no losses, conventional reporting uses "infinity"; we send
-            # a high sentinel (999) which the UI renders as "∞".
-            "profit_factor": (round(abs(win_pips / loss_pips), 2)
-                              if loss_pips != 0
-                              else (999.0 if win_pips > 0 else 0.0)),
-            "avg_rr_achieved": round(np.mean([t.rr_achieved for t in trades if t.rr_achieved > 0]), 2),
-            "avg_duration_minutes": round(avg_duration, 1),
-            "max_drawdown":     max_drawdown,
-            "max_drawdown_pct": max_drawdown_pct,
-            "equity_curve":     equity_curve,
-            "component_correlations": correlations,
-            "by_quality": by_quality,
-            "by_exit_reason": by_exit_reason,
-            "by_env": by_env,
-            "by_side": by_side,
-            "by_hour": by_hour,
-            "by_dow": by_dow,
-            "confidence_buckets": confidence_buckets,
-            "pnl_distribution": pnl_distribution,
-            "early_exits": early_exits,
-            # Make modelling assumptions explicit so the UI / consumer
-            # can show what the numbers actually represent.
-            "assumptions": {
-                "lot_size":            self.lot_size,
-                "spread_pips":         (self.spread_pips_override
-                                        if self.spread_pips_override is not None
-                                        else None),
-                "intrabar_policy":     self.intrabar_policy,
-                "entry_fill":          ("bid-based OHLC: BUY pays full spread, "
-                                        "SELL fills at open"),
-                "trade_management":    "raw (single SL/TP exit)",
-                "pip_usd_model":       "JPY pairs converted at ~150 USDJPY",
-                "commission":          "not modelled",
-                "swap":                "not modelled",
-                "lookahead":           "last-forming bar skipped",
-            },
-        }
-    
-    def run(self, symbol: str, days: int = 30,
-            progress_cb: Optional[Callable[[dict], None]] = None) -> Dict:
-        """Run complete backtest. Optional progress_cb receives stage/bar events."""
-        log.info("=" * 60)
-        log.info("Backtest: %s (%d days)", symbol, days)
-        log.info("=" * 60)
-
-        def _emit(payload: dict) -> None:
-            if progress_cb is not None:
-                try:
-                    progress_cb(payload)
-                except Exception:
-                    pass
-
-        try:
-            # Anchor point for "the last N days" — computed ONCE so every
-            # stage (data fetch, window clip, reporting) agrees on the
-            # same "now". Any drift here would show up as 1-bar off-by-one
-            # errors between the fetched window and the reported period.
-            now_utc      = datetime.now(timezone.utc)
-            window_start = now_utc - timedelta(days=int(days))
-
-            _emit({"type": "stage", "symbol": symbol, "stage": "fetching_data"})
-            df = self.fetch_data(symbol, days=days)
-            if df is None or len(df) < 50:
-                log.error("Could not fetch sufficient data for %s", symbol)
-                return {"error": f"Insufficient data for {symbol}", "symbol": symbol}
-
-            self.candle_history[symbol] = df
-
-            _emit({"type": "stage", "symbol": symbol, "stage": "generating_signals"})
-            # Generate signals, clipping evaluation to bars inside the
-            # rolling window. Warm-up bars (2 days of prefix) still feed
-            # into the strategy's lookback but do not produce signals.
-            signals = self.generate_signals(symbol, df,
-                                            progress_cb=progress_cb,
-                                            window_start=window_start)
-            if not signals:
-                log.warning("No signals generated for %s", symbol)
-                return {
-                    "symbol": symbol,
-                    "period": (f"{window_start.date()} to "
-                               f"{now_utc.date()}"),
-                    "total_trades": 0,
-                    "error": "No signals generated",
+            s_trades = [t for t in trades if str(t.signal.signal).upper() == side]
+            if s_trades:
+                s_wins = sum(1 for t in s_trades if t.outcome == "WIN")
+                by_side[side] = {
+                    "count":     len(s_trades),
+                    "wins":      s_wins,
+                    "losses":    sum(1 for t in s_trades if t.outcome == "LOSS"),
+                    "win_rate":  s_wins / len(s_trades),
+                    "total_pnl": sum(t.profit for t in s_trades),
+                    "avg_pips":  sum(t.profit_pips for t in s_trades) / len(s_trades),
                 }
 
-            self.signals.extend(signals)
+        # ── By hour / day-of-week ─────────────────────────────────────────────
+        by_hour: Dict[str, Any] = {}
+        by_dow:  Dict[str, Any] = {}
+        _dow_map = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
+        for t in trades:
+            ts = t.entry_time or t.signal.ts
+            if ts is None:
+                continue
+            h  = str(ts.hour)
+            dw = _dow_map.get(ts.weekday(), "?")
+            for bucket, key in [(by_hour, h), (by_dow, dw)]:
+                if key not in bucket:
+                    bucket[key] = {"count":0,"wins":0,"losses":0,"total_pnl":0.0,"avg_pips":0.0,"_p":0.0}
+                bucket[key]["count"] += 1
+                bucket[key]["total_pnl"] += t.profit
+                bucket[key]["_p"] += t.profit_pips
+                if t.outcome == "WIN":  bucket[key]["wins"]   += 1
+                if t.outcome == "LOSS": bucket[key]["losses"] += 1
+        for bucket in (by_hour, by_dow):
+            for d in bucket.values():
+                n = d["count"]
+                d["win_rate"] = d["wins"] / n if n else 0.0
+                d["avg_pips"] = d["_p"]   / n if n else 0.0
+                del d["_p"]
 
-            # ── Volume-profile POC bias filter ────────────────────────
-            # Keep only signals that align with POC bias (BUYs above POC,
-            # SELLs below POC). See _apply_vp_filter for the gate.
-            signals_pre = len(signals)
-            signals, vp_filter_stats = self._apply_vp_filter(signals)
-            if signals_pre != len(signals):
-                log.info("POC bias: kept %d of %d signals for %s (%s)",
-                         len(signals), signals_pre, symbol,
-                         vp_filter_stats)
+        # ── Confidence buckets ────────────────────────────────────────────────
+        confidence_buckets: Dict[str, Any] = {}
+        _conf_ranges = [("<50",0,50),("50-60",50,60),("60-70",60,70),
+                        ("70-80",70,80),("80-90",80,90),("90-100",90,101)]
+        for label, lo, hi in _conf_ranges:
+            c_trades = [t for t in trades
+                        if lo <= (t.signal.confidence or 0) * 100 < hi]
+            if c_trades:
+                c_wins = sum(1 for t in c_trades if t.outcome == "WIN")
+                confidence_buckets[label] = {
+                    "count":     len(c_trades),
+                    "wins":      c_wins,
+                    "losses":    sum(1 for t in c_trades if t.outcome == "LOSS"),
+                    "win_rate":  c_wins / len(c_trades),
+                    "total_pnl": sum(t.profit for t in c_trades),
+                    "avg_pips":  sum(t.profit_pips for t in c_trades) / len(c_trades),
+                }
 
-            _emit({"type": "stage", "symbol": symbol, "stage": "simulating_trades"})
-            trades = self.simulate_trades(symbol, signals, df, progress_cb=progress_cb)
-            self.trades.extend(trades)
+        # ── P&L distribution ──────────────────────────────────────────────────
+        pnl_distribution: Dict[str, Any] = {}
+        pip_values = [t.profit_pips for t in decided]
+        if pip_values:
+            nbins = max(5, min(12, len(pip_values) // 5 or 5))
+            hist_min = min(pip_values)
+            hist_max = max(pip_values)
+            if hist_max > hist_min:
+                bin_w = (hist_max - hist_min) / nbins
+                bins  = []
+                for bi in range(nbins):
+                    x0  = hist_min + bi * bin_w
+                    x1  = x0 + bin_w
+                    mid = (x0 + x1) / 2
+                    cnt = sum(1 for p in pip_values if x0 <= p < x1)
+                    if bi == nbins - 1:
+                        cnt = sum(1 for p in pip_values if x0 <= p <= x1)
+                    bins.append({
+                        "x0":    round(x0,  1),
+                        "x1":    round(x1,  1),
+                        "mid":   round(mid, 1),
+                        "count": cnt,
+                        "sign":  "win" if mid > 0 else ("loss" if mid < 0 else "be"),
+                    })
+                pnl_distribution = {
+                    "bins":   bins,
+                    "n":      len(pip_values),
+                    "median": round(float(np.median(pip_values)), 1),
+                }
 
-            _emit({"type": "stage", "symbol": symbol, "stage": "analyzing"})
-            # Analyze
-            results = self.analyze_results(trades)
-            results["symbol"] = symbol
-            # Report the rolling window the user actually requested, not
-            # the wider fetched slice (which includes 2-day warm-up).
-            results["period"] = (f"{window_start.date()} to "
-                                 f"{now_utc.date()}")
-            results["window_start_utc"] = window_start.isoformat()
-            results["window_end_utc"]   = now_utc.isoformat()
-            results["requested_days"]   = int(days)
-            # Surface VP-veto filter stats so the dashboard can show how
-            # many setups were dropped and why.
-            results["vp_filter"] = vp_filter_stats
+        # ── Component correlations ────────────────────────────────────────────
+        component_correlations: Dict[str, float] = {}
+        if decided:
+            outcomes_arr = np.array([1.0 if t.outcome == "WIN" else 0.0 for t in decided])
+            score_keys   = set()
+            for t in decided:
+                score_keys.update((t.signal.component_scores or {}).keys())
+            for key in score_keys:
+                vals = np.array([
+                    float((t.signal.component_scores or {}).get(key, 0.0))
+                    for t in decided
+                ])
+                if vals.std() > 1e-9 and outcomes_arr.std() > 1e-9:
+                    corr = float(np.corrcoef(vals, outcomes_arr)[0, 1])
+                    if np.isfinite(corr):
+                        component_correlations[key] = round(corr, 3)
 
-            # ML diagnostic: feature importance on the trades we just closed
-            fi = self.compute_feature_importance(trades)
-            if fi is not None:
-                results["feature_importance"] = fi
+        # ── Early exits analysis ──────────────────────────────────────────────
+        early_exits: Dict[str, Any] = {}
+        for threshold_candles in [3, 6]:
+            threshold_minutes = threshold_candles * 15
+            early = [
+                t for t in trades
+                if t.duration_minutes <= threshold_minutes and t.outcome == "LOSS"
+            ]
+            if early:
+                early_exits[f"within_{threshold_candles}_candles"] = {
+                    "count": len(early),
+                    "pct_of_losses": len(early) / sum(1 for t in trades if t.outcome == "LOSS"),
+                    "avg_loss_pips": sum(t.profit_pips for t in early) / len(early),
+                    "exit_reasons": dict(
+                        (reason, sum(1 for t in early if t.exit_reason == reason))
+                        for reason in ["sl", "timeout"]
+                    ),
+                }
 
-            return results
+        # ── By quality ────────────────────────────────────────────────────────
+        by_quality_detailed: Dict[str, Any] = {}
+        for quality in ["strong", "good", "fair", "weak"]:
+            q_trades = [t for t in trades if t.signal.quality == quality]
+            if q_trades:
+                q_wins = sum(1 for t in q_trades if t.outcome == "WIN")
+                q_losses = sum(1 for t in q_trades if t.outcome == "LOSS")
+                by_quality_detailed[quality] = {
+                    "count":     len(q_trades),
+                    "wins":      q_wins,
+                    "losses":    q_losses,
+                    "win_rate":  q_wins / len(q_trades),
+                    "total_pnl": sum(t.profit for t in q_trades),
+                    "avg_pips":  sum(t.profit_pips for t in q_trades) / len(q_trades),
+                }
 
-        except Exception as e:
-            log.exception("Backtest error: %s", e)
-            return {"error": str(e), "symbol": symbol}
+        return {
+            "total_trades":          len(trades),
+            "wins":                  len(wins),
+            "losses":                len(losses),
+            "win_rate":              round(win_rate, 4),
+            "win_rate_label":        f"{win_rate * 100:.1f}%",
+            "total_pnl":             round(total_pnl, 2),
+            "total_pnl_label":       f"{'+'if total_pnl>=0 else ''}${total_pnl:.2f}",
+            "avg_pnl":               round(avg_pnl, 2),
+            "avg_pnl_label":         f"{'+'if avg_pnl>=0 else ''}${avg_pnl:.2f}",
+            "profit_factor":         round(abs(win_pips / loss_pips), 2) if loss_pips != 0 else (999.0 if win_pips > 0 else 0.0),
+            "avg_rr_achieved":       avg_rr,
+            "avg_win_rr":            avg_win_rr,
+            "avg_loss_rr":           avg_loss_rr,
+            "avg_win_pips":          round(avg_win_pips,  1),
+            "avg_loss_pips":         round(avg_loss_pips, 1),
+            "avg_duration_minutes":  round(float(avg_duration), 1),
+            "max_drawdown":          round(max_dd, 2),
+            "max_drawdown_pct":      max_drawdown_pct,
+            "max_drawdown_label":    f"-${max_dd:.2f}" if max_dd > 0 else "$0.00",
+            "equity_curve":          equity_curve,
+            "by_quality":            by_quality_detailed,
+            "by_exit_reason":        by_exit_reason,
+            "by_env":                by_env,
+            "by_side":               by_side,
+            "by_hour":               by_hour,
+            "by_dow":                by_dow,
+            "confidence_buckets":    confidence_buckets,
+            "pnl_distribution":      pnl_distribution,
+            "component_correlations":component_correlations,
+            "early_exits":           early_exits,
+            "assumptions":           self._build_assumptions(symbol),
+        }
 
-    # ---------------------------------------------------------------- #
-    # Feature-importance diagnostic (sklearn — optional)               #
-    # ---------------------------------------------------------------- #
-    def compute_feature_importance(self, trades: List[Trade]) -> Optional[Dict[str, Any]]:
+    def _build_assumptions(self, symbol: str) -> Dict[str, Any]:
+        """Return the modelling-assumptions block shown in the dashboard."""
+        is_jpy    = "JPY" in symbol.upper()
+        spread_pt = (self.default_spread_points_jpy if is_jpy
+                     else self.default_spread_points_major)
+        return {
+            "trade_management": "raw (single SL/TP exit)",
+            "lot_size":         self.lot_size,
+            "spread_pips":      None,   # signals "default per-pair" in the UI
+            "intrabar_policy":  "conservative",
+            "entry_fill":       "bid-based OHLC: BUY pays full spread, SELL fills at open",
+            "pip_usd_model":    "JPY pairs converted at ~150 USDJPY",
+            "commission":       "not modelled",
+            "swap":             "not modelled",
+            "lookahead":        "last-forming bar skipped",
+        }
+
+    # ── ML ────────────────────────────────────────────────────────────────────
+
+    def compute_feature_importance(
+        self,
+        trades: List,
+    ) -> Optional[Dict[str, Any]]:
         """
         Train a RandomForest on trade-level features and return feature
         importances. Purely diagnostic — does NOT feed back into live
         trading. Returns None if sklearn is unavailable or the dataset is
         too thin to be meaningful.
-
-        Features are derived from fields that actually vary per trade:
-        setup one-hots (CHoCH vs Continuation, level anchored to PDH/PDL),
-        hour/day of entry, confidence, risk-reward ratio, risk size in
-        pips. Metric is balanced accuracy (robust to class imbalance).
         """
         if not HAS_SKLEARN:
             return {"error": "sklearn not installed (pip install scikit-learn)"}
 
         decided = [t for t in trades if t.outcome in ("WIN", "LOSS")]
-        if len(decided) < 20:
-            return {"error": f"Not enough decided trades for ML ({len(decided)}<20)"}
+        if len(decided) < 15:
+            return {"error": f"Not enough decided trades for ML ({len(decided)}<15)"}
 
         FEATURES = [
             "confidence",
@@ -1330,17 +1320,8 @@ class AgentZeroBacktester:
             "hour_of_day",
             "dow",
             "is_jpy",
-            # POC-bias context (filter is POC-only, so this captures
-            # how strongly aligned the trade was with the bias).
-            # dist_to_poc_atr: signed distance from entry to POC,
-            # scaled by ATR. Positive = aligned with the trade side
-            # (BUY above POC / SELL below POC). 0 when POC missing.
             "dist_to_poc_atr",
-            # Raw distance (price units) → useful even when ATR is
-            # missing or close to zero on the trigger bar.
             "dist_to_poc_pips",
-            # Whether a POC value was actually available for this
-            # signal (some early bars in the window won't have one).
             "has_poc",
         ]
 
@@ -1354,12 +1335,6 @@ class AgentZeroBacktester:
             hour = int(ts.hour) if ts is not None else 0
             dow  = int(ts.weekday()) if ts is not None else 0
 
-            # POC-bias features. Note: t.signal.entry_price has been
-            # rewritten to the actual fill (next-bar open ± spread) by
-            # simulate_trades, while t.signal.poc was captured at the
-            # trigger close. Those differ by at most a fraction of an
-            # ATR, so dist_to_poc_atr remains a meaningful proxy for
-            # "how strongly the price was on the bias side of POC".
             poc_val = float(t.signal.poc or 0.0)
             atr_val = float(t.signal.atr or 0.0)
             entry_val = float(t.signal.entry_price or 0.0)
@@ -1375,244 +1350,364 @@ class AgentZeroBacktester:
                 dist_to_poc_pips = 0.0
                 has_poc = 0.0
 
-            row = [
+            X.append([
                 float(t.signal.confidence or 0.0),
                 float(t.signal.rr_ratio or 0.0),
-                float(risk_pips),
+                risk_pips,
                 1.0 if is_buy else 0.0,
                 1.0 if "CHOCH" in src else 0.0,
                 1.0 if "CONTINUATION" in src else 0.0,
-                1.0 if src.endswith("@PDH") else 0.0,
-                1.0 if src.endswith("@PDL") else 0.0,
+                1.0 if "PDH" in src else 0.0,
+                1.0 if "PDL" in src else 0.0,
                 float(hour),
                 float(dow),
-                1.0 if "JPY" in str(t.signal.symbol).upper() else 0.0,
-                float(dist_to_poc_atr),
-                float(dist_to_poc_pips),
-                float(has_poc),
-            ]
-            X.append(row)
+                1.0 if pip == 0.01 else 0.0,
+                dist_to_poc_atr,
+                dist_to_poc_pips,
+                has_poc,
+            ])
             y.append(1 if t.outcome == "WIN" else 0)
 
-        X_arr = np.array(X, dtype=float)
-        y_arr = np.array(y, dtype=int)
+        import numpy as np_local
+        X_arr = np_local.array(X)
+        y_arr = np_local.array(y)
 
-        if len(set(y_arr.tolist())) < 2:
-            only = "WIN" if y_arr[0] == 1 else "LOSS"
-            return {"error": f"All trades ended in {only} — cannot fit classifier"}
-
-        # Drop zero-variance columns so they don't clutter the chart with 0.000.
-        # Use a small epsilon to also drop near-constant columns from float noise.
-        variances = X_arr.var(axis=0)
-        keep_idx = [i for i, v in enumerate(variances) if v > 1e-9]
+        # Drop constant features (RF can't use them)
+        keep_idx = [i for i in range(X_arr.shape[1]) if X_arr[:, i].std() > 1e-9]
         if len(keep_idx) < 2:
-            return {"error": "Fewer than 2 features have variance — nothing to learn."}
+            return {"error": "Too few variable features for RF"}
+
         X_arr = X_arr[:, keep_idx]
-        active_features = [FEATURES[i] for i in keep_idx]
+        kept_features = [FEATURES[i] for i in keep_idx]
+
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.metrics import balanced_accuracy_score, precision_score, recall_score
+
+        clf = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=4,
+            min_samples_leaf=3,
+            class_weight="balanced",
+            random_state=42,
+            oob_score=True,
+        )
+        clf.fit(X_arr, y_arr)
+
+        oob_pred = (clf.oob_decision_function_[:, 1] >= 0.5).astype(int)
+        bal_acc  = balanced_accuracy_score(y_arr, oob_pred)
+
+        wins_actual = int(y_arr.sum())
+        baseline_wr = wins_actual / len(y_arr)
+        lift = bal_acc - 0.5   # lift over random 50%
 
         try:
-            clf = RandomForestClassifier(
-                n_estimators=300,
-                max_depth=5,
-                min_samples_leaf=3,
-                random_state=42,
-                oob_score=True,
-                bootstrap=True,
-                class_weight="balanced",
-                n_jobs=1,
-            )
-            clf.fit(X_arr, y_arr)
+            win_prec = precision_score(y_arr, oob_pred, zero_division=0)
+            win_rec  = recall_score(y_arr, oob_pred, zero_division=0)
+        except Exception:
+            win_prec = win_rec = 0.0
 
-            # Build per-feature importance list
-            importances = [
-                {"feature": name, "importance": round(float(imp), 4)}
-                for name, imp in zip(active_features, clf.feature_importances_)
+        imps = sorted(
+            zip(kept_features, clf.feature_importances_),
+            key=lambda x: x[1], reverse=True,
+        )
+
+        return {
+            "n_trades":          len(decided),
+            "baseline_win_rate": round(baseline_wr, 4),
+            "balanced_accuracy": round(bal_acc, 4),
+            "lift_vs_random":    round(lift, 4),
+            "win_precision":     round(win_prec, 4),
+            "win_recall":        round(win_rec,  4),
+            "importances": [
+                {"feature": f, "importance": round(float(v), 4)}
+                for f, v in imps
+            ],
+        }
+
+    # ── Tuned-param derivation ────────────────────────────────────────────────
+
+    def _clamp_tuned(self, key: str, value: float) -> float:
+        lo, hi = self._TUNED_PARAM_CLAMPS.get(key, (0.0, 99.0))
+        return round(max(lo, min(hi, float(value))), 4)
+
+    def _compute_tuned_params(
+        self,
+        symbol: str,
+        trades: List[Trade],
+        results: Dict[str, Any],
+        feature_importance: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, float]]:
+        """Derive per-pair tuned_params from backtest statistics."""
+        decided = [t for t in trades if t.outcome in ("WIN", "LOSS")]
+        if len(decided) < 5:
+            return None
+
+        pip_size = get_pip_value(symbol)
+        atr_pips_series = [
+            float(t.signal.atr or 0.0) / pip_size
+            for t in decided
+            if t.signal.atr and pip_size > 0
+        ]
+        # Fallback: if ATR was not stored on the signal (e.g. EURJPY
+        # trades generated before ATR logging was added), derive it from
+        # the actual SL distance (SL = ATR × sl_mult ⇒ ATR ≈ SL / sl_mult).
+        if not atr_pips_series and pip_size > 0:
+            default_sl = 2.5
+            atr_pips_series = [
+                abs(float(t.signal.entry_price or 0.0) - float(t.signal.stop_loss or 0.0))
+                / pip_size / default_sl
+                for t in decided
+                if t.signal.entry_price and t.signal.stop_loss
+                and abs(float(t.signal.entry_price) - float(t.signal.stop_loss)) > 0
             ]
-            importances.sort(key=lambda r: r["importance"], reverse=True)
+        median_atr_pips = (
+            float(np.median(atr_pips_series)) if atr_pips_series else 0.0
+        )
 
-            baseline_wr = float(y_arr.mean())
+        if median_atr_pips <= 0:
+            return None
 
-            # Balanced accuracy via OOB predictions (robust to class imbalance).
-            # oob_decision_function_ gives per-sample class probabilities for
-            # out-of-bag trees; pick argmax to get predicted class.
-            balanced = None
-            win_precision = None
-            win_recall = None
+        def _f(key: str, default: Any = 0.0) -> float:
+            v = results.get(key)
             try:
-                from sklearn.metrics import balanced_accuracy_score, precision_score, recall_score
-                oob_proba = getattr(clf, "oob_decision_function_", None)
-                if oob_proba is not None:
-                    valid = ~np.isnan(oob_proba).any(axis=1)
-                    if valid.sum() >= 10:
-                        y_pred = oob_proba[valid].argmax(axis=1)
-                        y_true = y_arr[valid]
-                        balanced = float(balanced_accuracy_score(y_true, y_pred))
-                        # Precision / recall for the WIN class (label=1)
-                        if (y_pred == 1).any():
-                            win_precision = float(precision_score(y_true, y_pred, pos_label=1, zero_division=0))
-                        win_recall = float(recall_score(y_true, y_pred, pos_label=1, zero_division=0))
+                return float(v) if v is not None else default
+            except (TypeError, ValueError):
+                return default
+
+        win_rate     = _f("win_rate")
+        avg_win_p    = _f("avg_win_pips")
+        avg_loss_p   = _f("avg_loss_pips")
+        avg_rr       = _f("avg_rr_achieved")
+        avg_dur_min  = _f("avg_duration_minutes")
+        by_exit      = results.get("by_exit_reason") or {}
+        timeout_n    = int((by_exit.get("timeout") or {}).get("count", 0))
+        timeout_pct  = (timeout_n / len(decided)) if decided else 0.0
+        loss_mag     = abs(avg_loss_p)
+
+        if loss_mag > 0:
+            sl_atr_mult = (loss_mag / median_atr_pips) * 1.25
+        else:
+            sl_atr_mult = self._TUNED_PARAM_DEFAULTS["sl_atr_mult"]
+
+        if avg_win_p > 0:
+            tp_from_data = avg_win_p / median_atr_pips
+        else:
+            tp_from_data = self._TUNED_PARAM_DEFAULTS["tp_atr_mult"]
+        tp_atr_mult = max(tp_from_data, sl_atr_mult * 1.5)
+
+        atr_tolerance_mult = 1.5
+        if feature_importance:
+            lift = feature_importance.get("lift_vs_random")
+            if lift is not None:
+                try:
+                    lift_f = float(lift)
+                    atr_tolerance_mult = 1.5 + max(-0.3, min(0.5, lift_f * 3.0))
+                except (TypeError, ValueError):
+                    pass
+
+        if timeout_pct > 0.30:
+            partial_close_rr = 0.7
+        elif avg_rr > 1.5:
+            partial_close_rr = min(1.5, avg_rr * 0.7)
+        else:
+            partial_close_rr = 1.0
+
+        spread_floor = 2.0 if "JPY" in symbol.upper() else 1.0
+        if win_rate >= 0.60:
+            be_buffer_pips = spread_floor * 0.7
+        elif win_rate >= 0.45:
+            be_buffer_pips = spread_floor
+        else:
+            be_buffer_pips = spread_floor * 1.5
+
+        if avg_dur_min > 0:
+            ratio = avg_dur_min / 360.0
+            min_atr_to_tighten = 0.7 + max(-0.2, min(1.3, ratio - 1.0))
+        else:
+            min_atr_to_tighten = self._TUNED_PARAM_DEFAULTS["min_atr_to_tighten"]
+
+        if avg_win_p > 0:
+            run_ratio = avg_win_p / median_atr_pips
+            trail_atr_mult = 0.7 + max(0.0, min(0.9, (run_ratio - 1.0) / 4.0 * 0.9))
+        else:
+            trail_atr_mult = self._TUNED_PARAM_DEFAULTS["trail_atr_mult"]
+
+        return {
+            "atr_tolerance_mult": self._clamp_tuned("atr_tolerance_mult", atr_tolerance_mult),
+            "sl_atr_mult":        self._clamp_tuned("sl_atr_mult",        sl_atr_mult),
+            "tp_atr_mult":        self._clamp_tuned("tp_atr_mult",        tp_atr_mult),
+            "partial_close_rr":   self._clamp_tuned("partial_close_rr",   partial_close_rr),
+            "be_buffer_pips":     self._clamp_tuned("be_buffer_pips",     be_buffer_pips),
+            "min_atr_to_tighten": self._clamp_tuned("min_atr_to_tighten", min_atr_to_tighten),
+            "trail_atr_mult":     self._clamp_tuned("trail_atr_mult",     trail_atr_mult),
+        }
+
+    def _save_insights_for_pair(
+        self,
+        symbol: str,
+        feature_importance: Optional[Dict[str, Any]] = None,
+        results: Optional[Dict[str, Any]] = None,
+        trades: Optional[List[Trade]] = None,
+    ) -> None:
+        """
+        Persist this backtest run to SQLite, then aggregate ALL historical
+        runs for `symbol` and write the result to backtest_insights.json
+        so the live AgentLearningLoop picks it up via its mtime watch.
+
+        Flow
+        ----
+        1. Derive tuned_params from this run's statistics (unchanged logic).
+        2. Save the raw run + every trade + importances + tuned_params to
+           trade_memory.db (accumulates across runs — never overwrites).
+        3. Call TradeMemory.aggregate_insights(symbol) to compute a
+           weighted-average importance dict across ALL stored runs.
+        4. Write the aggregated block to backtest_insights.json exactly as
+           before, using the same atomic temp+replace pattern.
+
+        If trade_memory is unavailable (import failed), falls back to the
+        original single-run JSON write so nothing breaks.
+        """
+        # ── 1. Derive tuned params (same logic as before) ────────────────
+        tuned: Optional[Dict[str, float]] = None
+        if results is not None and trades is not None:
+            try:
+                tuned = self._compute_tuned_params(
+                    symbol=symbol,
+                    trades=trades,
+                    results=results,
+                    feature_importance=feature_importance,
+                )
+            except Exception as exc:
+                log.warning("Tuning derivation for %s failed: %s", symbol, exc)
+
+        # ── 2. Persist to SQLite ─────────────────────────────────────────
+        aggregated: Dict[str, Any] = {}
+        if HAS_TRADE_MEMORY and _get_memory is not None:
+            try:
+                mem = _get_memory()
+                run_id = mem.save_run(
+                    symbol=symbol,
+                    results=results or {},
+                    trades=trades or [],
+                    feature_importance=feature_importance,
+                    tuned_params=tuned,
+                )
+                log.info(
+                    "%s: run #%d saved to trade_memory.db — aggregating across all runs",
+                    symbol, run_id,
+                )
+                # ── 3. Aggregate across ALL stored runs ──────────────────
+                aggregated = mem.aggregate_insights(symbol)
+                if aggregated:
+                    log.info(
+                        "%s: aggregated insights from %d runs, %d total trades",
+                        symbol,
+                        aggregated.get("n_runs", "?"),
+                        aggregated.get("trade_count", "?"),
+                    )
+            except Exception as exc:
+                log.warning(
+                    "%s: SQLite persistence failed (%s) — falling back to "
+                    "single-run JSON write",
+                    symbol, exc,
+                )
+
+        # If SQLite path produced aggregated data use it; otherwise fall
+        # back to building the pair_block from this run only (original
+        # behaviour — guarantees the live bot always gets *something*).
+        if aggregated:
+            pair_block = dict(aggregated)
+        else:
+            # ── Fallback: single-run block (original logic) ───────────────
+            pair_block: Dict[str, Any] = {}
+
+            importances_flat: Dict[str, float] = {}
+            if feature_importance:
+                raw_importances = feature_importance.get("importances") or []
+                for entry in raw_importances:
+                    if not isinstance(entry, dict):
+                        continue
+                    fname = entry.get("feature")
+                    score = entry.get("importance")
+                    if not fname or score is None:
+                        continue
+                    importances_flat[fname] = round(float(score), 4)
+
+            if importances_flat:
+                pair_block["importances"] = importances_flat
+            if tuned:
+                pair_block["tuned_params"] = tuned
+            if results:
+                tc = results.get("total_trades")
+                if tc is not None:
+                    try:
+                        pair_block["trade_count"] = int(tc)
+                    except (TypeError, ValueError):
+                        pass
+                wr = results.get("win_rate")
+                if wr is not None:
+                    try:
+                        pair_block["win_rate"] = round(float(wr), 4)
+                    except (TypeError, ValueError):
+                        pass
+            pair_block["backtest_at"] = datetime.now(timezone.utc).isoformat()
+
+        non_meta_keys = {"importances", "tuned_params", "trade_count", "win_rate"}
+        if not (set(pair_block.keys()) & non_meta_keys):
+            log.debug("Skipping insights write for %s — nothing useful to store", symbol)
+            return
+
+        # ── 4. Atomic write to backtest_insights.json ────────────────────
+        import json, tempfile, shutil
+        insights_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "backtest_insights.json",
+        )
+
+        try:
+            with open(insights_path, "r", encoding="utf-8") as fh:
+                existing = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            existing = {}
+
+        # Merge — the aggregated block already represents all history, so
+        # we replace the existing symbol entry wholesale.
+        if aggregated:
+            existing[symbol] = pair_block
+        else:
+            merged = dict(existing.get(symbol) or {})
+            merged.update(pair_block)
+            existing[symbol] = merged
+
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            suffix=".json",
+            dir=os.path.dirname(insights_path),
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                json.dump(existing, fh, indent=2)
+            shutil.move(tmp_path, insights_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
             except Exception:
                 pass
+            raise
 
-            raw_oob = float(getattr(clf, "oob_score_", float("nan")))
-
-            return {
-                "n_trades": len(decided),
-                "baseline_win_rate": round(baseline_wr, 4),
-                "balanced_accuracy": round(balanced, 4) if balanced is not None else None,
-                "win_precision": round(win_precision, 4) if win_precision is not None else None,
-                "win_recall": round(win_recall, 4) if win_recall is not None else None,
-                # lift: how much better than random guessing on a balanced dataset.
-                # 0.5 = coin flip. Positive means the model has real signal.
-                "lift_vs_random": round(balanced - 0.5, 4) if balanced is not None else None,
-                # Keep these for backwards-compat with older clients that read them
-                "oob_accuracy": round(raw_oob, 4) if not np.isnan(raw_oob) else None,
-                "lift_vs_baseline": None,  # deprecated — was misleading on imbalanced data
-                "importances": importances,
-                "model": "RandomForestClassifier(n=300, depth=5, class_weight=balanced)",
-                "note": "Features derived from signal source + timing + confidence; "
-                        "zero-variance features dropped.",
-            }
-        except Exception as exc:
-            log.exception("feature-importance training failed")
-            return {"error": f"sklearn training failed: {exc}"}
-    
-    def print_results(self, results: Dict) -> None:
-        """Pretty-print backtest results."""
-        print("\n" + "=" * 70)
-        print(f"  {results.get('symbol', '?')} — {results.get('period', '?')}")
-        print("=" * 70)
-        print(f"Trades:       {results['total_trades']} total "
-              f"({results['wins']} wins, {results['losses']} losses)")
-        print(f"Win Rate:     {results['win_rate']:.1%}")
-        print(f"P&L:          ${results['total_pnl']:+.2f} "
-              f"(${results['avg_pnl_per_trade']:+.2f}/trade)")
-        print(f"Avg Win/Loss: +{results['avg_win_pips']:.0f}p / {results['avg_loss_pips']:.0f}p")
-        print(f"Profit Factor: {results['profit_factor']:.2f}x")
-        print(f"Avg R:R Achieved: {results['avg_rr_achieved']:.2f}")
-        print(f"Avg Trade Duration: {results.get('avg_duration_minutes', 0):.0f} minutes")
-        
-        if results.get("component_correlations"):
-            print("\nComponent Score Correlations with Wins:")
-            for comp, corr in results["component_correlations"].items():
-                direction = "↑" if corr > 0.3 else "↓" if corr < -0.3 else "→"
-                print(f"  {direction} {comp:25} {corr:+.3f}")
-        
-        if results.get("by_quality"):
-            print("\nPerformance by Signal Quality:")
-            for quality in ["weak", "fair", "good", "strong"]:
-                if quality in results["by_quality"]:
-                    data = results["by_quality"][quality]
-                    print(f"  {quality:8} ({data['count']:3} trades): "
-                          f"{data['win_rate']:.0%} WR, "
-                          f"${data['avg_pnl']:+.1f} avg, "
-                          f"{data['avg_rr']:.2f} RR")
-        
-        if results.get("by_exit_reason"):
-            print("\nPerformance by Exit Reason:")
-            for reason in ["tp", "sl", "timeout"]:
-                if reason in results["by_exit_reason"]:
-                    data = results["by_exit_reason"][reason]
-                    reason_name = {"tp": "Take Profit", "sl": "Stop Loss", "timeout": "Timeout"}.get(reason, reason)
-                    print(f"  {reason_name:12} ({data['count']:3} trades): "
-                          f"{data['win_rate']:.0%} WR, "
-                          f"${data['avg_pnl']:+.1f} avg")
-        
-        if results.get("early_exits"):
-            print("\n🚩 Early Exit Analysis (Quick Reversals):")
-            for threshold, data in results["early_exits"].items():
-                candles = threshold.split("_")[1]
-                print(f"  Losses within {candles} candles: {data['count']} trades "
-                      f"({data['pct_of_losses']:.0%} of all losses), "
-                      f"avg {data['avg_loss_pips']:.0f} pips")
-                if data["exit_reasons"].get("sl"):
-                    print(f"    └─ {data['exit_reasons']['sl']} via SL, "
-                          f"{data['exit_reasons'].get('timeout', 0)} via timeout")
-        
-        print("=" * 70 + "\n")
-    
-    def export_trades(self, symbol: str, filepath: str = None) -> str:
-        """Export trade log to JSON."""
-        if filepath is None:
-            filepath = f"backtest_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        
-        trades_data = []
-        for t in self.trades:
-            if t.signal.symbol == symbol:
-                trades_data.append({
-                    "entry_time": t.entry_time.isoformat(),
-                    "exit_time": t.exit_time.isoformat() if t.exit_time else None,
-                    "signal": t.signal.signal,
-                    "source": t.signal.source,
-                    "entry": round(t.entry_price, 5),
-                    "exit": round(t.exit_price or t.entry_price, 5),
-                    "sl": round(t.signal.stop_loss, 5),
-                    "tp": round(t.signal.take_profit, 5),
-                    "atr": round(t.signal.atr, 6),
-                    "pips": round(t.profit_pips, 1),
-                    "pnl": round(t.profit, 2),
-                    "outcome": t.outcome,
-                    "rr_achieved": round(t.rr_achieved, 2),
-                    "exit_reason": t.exit_reason,
-                    "signal_quality": t.signal.quality,
-                    "components": t.signal.component_scores,
-                })
-        
-        Path(filepath).write_text(json.dumps(trades_data, indent=2))
-        log.info("Exported %d trades to %s", len(trades_data), filepath)
-        return filepath
+        tuned_out = pair_block.get("tuned_params") or {}
+        msg_parts = [f"SL={tuned_out.get('sl_atr_mult','?')}×",
+                     f"TP={tuned_out.get('tp_atr_mult','?')}×",
+                     f"PC={tuned_out.get('partial_close_rr','?')}R",
+                     f"BE={tuned_out.get('be_buffer_pips','?')}p"]
+        if aggregated:
+            msg_parts.append(f"(aggregated {aggregated.get('n_runs', '?')} runs)")
+        log.info(
+            "Saved insights for %s | tuned: %s → %s",
+            symbol, " ".join(msg_parts), insights_path,
+        )
 
 
-# ============================================================ #
-# ENTRY POINT                                                  #
-# ============================================================ #
-
-def main():
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="Agent Zero backtester — validate signal generation"
-    )
-    parser.add_argument("--symbol", default="EURUSD", help="Symbol to backtest")
-    parser.add_argument("--days", type=int, default=7, help="Days of history")
-    parser.add_argument("--lot-size", type=float, default=1.0, help="Lot size per trade (e.g., 0.50)")
-    parser.add_argument("--export", action="store_true", help="Export trade log")
-    parser.add_argument("--plot", action="store_true", help="Plot results (requires matplotlib)")
-    
-    args = parser.parse_args()
-    
-    if not HAS_AI_PRO:
-        print("\n" + "!"*70)
-        print("ERROR: AgentZeroBot module not found in current directory")
-        print("Make sure ai_pro.py is in the same folder as backtest.py")
-        print("!"*70 + "\n")
-        return
-
-    backtest = AgentZeroBacktester(lot_size=args.lot_size)
-    results = backtest.run(args.symbol, days=args.days)
-    
-    if "error" in results:
-        log.error("Backtest failed: %s", results["error"])
-        print(f"\nError: {results['error']}")
-        print("\nTroubleshooting:")
-        print("1. Is MT5 terminal running?")
-        print("2. Have you configured login/password in the dashboard?")
-        print("3. Check that you have at least 50 bars of M15 data available")
-        return
-    
-    backtest.print_results(results)
-    
-    if args.export:
-        filepath = backtest.export_trades(args.symbol)
-        log.info("Trade log exported: %s", filepath)
-    
-    if args.plot and HAS_MATPLOTLIB:
-        log.info("Plotting not yet implemented (contribute?)")
-    elif args.plot:
-        log.warning("matplotlib not installed; skipping plots")
-
-
-
-
-if __name__ == "__main__":
-    main()
+# Backwards-compatible aliases — server.py imports AgentZeroBacktester
+# and calls bt.run(symbol, days=..., progress_cb=...) rather than .run_backtest()
+Backtester.run = Backtester.run_backtest
+AgentZeroBacktester = Backtester
