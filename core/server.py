@@ -1470,6 +1470,7 @@ def api_backtest_run():
         # still serves the other endpoints.
         try:
             from odl.backtest import AgentZeroBacktester
+            from ai_pro import AgentZeroBot
         except Exception as exc:
             log.error("backtest import failed: %s", exc)
             return jsonify({
@@ -1484,13 +1485,15 @@ def api_backtest_run():
         total_losses = 0
         total_pnl = 0.0
 
+        # One strategy instance shared across all pairs — MT5 init is expensive.
+        strategy = AgentZeroBot(use_ai=False)
         for symbol in pairs:
             log.info("[BACKTEST] %s days=%d lot=%.2f", symbol, days, lot_size)
             try:
                 # Pure strategy validation — whole position exits at first
                 # SL/TP/timeout so we're measuring the raw signal edge.
                 # (Trade-management overlay lives only in the live bot.)
-                bt = AgentZeroBacktester(lot_size=lot_size)
+                bt = AgentZeroBacktester(strategy=strategy, lot_size=lot_size)
                 result = bt.run(symbol, days=days)
             except Exception as exc:
                 log.exception("backtest failed for %s", symbol)
@@ -1568,6 +1571,10 @@ def api_backtest_run():
         log.exception("backtest run error")
         return jsonify({"ok": False, "error": f"{exc}"}), 500
     finally:
+        try:
+            strategy.shutdown()  # type: ignore[possibly-undefined]
+        except Exception:
+            pass
         _backtest_lock.release()
 
 
@@ -1651,6 +1658,15 @@ def api_backtest_stream():
             total_losses = 0
             total_pnl = 0.0
 
+            # One strategy instance shared across all pairs so MT5 is only
+            # initialised once. Shut it down in the finally block below.
+            try:
+                from ai_pro import AgentZeroBot as _AZB
+                _strategy = _AZB(use_ai=False)
+            except Exception as exc:
+                _push({"__event__": "error", "error": f"Strategy init failed: {exc}"})
+                return
+
             for symbol in pairs:
                 log.info("[BACKTEST-SSE] %s days=%d lot=%.2f", symbol, days, lot_size)
                 _push({"__event__": "pair_start", "symbol": symbol})
@@ -1659,7 +1675,7 @@ def api_backtest_stream():
                     # Pure strategy validation — whole position exits at
                     # the first SL/TP/timeout so the numbers measure the
                     # raw signal itself, not the management overlay.
-                    bt = AgentZeroBacktester(lot_size=lot_size)
+                    bt = AgentZeroBacktester(strategy=_strategy, lot_size=lot_size)
                     result = bt.run(
                         symbol,
                         days=days,
@@ -1833,6 +1849,10 @@ def api_backtest_stream():
             except Exception:
                 pass
         finally:
+            try:
+                _strategy.shutdown()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
             try:
                 q.put(_SENTINEL)
             except Exception:
