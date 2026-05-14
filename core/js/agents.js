@@ -19,6 +19,7 @@
 ══════════════════════════════════════════════════════════════════════ */
 let _ag_init = false;
 let _ag_timer = null;
+let _ag_abortCtrl = null;   // AbortController for in-flight fetch batch
 let _ag_matrix = null;
 let _ag_port   = null;
 let _ag_ollama = null;
@@ -58,6 +59,7 @@ function _startPoll() {
 function _stopPoll() {
   clearInterval(_ag_timer);
   _ag_timer = null;
+  if (_ag_abortCtrl) { _ag_abortCtrl.abort(); _ag_abortCtrl = null; }
 }
 
 /* Pause when leaving Agents tab */
@@ -71,20 +73,24 @@ window.showTab = function(tab, btn) {
    DATA FETCH
 ══════════════════════════════════════════════════════════════════════ */
 function _fetchAll() {
-  const p = [
-    fetch('/api/agent/matrix').then(r=>r.json()).catch(()=>null),
-    fetch('/api/agent/portfolio').then(r=>r.json()).catch(()=>null),
-    fetch('/api/ollama/health').then(r=>r.json()).catch(()=>null),
-    fetch('/bot/history').then(r=>r.json()).catch(()=>null),
-    fetch('/bot/status').then(r=>r.json()).catch(()=>null),
-  ];
+  if (_ag_abortCtrl) _ag_abortCtrl.abort();
+  _ag_abortCtrl = new AbortController();
+  const sig = _ag_abortCtrl.signal;
 
-  // Also fetch signals for all 4 pairs (for env map)
-  const sigFetches = PAIRS.map(sym =>
-    fetch(`/bot/signal/${sym}`).then(r=>r.json()).catch(()=>null)
-  );
+  const _f = url => fetch(url, {signal: sig}).then(r=>r.json()).catch(()=>null);
+
+  const p = [
+    _f('/api/agent/matrix'),
+    _f('/api/agent/portfolio'),
+    _f('/api/ollama/health'),
+    _f('/bot/history'),
+    _f('/bot/status'),
+  ];
+  const sigFetches = PAIRS.map(sym => _f(`/bot/signal/${sym}`));
 
   Promise.allSettled([...p, ...sigFetches]).then(results => {
+    if (sig.aborted) return;   // user left the tab — discard results
+
     const [mx, pf, ol, hist, status, ...sigs] = results.map(r =>
       r.status === 'fulfilled' ? r.value : null
     );
@@ -199,6 +205,7 @@ function _ingestTimeline(mx, status) {
    MAIN RENDER DISPATCH
 ══════════════════════════════════════════════════════════════════════ */
 function _render() {
+  if (!document.getElementById('tab-agents')?.classList.contains('active')) return;
   _renderHeader();
   _renderMatrix(_ag_matrix);
   _renderRiskDial(_ag_port);
@@ -425,24 +432,35 @@ function _renderBotDiag(d) {
     const trendC = sig.trend_intact ? '#50d963' : sig.trend_intact===false ? '#ff6b6b' : '#6a7280';
     const structC = sig.structure_broken ? '#ff6b6b' : '#50d963';
 
+    const tunedBadge = b.tuned
+      ? `<span style="padding:1px 6px;border-radius:3px;font-size:8px;font-weight:700;background:var(--cyan-bg);color:var(--cyan);letter-spacing:.05em">TUNED</span>`
+      : `<span style="padding:1px 6px;border-radius:3px;font-size:8px;font-weight:700;background:var(--amber-bg);color:var(--amber);letter-spacing:.05em">DEFAULTS</span>`;
+
     return `<div class="ag-bot-card">
       <div class="ag-bot-hdr">
         <span style="width:6px;height:6px;border-radius:50%;background:${dotC};
           box-shadow:${dotGlow};flex-shrink:0;display:inline-block"></span>
         <span class="ag-bot-title">BOT ${i+1}</span>
         <span class="ag-bot-sym">${sym}</span>
+        ${tunedBadge}
         <span style="padding:2px 8px;border-radius:3px;font-size:9px;font-weight:700;
           background:${aC}20;color:${aC};margin-left:auto">${action.toUpperCase()}</span>
       </div>
+      <div style="font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:.05em;margin:8px 0 4px;font-weight:600">Backtest Tuned Params</div>
       ${_diagRows([
-        ['Reason Code',    v.reason_code || '—'],
+        ['SL Mult',        b.sl_atr_mult!=null      ? b.sl_atr_mult+'× ATR'      : '—'],
+        ['TP Mult',        b.tp_atr_mult!=null      ? b.tp_atr_mult+'× ATR'      : '—'],
+        ['Trail Mult',     b.trail_atr_mult!=null   ? b.trail_atr_mult+'× ATR'   : '—'],
+        ['Min ATR Tighten',b.min_atr_to_tighten!=null ? b.min_atr_to_tighten+'× ATR' : '—'],
+        ['B/E Trigger',    b.partial_close_rr!=null ? b.partial_close_rr+'R'     : '—'],
+        ['B/E Buffer',     b.be_buffer_pips!=null   ? b.be_buffer_pips+' pips'   : '—'],
+      ])}
+      <div style="font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:.05em;margin:8px 0 4px;font-weight:600">Live Position</div>
+      ${_diagRows([
+        ['Last Action',    v.reason_code || '—'],
         ['Profit ATR',     v.atr_profit!=null ? v.atr_profit.toFixed(2)+'×' : '—'],
-        ['SL Dist ATR',    v.proposed_sl_dist_atr!=null ? v.proposed_sl_dist_atr.toFixed(2)+'×' : '—'],
-        ['Min ATR Thresh', b.min_atr_to_tighten!=null ? b.min_atr_to_tighten+'×' : '—'],
-        ['Trail Mult',     b.trail_atr_mult!=null ? b.trail_atr_mult+'×' : '—'],
         ['Trend',          trend, trendC],
         ['Structure',      struct, structC],
-        ['Close·Trend',    b.close_on_trend ? 'YES' : 'no', b.close_on_trend?'#ffc107':'#6a7280'],
       ])}
       ${confPct != null ? `
         <div class="ag-conf-wrap">
@@ -761,8 +779,9 @@ function _shell() {
   return `
 <style>
 /* ─── Reset / scope ─────────────────────────── */
-#tab-agents{display:flex;flex-direction:column;gap:12px;padding:14px;overflow-y:auto;
-  background:var(--bg0);height:100%}
+#tab-agents{flex-direction:column;gap:12px;padding:14px;overflow-y:auto;
+  background:var(--bg0)}
+#tab-agents.active{display:flex}
 
 /* ─── Header ────────────────────────────────── */
 #ag-header{display:flex;align-items:center;justify-content:space-between;

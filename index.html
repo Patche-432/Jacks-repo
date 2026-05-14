@@ -365,23 +365,24 @@
       <div id="signal-cards"></div>
     </div>
 
-    <!-- ZERO LOG — Orchestrator thoughts per pair -->
+    <!-- ZERO LOG — Actions taken feed, split by pair -->
     <div class="tab-panel" id="tab-thoughts">
-      <!-- Portfolio-level header (preflight, portfolio gate) -->
-      <div id="zl-portfolio-bar" style="padding:10px 16px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <span style="font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--txt3)">AGENT 0 · ORCHESTRATOR THOUGHTS</span>
-        <span id="thought-count" style="font-size:9px;color:var(--txt3);margin-left:4px">0 entries</span>
-        <button class="btn" onclick="clearThoughts()" style="margin-left:auto;font-size:9px;padding:4px 10px">Clear</button>
+      <!-- Top bar -->
+      <div style="display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--bg1);border-bottom:1px solid var(--line);flex-shrink:0">
+        <span style="font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--txt3)">Zero Log</span>
+        <span id="thought-count" style="font-size:9px;color:var(--txt3)">0 entries</span>
+        <button class="btn" onclick="clearThoughts()" style="margin-left:auto;font-size:9px;padding:3px 9px">Clear</button>
       </div>
-      <!-- 4 pair tiles -->
-      <div id="zl-tiles" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px"></div>
-      <!-- Portfolio-level thought feed (symbol=* events) -->
-      <div id="zl-portfolio-feed" style="margin:0 12px 12px;background:var(--bg1);border:1px solid var(--line);border-radius:8px;overflow:hidden">
-        <div style="padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--line);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--txt3)">
-          PORTFOLIO GATE
-        </div>
-        <div id="zl-portfolio-entries" style="max-height:100px;overflow-y:auto"></div>
+      <!-- Pair sub-tabs -->
+      <div style="display:flex;gap:0;background:var(--bg0);border-bottom:1px solid var(--line);flex-shrink:0">
+        <button id="zl-tab-ALL"    class="zl-pair-tab active" onclick="switchZLPair('ALL')">All</button>
+        <button id="zl-tab-EURUSD" class="zl-pair-tab"        onclick="switchZLPair('EURUSD')">EUR/USD</button>
+        <button id="zl-tab-GBPUSD" class="zl-pair-tab"        onclick="switchZLPair('GBPUSD')">GBP/USD</button>
+        <button id="zl-tab-GBPJPY" class="zl-pair-tab"        onclick="switchZLPair('GBPJPY')">GBP/JPY</button>
+        <button id="zl-tab-EURJPY" class="zl-pair-tab"        onclick="switchZLPair('EURJPY')">EUR/JPY</button>
       </div>
+      <!-- Action card feed (single column) -->
+      <div id="thoughts" style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:1px;background:var(--line)"></div>
     </div>
 
     <!-- POSITIONS -->
@@ -503,57 +504,52 @@
         <div class="equity-header">⚡ Equity Curve</div>
         <canvas id="equityCanvas"></canvas>
       </div>
+
+      <div id="perf-pair-grid"></div>
     </div>
 
     <!-- BACKTEST RESULTS -->
     <div class="tab-panel" id="tab-backtest">
-      <div style="padding:20px;color:var(--txt2)">
 
-        <div style="text-align:center">
-          <div style="font-size:14px;margin-bottom:6px">📊 Backtest Results</div>
-          <div style="font-size:12px;margin-bottom:14px" id="bt-subtitle">Historical validation against MT5 M15 data</div>
+      <!-- Header bar -->
+      <div style="display:flex;align-items:center;gap:12px;padding:10px 20px;border-bottom:1px solid var(--line);flex-shrink:0;background:var(--bg2)">
+        <div style="font-size:11px;font-weight:600;color:var(--txt);letter-spacing:.06em;font-family:var(--sans)">BACKTEST</div>
+        <div id="bt-subtitle" style="font-size:10px;color:var(--txt3);flex:1;font-family:var(--mono)">Historical validation · MT5 M15 data</div>
+        <div id="bt-status" style="font-size:10px;color:var(--txt3);font-family:var(--mono);max-width:300px;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+      </div>
+
+      <!-- Controls strip -->
+      <div style="display:flex;align-items:center;gap:14px;padding:8px 20px;border-bottom:1px solid var(--line);background:var(--bg1);flex-shrink:0;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--txt3);letter-spacing:.05em;text-transform:uppercase">
+          Days <input type="number" id="bt-days" min="1" max="60" value="7" class="bt-input">
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--txt3);letter-spacing:.05em;text-transform:uppercase">
+          Lot <input type="number" id="bt-lot" min="0.01" step="0.01" value="0.50" class="bt-input" style="width:64px">
+        </label>
+        <div style="width:1px;height:18px;background:var(--line);flex-shrink:0"></div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <label class="bt-chip"><input type="checkbox" class="bt-pair" value="GBPJPY" checked><span>GBPJPY</span></label>
+          <label class="bt-chip"><input type="checkbox" class="bt-pair" value="EURJPY" checked><span>EURJPY</span></label>
+          <label class="bt-chip"><input type="checkbox" class="bt-pair" value="GBPUSD" checked><span>GBPUSD</span></label>
+          <label class="bt-chip"><input type="checkbox" class="bt-pair" value="EURUSD" checked><span>EURUSD</span></label>
         </div>
+        <button class="btn start" id="bt-run" onclick="runBacktest()" style="margin-left:auto;padding:5px 16px;font-size:11px">&#9654; Run</button>
+      </div>
 
-        <!-- Controls -->
-        <div style="display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;margin-bottom:16px;font-family:var(--mono);font-size:11px">
-          <label style="display:flex;align-items:center;gap:6px">
-            <span style="color:var(--txt3)">Days</span>
-            <input type="number" id="bt-days" min="1" max="60" value="7"
-                   style="width:60px;background:var(--bg1);border:1px solid var(--line);border-radius:4px;padding:4px 6px;color:var(--txt);font-family:inherit">
-          </label>
-          <label style="display:flex;align-items:center;gap:6px">
-            <span style="color:var(--txt3)">Lot</span>
-            <input type="number" id="bt-lot" min="0.01" step="0.01" value="0.50"
-                   style="width:70px;background:var(--bg1);border:1px solid var(--line);border-radius:4px;padding:4px 6px;color:var(--txt);font-family:inherit">
-          </label>
-          <div style="display:flex;gap:8px;align-items:center">
-            <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" class="bt-pair" value="GBPJPY" checked> GBPJPY</label>
-            <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" class="bt-pair" value="EURJPY" checked> EURJPY</label>
-            <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" class="bt-pair" value="GBPUSD" checked> GBPUSD</label>
-            <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" class="bt-pair" value="EURUSD" checked> EURUSD</label>
-          </div>
-          <button class="btn start" id="bt-run" onclick="runBacktest()"
-                  style="padding:6px 14px">Run Backtest</button>
-        </div>
+      <!-- Last-run meta strip (hidden until a run completes) -->
+      <div id="bt-summary-banner"
+           style="display:none;padding:6px 20px;background:rgba(77,217,229,0.05);border-bottom:1px solid rgba(77,217,229,0.12);font-family:var(--mono);font-size:10px;color:var(--txt3);flex-shrink:0;flex-wrap:wrap;gap:0;align-items:center">
+        <span>Run: <span id="bt-last-run" style="color:var(--txt)">—</span></span>
+        <span style="margin:0 10px;color:var(--line2)">·</span>
+        <span>Period: <span id="bt-period" style="color:var(--txt)">—</span></span>
+        <span style="margin:0 10px;color:var(--line2)">·</span>
+        <span>Duration: <span id="bt-duration" style="color:var(--txt)">—</span></span>
+        <span style="margin:0 10px;color:var(--line2)">·</span>
+        <span>Lot: <span id="bt-lot-summary" style="color:var(--txt)">—</span></span>
+      </div>
 
-        <!-- Status / error strip -->
-        <div id="bt-status" style="text-align:center;font-size:11px;color:var(--txt3);min-height:16px;margin-bottom:10px"></div>
-
-        <!-- Last-run summary banner (hidden until a run completes) -->
-        <div id="bt-summary-banner"
-             style="display:none;margin:0 0 14px;padding:10px 14px;border-radius:8px;
-                    background:linear-gradient(90deg,rgba(30,144,255,0.08),rgba(30,144,255,0.02));
-                    border:1px solid rgba(30,144,255,0.25);font-family:var(--mono);
-                    font-size:11px;color:var(--txt2);display:flex;gap:16px;flex-wrap:wrap;
-                    align-items:center;justify-content:center">
-          <span>🕒 Last run: <span id="bt-last-run" style="color:var(--txt)">—</span></span>
-          <span style="color:var(--txt3)">·</span>
-          <span>📅 Period: <span id="bt-period" style="color:var(--txt)">—</span></span>
-          <span style="color:var(--txt3)">·</span>
-          <span>⏱ Duration: <span id="bt-duration" style="color:var(--txt)">—</span></span>
-          <span style="color:var(--txt3)">·</span>
-          <span>🪙 Lot: <span id="bt-lot-summary" style="color:var(--txt)">—</span></span>
-        </div>
+      <!-- Scrollable content -->
+      <div style="flex:1;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:14px">
 
         <!-- KPI grid -->
         <div class="kpi-grid">
@@ -568,12 +564,12 @@
             <div class="kpi-deco" id="bt-win-rate-deco">aggregate</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-label">Total P&L</div>
+            <div class="kpi-label">Total P&amp;L</div>
             <div class="kpi-value" id="bt-total-pnl">—</div>
             <div class="kpi-deco" id="bt-lot-label">at 0.50 lot</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-label">Avg/Trade</div>
+            <div class="kpi-label">Avg / Trade</div>
             <div class="kpi-value" id="bt-avg-pnl">—</div>
             <div class="kpi-deco">profit per trade</div>
           </div>
@@ -584,28 +580,29 @@
           </div>
         </div>
 
-        <!-- P&L contribution chart -->
-        <div style="margin-top:24px;padding:16px 20px;background:var(--bg0);border:1px solid var(--line);border-radius:8px">
-          <div style="font-weight:600;margin-bottom:10px;font-size:12px;color:var(--txt);display:flex;align-items:center;gap:8px">
-            <span>💰</span> P&L Contribution by Pair
-            <span style="color:var(--txt3);font-weight:400;font-size:10px">(horizontal bars scale to the biggest absolute P&L)</span>
+        <!-- P&L contribution panel -->
+        <div class="bt-panel">
+          <div class="bt-panel-hdr">
+            P&amp;L Contribution
+            <span class="bt-panel-sub">bars scale to the largest absolute P&amp;L</span>
           </div>
-          <div id="bt-pnl-chart" style="display:flex;flex-direction:column;gap:6px;font-family:var(--mono);font-size:11px">
-            <div style="color:var(--txt3);padding:6px 0">Run a backtest to see contribution.</div>
+          <div id="bt-pnl-chart" style="padding:12px 16px;font-family:var(--mono);font-size:11px;display:flex;flex-direction:column;gap:6px">
+            <div class="bt-idle-msg">Run a backtest to see contribution.</div>
           </div>
         </div>
 
-        <!-- Per-pair detail cards -->
-        <div style="margin-top:20px;padding:16px 20px;background:var(--bg0);border:1px solid var(--line);border-radius:8px">
-          <div style="font-weight:600;margin-bottom:12px;font-size:12px;color:var(--txt);display:flex;align-items:center;gap:8px">
-            <span>📈</span> Per-Pair Breakdown
-            <span id="bt-lot-label-2" style="color:var(--txt3);font-weight:400">(0.50 lot)</span>
+        <!-- Per-pair breakdown panel -->
+        <div class="bt-panel">
+          <div class="bt-panel-hdr">
+            Per-Pair Breakdown
+            <span id="bt-lot-label-2" class="bt-panel-sub">—</span>
           </div>
           <div id="bt-pairs-body"
-               style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;font-family:var(--mono);font-size:11px">
-            <div style="color:var(--txt3);padding:8px">Run a backtest to see per-pair results.</div>
+               style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;padding:14px 16px;font-family:var(--mono);font-size:11px">
+            <div class="bt-idle-msg" style="grid-column:1/-1">Run a backtest to see per-pair results.</div>
           </div>
         </div>
+
       </div>
     </div>
 

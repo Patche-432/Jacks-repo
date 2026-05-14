@@ -77,9 +77,10 @@ import json as _json
 import logging
 import os
 import re
+import threading
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 # Memory bank — imported lazily so ai_agent works even if agent_memory.py
@@ -335,13 +336,27 @@ class PairBotBase:
 
     # --- methods ---
 
-    def manage_position(self, ctx: PositionContext) -> dict:
+    def manage_position(
+        self,
+        ctx: PositionContext,
+        tuned_params: Optional[dict] = None,
+    ) -> dict:
         """Decide what to do with one open position. Verdict only;
-        execution is the orchestrator + ai_pro's job."""
-        # Convert profit-points to ATR multiples for tunable comparisons.
-        # `profit_pts` is in points (= 1/10 pip on 5-digit symbols, 1/100
-        # pip on 3-digit JPY symbols). ATR is in price units; we convert
-        # profit to price by dividing by 10**digits, then divide by ATR.
+        execution is the orchestrator + ai_pro's job.
+
+        tuned_params: per-pair dict from AgentLearningLoop.get_tuned_params().
+        When supplied, overrides the class-level MIN_ATR_PROFIT_TO_TIGHTEN
+        and TRAIL_ATR_MULT and activates break-even logic using the
+        backtest-derived be_buffer_pips / partial_close_rr values.
+        B/E is intentionally off when tuned_params is None (tests + fallback).
+        """
+        tp = tuned_params or {}
+        min_atr    = float(tp.get("min_atr_to_tighten") or self.MIN_ATR_PROFIT_TO_TIGHTEN)
+        trail_mult = float(tp.get("trail_atr_mult")     or self.TRAIL_ATR_MULT)
+        # B/E only activates when the caller supplies backtest-tuned params.
+        be_trigger: Optional[float] = float(tp["partial_close_rr"]) if tuned_params and "partial_close_rr" in tp else None
+        be_buffer:  Optional[float] = float(tp["be_buffer_pips"])   if tuned_params and "be_buffer_pips"   in tp else None
+
         if ctx.atr > 0:
             price_unit_profit = ctx.profit_pts * (10.0 ** (-ctx.digits))
             atr_profit = price_unit_profit / ctx.atr
@@ -352,47 +367,79 @@ class PairBotBase:
         if self.CLOSE_ON_STRUCTURE_BROKEN and ctx.structure_broken is True:
             return {
                 "action": "close",
+                "atr_profit": round(atr_profit, 2),
                 "reason": f"{self.SYMBOL} bot: structure broken — close",
             }
 
         if self.CLOSE_ON_TREND_BROKEN and ctx.trend_intact is False:
             return {
                 "action": "close",
+                "atr_profit": round(atr_profit, 2),
                 "reason": f"{self.SYMBOL} bot: trend lost (spike-prone pair) — close",
             }
 
-        # ----- Tighten checks -----------------------------------------
-        if atr_profit >= self.MIN_ATR_PROFIT_TO_TIGHTEN:
-            new_sl = self._propose_trailing_sl(ctx)
-            if new_sl is not None and self._sl_is_tighter(ctx, new_sl):
-                return {
-                    "action": "move_sl",
-                    "new_sl": new_sl,
-                    "reason": (
-                        f"{self.SYMBOL} bot: profit {atr_profit:.2f} ATR — "
-                        f"trail SL {self.TRAIL_ATR_MULT:.1f} ATR behind"
-                    ),
-                }
+        # ----- Collect candidate SL tightens (both trail and B/E) -----
+        # Run both checks; the one that produces the tightest SL wins.
+        # This means once trail is deep enough to beat B/E, trail takes
+        # over automatically — no special-casing needed.
+        candidates: list[tuple[float, str]] = []
+
+        if atr_profit >= min_atr:
+            trail_sl = self._propose_trailing_sl(ctx, trail_mult)
+            if trail_sl is not None and self._sl_is_tighter(ctx, trail_sl):
+                candidates.append((trail_sl, f"trail SL {trail_mult:.1f}× ATR"))
+
+        if be_trigger is not None and be_buffer is not None and atr_profit >= be_trigger:
+            be_sl = self._propose_be_sl(ctx, be_buffer)
+            if be_sl is not None and self._sl_is_tighter(ctx, be_sl):
+                candidates.append((be_sl, f"B/E +{be_buffer:.1f}p"))
+
+        if candidates:
+            is_buy = ctx.side.upper() == "BUY"
+            best_sl, best_reason = max(
+                candidates,
+                key=lambda x: x[0] if is_buy else -x[0],
+            )
+            return {
+                "action": "move_sl",
+                "new_sl": best_sl,
+                "atr_profit": round(atr_profit, 2),
+                "reason": f"{self.SYMBOL} bot: profit {atr_profit:.2f} ATR — {best_reason}",
+            }
 
         # ----- Default: hold ------------------------------------------
         return {
             "action": "hold",
+            "atr_profit": round(atr_profit, 2),
             "reason": f"{self.SYMBOL} bot: hold (profit {atr_profit:.2f} ATR)",
         }
 
-    # -- helpers (subclasses can override _propose_trailing_sl if a pair
-    #    needs something fancier than ATR-multiple trailing) -------------
+    # -- helpers -------------------------------------------------------
 
-    def _propose_trailing_sl(self, ctx: PositionContext) -> Optional[float]:
-        """Default trail: cur_price ± (TRAIL_ATR_MULT * ATR)."""
+    def _propose_trailing_sl(
+        self,
+        ctx: PositionContext,
+        trail_atr_mult: Optional[float] = None,
+    ) -> Optional[float]:
+        """Default trail: cur_price ± (trail_atr_mult * ATR)."""
         if ctx.atr <= 0:
             return None
-        offset = ctx.atr * self.TRAIL_ATR_MULT
+        mult   = trail_atr_mult if trail_atr_mult is not None else self.TRAIL_ATR_MULT
+        offset = ctx.atr * mult
         if ctx.side.upper() == "BUY":
             new_sl = ctx.cur_price - offset
         else:
             new_sl = ctx.cur_price + offset
         return round(new_sl, ctx.digits)
+
+    def _propose_be_sl(self, ctx: PositionContext, be_buffer_pips: float) -> Optional[float]:
+        """Break-even SL: entry ± (be_buffer_pips × pip_size).
+        Puts the stop just past entry so the trade becomes risk-free."""
+        pip_size = 0.01 if "JPY" in ctx.symbol else 0.0001
+        offset = be_buffer_pips * pip_size
+        if ctx.side.upper() == "BUY":
+            return round(ctx.entry + offset, ctx.digits)
+        return round(ctx.entry - offset, ctx.digits)
 
     @staticmethod
     def _sl_is_tighter(ctx: PositionContext, new_sl: float) -> bool:
@@ -496,26 +543,26 @@ def get_pair_agent(symbol: str) -> PairBotBase:
 #     - override (only "hold" -> "close")
 
 ORCHESTRATOR_SYSTEM_PROMPT = (
-    "You are AGENT ZERO, portfolio orchestrator for 4-pair forex bot. "
-    "Four deterministic bots already decided per-trade actions (hold / move_sl / close). "
-    "Your job: approve, veto, or override based on PORTFOLIO state.\n"
+    "You are AGENT ZERO, supervisor for a 4-pair forex bot trading CHoCH + daily-levels strategy.\n"
     "\n"
-    "Authority:\n"
-    "  APPROVE: execute bot verdict as-is\n"
-    "  VETO: suppress bot action (turns tighten/close → hold). Use when portfolio is fine.\n"
-    "  OVERRIDE: turn hold → close. ONLY when portfolio in trouble (daily loss near limit, bad drawdown).\n"
+    "PRIMARY MISSION: protect the entry reason. Every trade was opened because price showed a "
+    "Change of Character (CHoCH) at a key daily level. Your only job is to assess whether "
+    "that entry reason is still valid or has been invalidated by current price action.\n"
     "\n"
-    "You CANNOT propose SL values or issue actions outside approve/veto/override.\n"
+    "DEFAULT: APPROVE. The bots are correct unless price action has clearly spoken against the trade.\n"
     "\n"
-    "Currency correlations:\n"
-    "  EUR/GBP pairs move together (EURUSD+GBPUSD correlated; EURJPY+GBPJPY correlated)\n"
-    "  2+ correlated pairs same direction = compounded risk\n"
+    "Authority — judge each trade individually on its own price action:\n"
+    "  APPROVE      → entry reason still intact. Price respecting structure. Let the bot run its plan.\n"
+    "  VETO         → bot wants to close or tighten, but price action shows the setup is still valid\n"
+    "                  (structure holding, no opposing CHoCH, still within the daily level range).\n"
+    "                  Block the premature exit — the edge has not played out yet.\n"
+    "  OVERRIDE     → bot is holding, but price action has INVALIDATED the entry reason:\n"
+    "                  opposing CHoCH printed, price has broken back through the entry level,\n"
+    "                  or the original directional bias is structurally broken.\n"
+    "                  Force close — the reason this trade exists is gone.\n"
     "\n"
-    "Day trader rules:\n"
-    "  3+ positions open + daily loss >50% limit → OVERRIDE any hold with structure broken or negative P&L.\n"
-    "  Position at BE + correlated pair just hit SL → correlation says your BE will reverse. OVERRIDE to close.\n"
-    "  All pairs profitable + 1 lagging → APPROVE bot tightens (protect profit on weakness, let winners run).\n"
-    "  Correlated positions both deep red → it's a directional mistake, not pair-specific. Cut both fast.\n"
+    "Never act on portfolio metrics, daily P&L, or what other pairs are doing. "
+    "Each decision is based solely on whether that pair's price action still supports its entry.\n"
     "\n"
     "Reply JSON only, one line:\n"
     "  {\"decisions\": [{\"ticket\": <int>, \"verdict\": \"approve|veto|override_close\", \"reason\": \"<20w\"}, ...]}\n"
@@ -562,14 +609,207 @@ class Orchestrator:
     """Agent 0 — the LLM-backed portfolio orchestrator."""
 
     name = "Agent 0"
+    _ML_CONTEXT_CACHE: dict = {"path": None, "mtime": -1.0, "text": ""}
 
-    def __init__(self, client: Optional[OllamaClient] = None) -> None:
+    def __init__(self, client=None):
         self.client = client or OllamaClient()
 
-    def orchestrate(self,
-                    verdicts: list[dict],
-                    portfolio: Optional[PortfolioSnapshot] = None,
-                    ) -> list[dict]:
+    # ------------------------------------------------------------------ #
+    # Helpers                                                               #
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def _load_ml_context(cls) -> str:
+        """Return ML insights block string, cached by file mtime."""
+        try:
+            import os as _os, json as _j
+            path = _os.path.join(
+                _os.path.dirname(_os.path.abspath(__file__)),
+                "backtest_insights.json",
+            )
+            if not _os.path.exists(path):
+                return ""
+            mtime = _os.path.getmtime(path)
+            cache = cls._ML_CONTEXT_CACHE
+            if cache["path"] == path and cache["mtime"] == mtime:
+                return cache["text"]
+            with open(path, "r", encoding="utf-8") as fh:
+                ins = _j.load(fh)
+            ml_lines = []
+            tp_lines = []
+            for sym, d in sorted(ins.items()):
+                wr   = d.get("win_rate") or 0.0
+                imps = d.get("importances") or {}
+                top  = max(imps, key=imps.get) if imps else None
+                tv   = imps.get(top, 0.0) if top else 0.0
+                n    = d.get("trade_count", 0)
+                ml_lines.append(
+                    f"  {sym}: WR={wr*100:.0f}% n={n}"
+                    + (f" top={top}({tv:.2f})" if top else "")
+                )
+                tp = d.get("tuned_params") or {}
+                if tp:
+                    tp_lines.append(
+                        f"  {sym}: SL={tp.get('sl_atr_mult', 2.5):.2f}\u00d7"
+                        f" TP={tp.get('tp_atr_mult', 4.5):.2f}\u00d7"
+                        f" BE={tp.get('be_buffer_pips', 1.0):.1f}p"
+                        f" trail={tp.get('trail_atr_mult', 1.0):.2f}\u00d7"
+                    )
+            text = ""
+            if ml_lines:
+                text = (
+                    "\nML INSIGHTS (backtest-derived):\n"
+                    + "\n".join(ml_lines)
+                    + "\n  Higher WR = give more patience before overriding holds."
+                    + "\n  Top feature = what predicts wins for this pair."
+                )
+                if tp_lines:
+                    text += (
+                        "\n\nTUNED SL/TP (live bot uses these per pair):\n"
+                        + "\n".join(tp_lines)
+                        + "\n  Wider SL = position needs more room, don't override too early."
+                    )
+            cache.update({"path": path, "mtime": mtime, "text": text})
+            return text
+        except Exception as exc:
+            log.debug("ML insights load failed: %s", exc)
+            return ""
+
+    def _build_system_prompt(self) -> str:
+        """Build system prompt, optionally appending agent-memory context."""
+        prompt = ORCHESTRATOR_SYSTEM_PROMPT
+        if HAS_AGENT_MEMORY and _get_agent_memory is not None:
+            try:
+                mem_ctx = _get_agent_memory().build_context()
+                if mem_ctx:
+                    prompt = prompt + "\n" + mem_ctx
+            except Exception as exc:
+                log.debug("agent_memory build_context failed: %s", exc)
+        return prompt
+
+    @staticmethod
+    def _session_label(utc_hour: int) -> str:
+        """Map UTC hour to a readable FX session name."""
+        if 22 <= utc_hour or utc_hour < 7:
+            return "Asian/Overnight"
+        if 7 <= utc_hour < 10:
+            return "London-Open"
+        if 10 <= utc_hour < 12:
+            return "London-Mid"
+        if 12 <= utc_hour < 17:
+            return "NY/London-Overlap"
+        return "NY-Afternoon"
+
+    @staticmethod
+    def _build_user_message(verdicts, portfolio, ml_context: str) -> str:
+        """Format bot verdicts + price action context as the LLM user message."""
+        import datetime as _dt
+        now     = _dt.datetime.now(_dt.timezone.utc)
+        session = Orchestrator._session_label(now.hour)
+
+        lines = []
+        for v in verdicts:
+            new_sl    = v.get("new_sl")
+            sl_str    = f"{new_sl:.5f}" if isinstance(new_sl, (int, float)) else "\u2014"
+            entry     = v.get("entry")
+            cur_price = v.get("cur_price")
+            atr       = v.get("atr") or 0.0
+            direction = v.get("direction", "?")
+            profit_pts= v.get("profit_pts")
+
+            entry_str  = f"{entry:.5f}"     if entry     is not None else "?"
+            price_str  = f"{cur_price:.5f}" if cur_price is not None else "?"
+            profit_str = (f"{profit_pts:+.0f}pts"
+                          f"({profit_pts/atr:.1f}R)" if profit_pts is not None and atr > 0
+                          else f"{profit_pts:+.0f}pts" if profit_pts is not None else "?")
+
+            struct_broken   = v.get("structure_broken")
+            trend_intact    = v.get("trend_intact")
+            fresh_structure = v.get("fresh_structure")
+
+            struct_str = (
+                "STRUCTURE_BROKEN" if struct_broken
+                else "fresh_structure" if fresh_structure
+                else "structure_ok"
+            )
+            trend_str = (
+                "TREND_BROKEN" if trend_intact is False
+                else "trend_ok"
+            )
+
+            lines.append(
+                f"  ticket={v['ticket']} {v['symbol']} {direction} "
+                f"entry={entry_str} price={price_str} P&L={profit_str}\n"
+                f"    price_action: {struct_str} | {trend_str}\n"
+                f"    bot_verdict:  action={v['action']} new_sl={sl_str}\n"
+                f"    bot_reason:   {(v.get('reason') or '')[:120]}"
+            )
+
+        msg = (
+            f"SESSION: {session} (UTC {now.hour:02d}h)\n\n"
+            f"TRADES ({len(verdicts)})\n"
+            + "\n".join(lines)
+        )
+        if ml_context:
+            msg += ml_context
+        return msg
+
+    @staticmethod
+    def _apply_decisions(verdicts, decisions) -> list:
+        """Apply orchestrator decisions to bot verdicts; return executable plan."""
+        by_ticket = {}
+        for d in decisions:
+            try:
+                by_ticket[int(d.get("ticket"))] = d
+            except Exception:
+                continue
+
+        out = []
+        for v in verdicts:
+            d = by_ticket.get(v["ticket"], {})
+            verdict_str = str(d.get("verdict", "approve")).lower().strip()
+            reason = str(d.get("reason", "")).strip()[:200]
+
+            if verdict_str == "veto":
+                log.info(
+                    "[orchestrator] VETO ticket #%d %s %s \u2014 %s",
+                    v["ticket"], v["symbol"], v["action"], reason or "no reason",
+                )
+                out.append({
+                    **v,
+                    "action": "hold",
+                    "new_sl": None,
+                    "orchestrator_reason": f"VETO: {reason}",
+                    "reason_code": "ORC_VETO",
+                })
+                continue
+
+            if verdict_str in ("override_close", "override") and v["action"] == "hold":
+                log.info(
+                    "[orchestrator] OVERRIDE ticket #%d %s hold->close \u2014 %s",
+                    v["ticket"], v["symbol"], reason or "no reason",
+                )
+                out.append({
+                    **v,
+                    "action": "close",
+                    "new_sl": None,
+                    "orchestrator_reason": f"OVERRIDE hold->close: {reason}",
+                    "reason_code": "ORC_OVERRIDE",
+                })
+                continue
+
+            out.append({**v, "reason_code": "ORC_APPROVE"})
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Main entry point                                                      #
+    # ------------------------------------------------------------------ #
+
+    def orchestrate(
+        self,
+        verdicts: list,
+        portfolio=None,
+    ) -> list:
         """
         Take the bot verdicts produced this cycle and return the
         executable plan after orchestrator review.
@@ -581,183 +821,82 @@ class Orchestrator:
              "reason": str,
              "agent": str}
 
-        Output shape (subset, possibly modified):
+        Output shape:
             same shape, with:
-             - vetoed verdicts dropped
+             - vetoed verdicts converted to holds
              - holds turned into closes when overridden
-             - an extra "orchestrator_reason" key on touched verdicts
+             - "reason_code" on every output verdict
+               (ORC_APPROVE / ORC_VETO / ORC_OVERRIDE)
+             - "orchestrator_reason" on touched verdicts
 
         Failure mode: if the LLM call errors or returns malformed JSON,
         ALL verdicts are approved as-is. We do not block trade
-        management on orchestrator availability — the bots are
-        deterministic and the broker hard SL is still active.
+        management on orchestrator availability.
         """
         if not verdicts:
             return []
 
-        # Fast path — no LLM needed when there's nothing the orchestrator
-        # could meaningfully add. (One verdict, all holds, etc., still
-        # go through; the orchestrator might still want to override the
-        # hold to a close if the portfolio is in trouble.)
         portfolio = portfolio or PortfolioSnapshot()
 
-        # ---- Inject memory context into the system prompt -------------
-        system_prompt = ORCHESTRATOR_SYSTEM_PROMPT
-        if HAS_AGENT_MEMORY and _get_agent_memory is not None:
-            try:
-                mem_ctx = _get_agent_memory().build_context()
-                if mem_ctx:
-                    system_prompt = (
-                        ORCHESTRATOR_SYSTEM_PROMPT
-                        + "\n" + mem_ctx
-                    )
-            except Exception as _mem_exc:
-                log.debug("agent_memory build_context failed: %s", _mem_exc)
-
-        # ---- Inject ML insights from backtest_insights.json ----------
-        # Give the orchestrator per-pair win rate, ML lift, top predictive
-        # feature, and tuned SL/TP so it can weight its decisions correctly.
-        # e.g. GBPUSD at 96% WR deserves more patience than GBPJPY at 54%.
-        try:
-            _insights_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "backtest_insights.json",
-            )
-            if os.path.exists(_insights_path):
-                with open(_insights_path, "r", encoding="utf-8") as _f:
-                    _ins = _json.load(_f)
-                _ml_lines = []
-                _tp_lines = []
-                for _sym, _d in sorted(_ins.items()):
-                    _wr   = _d.get("win_rate") or 0.0
-                    _lift = _d.get("lift_vs_random") or 0.0
-                    _imps = _d.get("importances") or {}
-                    _top  = max(_imps, key=_imps.get) if _imps else None
-                    _tv   = _imps.get(_top, 0.0) if _top else 0.0
-                    _n    = _d.get("trade_count", 0)
-                    _ml_lines.append(
-                        f"  {_sym}: WR={_wr*100:.0f}% n={_n}"
-                        + (f" lift={_lift*100:+.0f}%" if _lift else "")
-                        + (f" top={_top}({_tv:.2f})" if _top else "")
-                    )
-                    _tp = _d.get("tuned_params") or {}
-                    if _tp:
-                        _tp_lines.append(
-                            f"  {_sym}: SL={_tp.get('sl_atr_mult',2.5):.2f}\u00d7"
-                            f" TP={_tp.get('tp_atr_mult',4.5):.2f}\u00d7"
-                            f" BE={_tp.get('be_buffer_pips',1.0):.1f}p"
-                            f" trail={_tp.get('trail_atr_mult',1.0):.2f}\u00d7"
-                        )
-                if _ml_lines:
-                    _ml_block = (
-                        "\nML INSIGHTS (backtest-derived):\n"
-                        + "\n".join(_ml_lines)
-                        + "\n  Higher WR = give more patience before overriding holds."
-                        + "\n  Top feature = what predicts wins for this pair."
-                    )
-                    if _tp_lines:
-                        _ml_block += (
-                            "\n\nTUNED SL/TP (live bot uses these per pair):\n"
-                            + "\n".join(_tp_lines)
-                            + "\n  Wider SL = position needs more room, don't override too early."
-                        )
-                    system_prompt = system_prompt + _ml_block
-        except Exception as _ml_exc:
-            log.debug("ML insights injection failed: %s", _ml_exc)
-
-        # ---- Build the user message --------------------------------
-        verdict_lines = []
+        # \u2500\u2500 Operator directives: absolute priority, bypass LLM \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        d = get_directives()
+        directive_out: list = []
+        remaining:     list = []
         for v in verdicts:
-            new_sl = v.get("new_sl")
-            new_sl_str = f"{new_sl:.5f}" if isinstance(new_sl, (int, float)) else "—"
-            verdict_lines.append(
-                f"  ticket {v['ticket']} {v['symbol']:>6} "
-                f"action={v['action']:<8} new_sl={new_sl_str}  "
-                f"reason: {(v.get('reason') or '')[:120]}"
-            )
-        user = (
-            f"PORTFOLIO\n  {portfolio.summary()}\n\n"
-            f"BOT VERDICTS ({len(verdicts)})\n"
-            + "\n".join(verdict_lines)
-        )
+            sym = (v.get("symbol") or "").upper()
+            if sym in d.close_symbols:
+                directive_out.append({**v, "action": "close",
+                                      "reason_code": "ORC_FORCE_CLOSE",
+                                      "orchestrator_reason": "operator directive: force close"})
+            elif sym in d.freeze_symbols:
+                directive_out.append({**v, "action": "hold",
+                                      "reason_code": "ORC_FREEZE",
+                                      "orchestrator_reason": "operator directive: frozen"})
+            else:
+                remaining.append(v)
+
+        if not remaining:
+            return directive_out
+
+        # Fast path: all remaining bots say hold and no breach \u2014 skip LLM.
+        if all(v.get("action") == "hold" for v in remaining) and not portfolio.daily_loss_breach:
+            return directive_out + [{**v, "reason_code": "ORC_APPROVE"} for v in remaining]
+
+        # Append operator notes to portfolio context if set
+        if d.notes:
+            portfolio = PortfolioSnapshot(**{
+                **portfolio.__dict__,
+                "notes": (portfolio.notes + " | OPERATOR: " + d.notes).strip(" |"),
+            })
+
+        system_prompt = self._build_system_prompt()
+        ml_context    = self._load_ml_context()
+        user          = self._build_user_message(remaining, portfolio, ml_context)
 
         try:
-            raw = self.client.chat(
-                system_prompt, user,
-                expect_json=True, max_tokens=400,
-            )
+            raw = self.client.chat(system_prompt, user, expect_json=True, max_tokens=400)
         except Exception as exc:
             log.warning(
-                "orchestrator transport error: %s — approving all verdicts as-is",
-                exc,
+                "orchestrator transport error: %s \u2014 approving all verdicts as-is", exc,
             )
-            return list(verdicts)
+            return directive_out + [{**v, "reason_code": "ORC_APPROVE"} for v in remaining]
 
-        parsed = _extract_json_dict(raw) or {}
+        parsed    = _extract_json_dict(raw) or {}
         decisions = parsed.get("decisions") or []
         if not isinstance(decisions, list):
             log.warning("orchestrator returned non-list decisions; approving all as-is")
-            return list(verdicts)
+            return directive_out + [{**v, "reason_code": "ORC_APPROVE"} for v in remaining]
 
-        # ---- Apply decisions ----------------------------------------
-        # Index decisions by ticket. Tickets not mentioned default to approve.
-        by_ticket: dict[int, dict] = {}
-        for d in decisions:
-            try:
-                t = int(d.get("ticket"))
-            except Exception:
-                continue
-            by_ticket[t] = d
+        llm_out = self._apply_decisions(remaining, decisions)
+        out = directive_out + llm_out
 
-        out: list[dict] = []
-        for v in verdicts:
-            d = by_ticket.get(v["ticket"], {})
-            verdict_str = str(d.get("verdict", "approve")).lower().strip()
-            reason = str(d.get("reason", "")).strip()[:200]
-
-            if verdict_str == "veto":
-                # Drop entirely. The dashboard logger upstream will record this.
-                log.info(
-                    "[orchestrator] VETO ticket #%d %s %s — %s",
-                    v["ticket"], v["symbol"], v["action"], reason or "no reason",
-                )
-                # Convert to a hold so callers can still log it cleanly,
-                # rather than silently dropping. ai_pro.py's executor
-                # treats hold as a no-op.
-                out.append({
-                    **v,
-                    "action": "hold",
-                    "new_sl": None,
-                    "orchestrator_reason": f"VETO: {reason}",
-                })
-                continue
-
-            if verdict_str == "override_close" and v["action"] == "hold":
-                log.info(
-                    "[orchestrator] OVERRIDE ticket #%d %s hold->close — %s",
-                    v["ticket"], v["symbol"], reason or "no reason",
-                )
-                out.append({
-                    **v,
-                    "action": "close",
-                    "new_sl": None,
-                    "orchestrator_reason": f"OVERRIDE hold->close: {reason}",
-                })
-                continue
-
-            # Approve as-is (default).
-            out.append(v)
-
-        # ---- Record decisions to memory ----------------------------
         if HAS_AGENT_MEMORY and _get_agent_memory is not None:
             try:
-                _get_agent_memory().record_decisions(verdicts, out)
-            except Exception as _rec_exc:
-                log.debug("agent_memory record_decisions failed: %s", _rec_exc)
+                _get_agent_memory().record_decisions(remaining, llm_out)
+            except Exception as exc:
+                log.debug("agent_memory record_decisions failed: %s", exc)
 
         return out
-
-
 # Module-level singleton.
 _orchestrator: Optional[Orchestrator] = None
 
@@ -768,6 +907,53 @@ def get_orchestrator() -> Orchestrator:
     if _orchestrator is None:
         _orchestrator = Orchestrator()
     return _orchestrator
+
+
+# ========================================================================== #
+# Operator directives — freeze / force-close / exposure cap                  #
+# ========================================================================== #
+
+@dataclass
+class GlobalDirectives:
+    """Operator-level overrides applied before any bot or LLM logic.
+
+    freeze_symbols  : hold only — no tighten, no close.
+    close_symbols   : force-close immediately, bypasses orchestrator.
+    max_exposure_pct: not yet enforced in bots (future); stored for display.
+    notes           : forwarded verbatim into the orchestrator LLM prompt.
+    """
+    freeze_symbols:   set   = field(default_factory=set)
+    close_symbols:    set   = field(default_factory=set)
+    max_exposure_pct: float = 0.0
+    notes:            str   = ""
+
+    def summary(self) -> str:
+        parts = []
+        if self.freeze_symbols:
+            parts.append(f"freeze={sorted(self.freeze_symbols)}")
+        if self.close_symbols:
+            parts.append(f"force-close={sorted(self.close_symbols)}")
+        if self.max_exposure_pct > 0:
+            parts.append(f"max_exp={self.max_exposure_pct:.0f}%")
+        if self.notes:
+            parts.append(f"note={self.notes[:40]!r}")
+        return "; ".join(parts) if parts else "no active directives"
+
+
+_directives: GlobalDirectives = GlobalDirectives()
+_directives_lock = threading.Lock()
+
+
+def get_directives() -> GlobalDirectives:
+    with _directives_lock:
+        return _directives
+
+
+def set_directives(d: GlobalDirectives) -> None:
+    global _directives
+    with _directives_lock:
+        _directives = d
+    log.info("GlobalDirectives updated: %s", d.summary())
 
 
 # ========================================================================== #

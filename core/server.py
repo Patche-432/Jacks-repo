@@ -185,6 +185,31 @@ def _mt5_signal_snapshot(symbol: str) -> dict:
     atr_val  = sig.get("atr")         or 0.0
     conf     = sig.get("confidence")  or 0
 
+    # ── Volume Profile / POC ──────────────────────────────────────────────
+    vp       = sig.get("volume_profile") or {}
+    poc      = float(vp.get("poc") or 0.0)
+    pip_size = 0.01 if "JPY" in symbol else 0.0001
+
+    poc_aligned: bool | None = None
+    poc_dist_pips: float | None = None
+    poc_side: str = "—"
+    ref_price = float(entry or 0.0)
+    if poc > 0.0 and ref_price > 0.0:
+        poc_dist_pips = round((ref_price - poc) / pip_size, 1)
+        poc_side = "above" if ref_price > poc else "below" if ref_price < poc else "at"
+        if raw_signal == "BUY":
+            poc_aligned = ref_price > poc
+        elif raw_signal == "SELL":
+            poc_aligned = ref_price < poc
+
+    # ── Per-pair backtest-tuned zone multiplier ───────────────────────────
+    atr_tol_mult: float | None = None
+    try:
+        from agent_learning_loop import get_learning_loop as _gll
+        atr_tol_mult = round(_gll().get_tuned_params(symbol)["atr_tolerance_mult"], 2)
+    except Exception:
+        pass
+
     return {
         "symbol":            symbol,
         "bias":              bias,
@@ -200,6 +225,13 @@ def _mt5_signal_snapshot(symbol: str) -> dict:
         "signal_source":     source,
         "ai_approved":       sig.get("ai_approved"),
         "ts":                datetime.now(timezone.utc).isoformat(),
+        # Volume profile
+        "poc":               round(poc, 5) if poc > 0.0 else None,
+        "poc_aligned":       poc_aligned,
+        "poc_dist_pips":     poc_dist_pips,
+        "poc_side":          poc_side,
+        # Backtest-tuned entry zone
+        "atr_tol_mult":      atr_tol_mult,
     }
 
 
@@ -1067,6 +1099,48 @@ def bot_performance():
             b["win_rate"]  = round((b["wins"] / decided * 100), 1) if decided else 0.0
             b["total_pnl"] = round(b["total_pnl"], 2)
 
+        # ── Per-pair breakdown ─────────────────────────────────────────
+        PAIRS_ORDER = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
+        pair_buckets: "dict[str, dict]" = {
+            sym: {"trades": 0, "wins": 0, "losses": 0, "total_pnl": 0.0,
+                  "buys": 0, "sells": 0}
+            for sym in PAIRS_ORDER
+        }
+        for pid, plist in by_position.items():
+            ins  = [d for d in plist if d.entry == DEAL_ENTRY_IN]
+            outs = [d for d in plist if d.entry in OUT_CODES]
+            if not ins or not outs:
+                continue
+            in_deal = min(ins, key=lambda d: d.time)
+            sym = (getattr(in_deal, "symbol", "") or "").upper()
+            if sym not in pair_buckets:
+                continue
+            pnl  = sum(float(d.profit or 0) + float(d.swap or 0)
+                       + float(d.commission or 0) for d in outs)
+            side = "buys" if in_deal.type == 0 else "sells"
+            b = pair_buckets[sym]
+            b["trades"]    += 1
+            b["total_pnl"] += pnl
+            b[side]        += 1
+            if pnl > 0:
+                b["wins"] += 1
+            elif pnl < 0:
+                b["losses"] += 1
+        pair_stats = []
+        for sym in PAIRS_ORDER:
+            b = pair_buckets[sym]
+            decided = b["wins"] + b["losses"]
+            pair_stats.append({
+                "symbol":    sym,
+                "trades":    b["trades"],
+                "wins":      b["wins"],
+                "losses":    b["losses"],
+                "win_rate":  round((b["wins"] / decided * 100), 1) if decided else 0.0,
+                "total_pnl": round(b["total_pnl"], 2),
+                "buys":      b["buys"],
+                "sells":     b["sells"],
+            })
+
         # Open-positions count — surfaced on the Total Trades card so the
         # operator can see "3 closed · 1 live" at a glance instead of just
         # the closed count.
@@ -1118,7 +1192,7 @@ def bot_performance():
             'open_positions':       int(open_count),
             'open_pnl':             round(open_pnl,     2),     # floating $
         }
-        return jsonify({'ok': True, 'kpis': kpis, 'equity_curve': cumulative[-200:]})
+        return jsonify({'ok': True, 'kpis': kpis, 'equity_curve': cumulative[-200:], 'pair_stats': pair_stats})
     except Exception as exc:
         log.error("Error calculating performance: %s", exc)
         return jsonify({'ok': True, 'kpis': _empty_kpis(), 'equity_curve': [], 'error': 'Failed to calculate performance'})
@@ -1180,36 +1254,145 @@ def bot_config_apply():
 
 PAIR_SYMBOLS = ("EURUSD", "GBPUSD", "GBPJPY", "EURJPY")
 
-# Cache the latest verdicts the orchestrator received, keyed by symbol. The
-# bot subprocess writes verdicts via the thought log; we mirror them here so
-# the dashboard's matrix tab can show the most recent verdict per pair
-# without re-running the strategy.
 _latest_verdicts_by_symbol: dict = {}
-_last_orch_confidence: float = None
+_last_orch_confidence: float | None = None
+
+# Path to the shared thought log written by the bot subprocess
+_THOUGHTS_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ai_thoughts.jsonl")
+
+
+import json as _thoughts_json
+import re  as _re
+
+
+def _refresh_verdicts_from_thoughts() -> None:
+    """Read ai_thoughts.jsonl and populate _latest_verdicts_by_symbol.
+
+    The bot writes one thought entry per verdict cycle.  We scan the file
+    for the most recent entry per pair that carries an action field.
+    """
+    global _latest_verdicts_by_symbol, _last_orch_confidence
+    try:
+        if not os.path.exists(_THOUGHTS_PATH):
+            return
+        latest: dict = {}
+        with open(_THOUGHTS_PATH, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = _thoughts_json.loads(line)
+                except Exception:
+                    continue
+                sym    = (entry.get("symbol") or "").upper()
+                action = (entry.get("action") or "").strip()
+                if sym not in PAIR_SYMBOLS or not action:
+                    continue
+                ts = entry.get("ts") or ""
+                if sym not in latest or ts > latest[sym].get("ts", ""):
+                    latest[sym] = entry
+
+        new_verdicts: dict = {}
+        for sym, e in latest.items():
+            new_verdicts[sym] = {
+                "action":      e.get("action", "hold"),
+                "confidence":  e.get("confidence"),
+                "reason_code": _extract_reason_code_from_thought(e),
+                "atr_profit":  _extract_atr_from_thought(e),
+                "ts":          e.get("ts"),
+                "summary":     (e.get("summary") or "")[:80],
+            }
+        _latest_verdicts_by_symbol = new_verdicts
+
+        # Orch confidence = most recent entry from orchestrator source
+        orch_conf = None
+        orch_ts   = ""
+        with open(_THOUGHTS_PATH, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = _thoughts_json.loads(line)
+                except Exception:
+                    continue
+                src = (entry.get("source") or "").lower()
+                if ("orch" in src or "agent 0" in src) and entry.get("confidence") is not None:
+                    ts = entry.get("ts") or ""
+                    if ts > orch_ts:
+                        orch_ts   = ts
+                        orch_conf = entry.get("confidence")
+        if orch_conf is not None:
+            _last_orch_confidence = float(orch_conf)
+    except Exception as exc:
+        log.debug("_refresh_verdicts_from_thoughts failed: %s", exc)
+
+
+def _extract_reason_code_from_thought(e: dict) -> str:
+    """Pull ORC_* reason code from summary or detail text if present."""
+    for key in ("summary", "detail"):
+        m = _re.search(r'\bORC_\w+\b', e.get(key) or "")
+        if m:
+            return m.group(0)
+    return ""
+
+
+def _extract_atr_from_thought(e: dict) -> "float | None":
+    """Pull atr_profit value from detail text, e.g. 'atr_p=1.23R'."""
+    for key in ("detail", "summary"):
+        m = _re.search(r'atr_p[=:]\s*([\d.]+)', e.get(key) or "")
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                pass
+    return None
 
 
 def _bot_config_for_symbol(sym: str) -> dict:
-    """Read pair-bot tunables from ai_agent so the dashboard can render
-    per-pair diagnostics (min ATR threshold, trail multiplier, etc.)."""
+    """Read pair-bot tunables — live tuned params from backtest_insights.json
+    merged with class-level constants so the dashboard shows what the bot
+    will actually use on the next trade."""
+    base: dict = {}
     try:
         from ai_agent import _PAIR_BOT_CLASSES
         cls = _PAIR_BOT_CLASSES.get(sym.upper())
-        if cls is None:
-            return {}
-        return {
-            "min_atr_to_tighten": float(cls.MIN_ATR_PROFIT_TO_TIGHTEN),
-            "trail_atr_mult":     float(cls.TRAIL_ATR_MULT),
-            "close_on_trend":     bool(cls.CLOSE_ON_TREND_BROKEN),
-            "close_on_structure": bool(cls.CLOSE_ON_STRUCTURE_BROKEN),
-        }
+        if cls is not None:
+            base = {
+                "min_atr_to_tighten": float(cls.MIN_ATR_PROFIT_TO_TIGHTEN),
+                "trail_atr_mult":     float(cls.TRAIL_ATR_MULT),
+                "close_on_trend":     bool(cls.CLOSE_ON_TREND_BROKEN),
+                "close_on_structure": bool(cls.CLOSE_ON_STRUCTURE_BROKEN),
+            }
     except Exception:
-        return {}
+        pass
+
+    # Overlay with live tuned params (from backtest_insights.json via learning loop)
+    try:
+        from agent_learning_loop import AgentLearningLoop, get_learning_loop
+        ll = get_learning_loop() if callable(get_learning_loop) else AgentLearningLoop()
+        tp = ll.get_tuned_params(sym.upper()) or {}
+        if tp:
+            base["sl_atr_mult"]      = round(float(tp.get("sl_atr_mult",      base.get("sl_atr_mult",      0))), 4)
+            base["tp_atr_mult"]      = round(float(tp.get("tp_atr_mult",      base.get("tp_atr_mult",      0))), 4)
+            base["trail_atr_mult"]   = round(float(tp.get("trail_atr_mult",   base.get("trail_atr_mult",   0))), 4)
+            base["be_buffer_pips"]   = round(float(tp.get("be_buffer_pips",   base.get("be_buffer_pips",   0))), 2)
+            base["partial_close_rr"] = round(float(tp.get("partial_close_rr", base.get("partial_close_rr",0))), 2)
+            base["min_atr_to_tighten"] = round(float(tp.get("min_atr_to_tighten", base.get("min_atr_to_tighten", 0))), 4)
+            base["tuned"] = True
+    except Exception:
+        base["tuned"] = False
+
+    return base
 
 
 @app.route('/api/agent/matrix', methods=['GET'])
 def api_agent_matrix():
     """Snapshot of the multi-agent system: config, verdicts, heatmap, memory."""
     global bot_process, _latest_verdicts_by_symbol, _last_orch_confidence
+
+    _refresh_verdicts_from_thoughts()   # pull latest actions from thought log
 
     running = bool(bot_process and bot_process.poll() is None)
 
@@ -1520,7 +1703,7 @@ def api_backtest_run():
             wins   = int(result.get("wins", 0) or 0)
             losses = int(result.get("losses", 0) or 0)
             pnl    = float(result.get("total_pnl", 0.0) or 0.0)
-            avg    = float(result.get("avg_pnl_per_trade", 0.0) or 0.0)
+            avg    = float(result.get("avg_pnl", 0.0) or 0.0)
 
             total_trades += trades
             total_wins   += wins
@@ -1733,7 +1916,7 @@ def api_backtest_stream():
                     "losses": pl,
                     "win_rate": float(result.get("win_rate", 0.0) or 0.0),
                     "total_pnl": round(pp, 2),
-                    "avg_pnl_per_trade": float(result.get("avg_pnl_per_trade", 0.0) or 0.0),
+                    "avg_pnl_per_trade": float(result.get("avg_pnl", 0.0) or 0.0),
                     "profit_factor": float(result.get("profit_factor", 0.0) or 0.0),
                     "avg_rr_achieved": float(result.get("avg_rr_achieved", 0.0) or 0.0),
                     "avg_win_pips": float(result.get("avg_win_pips", 0.0) or 0.0),
@@ -1798,15 +1981,23 @@ def api_backtest_stream():
             # drawdowns don't occur simultaneously. The honest way is to
             # merge every pair's trade P&L stream in chronological order
             # and run one equity curve on the combined flow.
-            agg_stream: list[tuple[str, float]] = []
+            # equity_curve from analyze_results is List[float] (cumulative P&L),
+            # not List[{"t":..., "pnl":...}].  Convert incremental deltas so
+            # the running-drawdown loop below works with both formats.
+            agg_stream: list[float] = []
             for p in per_pair:
+                prev_pnl = 0.0
                 for pt in (p.get("equity_curve") or []):
-                    agg_stream.append((pt.get("t", ""), float(pt.get("pnl", 0.0))))
-            agg_stream.sort(key=lambda x: x[0])
+                    if isinstance(pt, dict):
+                        agg_stream.append(float(pt.get("pnl", 0.0)))
+                    else:
+                        cur = float(pt or 0.0)
+                        agg_stream.append(cur - prev_pnl)
+                        prev_pnl = cur
             agg_running = 0.0
             agg_peak    = 0.0
             agg_mdd     = 0.0
-            for _, pnl in agg_stream:
+            for pnl in agg_stream:
                 agg_running += pnl
                 if agg_running > agg_peak:
                     agg_peak = agg_running
@@ -1933,6 +2124,12 @@ def backtest_memory():
     for sym in PAIRS:
         try:
             stats = mem.get_cumulative_stats(sym)
+            # JS reads total_wins/total_losses/earliest/latest;
+            # get_cumulative_stats returns wins/losses/earliest_run/latest_run
+            stats["total_wins"]   = stats.get("wins",         0)
+            stats["total_losses"] = stats.get("losses",       0)
+            stats["earliest"]     = stats.get("earliest_run")
+            stats["latest"]       = stats.get("latest_run")
             # Also pull latest aggregated importances & tuned params
             agg = mem.aggregate_insights(sym)
             stats["importances"] = agg.get("importances") or {}

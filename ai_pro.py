@@ -651,17 +651,25 @@ class AgentZeroBot:
     # Pair-specific SL multiplier                                         #
     # ------------------------------------------------------------------ #
 
-    def get_sl_multiplier(self, symbol: str) -> float:
-        """Return pair-specific SL multiplier (ATR multiplier).
-        
-        Pairs with higher volatility need wider SL:
-        - EURUSD, GBPUSD, GBPJPY: 2.5×ATR (work well, lower volatility)
-        - USDCAD, USDJPY: 3.5×ATR (higher volatility, tighter SL causes early exits)
-        - AUDUSD: 2.5×ATR (default, standard volatility)
+    def _get_pair_tuned_params(self, symbol: str) -> dict:
+        """Return backtest-tuned strategy params for one pair.
+
+        Reads from AgentLearningLoop (which caches by mtime, so a fresh
+        backtest is reflected on the very next call with no bot restart).
+        Falls back to AgentLearningLoop.DEFAULT_PARAMS when the learning
+        loop is unavailable or has no data for this symbol yet.
         """
-        if symbol in ("USDCAD", "USDJPY"):
-            return 3.5  # Higher volatility pairs need wider stops
-        return 2.5     # Default for other pairs
+        if _LEARNING_LOOP_OK and get_learning_loop is not None:
+            try:
+                return get_learning_loop().get_tuned_params(symbol)
+            except Exception as exc:
+                log.debug("get_tuned_params(%s) failed: %s", symbol, exc)
+        from agent_learning_loop import AgentLearningLoop
+        return dict(AgentLearningLoop.DEFAULT_PARAMS)
+
+    def get_sl_multiplier(self, symbol: str) -> float:
+        """Return per-pair SL multiplier from backtest tuning."""
+        return self._get_pair_tuned_params(symbol)["sl_atr_mult"]
 
     # ------------------------------------------------------------------ #
     # MT5 helpers                                                         #
@@ -1080,7 +1088,8 @@ class AgentZeroBot:
                 notes=(f"trend_reason={hh_ll_status.get('reason','')} "
                        f"struct_reason={structure_status.get('reason','')}"),
             )
-            verdict = _ai_agent.get_pair_agent(symbol).manage_position(ctx)
+            _tuned  = get_learning_loop().get_tuned_params(symbol) if _LEARNING_LOOP_OK and get_learning_loop else {}
+            verdict = _ai_agent.get_pair_agent(symbol).manage_position(ctx, tuned_params=_tuned)
             action  = str(verdict.get("action", "hold"))
             reason  = str(verdict.get("reason", ""))[:120]
 
@@ -1229,8 +1238,10 @@ class AgentZeroBot:
     # ------------------------------------------------------------------ #
 
     def _level_interacted(self, df: pd.DataFrame, level: float,
-                           atr: float, bar_multiplier: int = 1) -> bool:
-        zone    = atr * self.atr_tolerance_multiplier
+                           atr: float, bar_multiplier: int = 1,
+                           atr_mult: Optional[float] = None) -> bool:
+        mult    = atr_mult if atr_mult is not None else self.atr_tolerance_multiplier
+        zone    = atr * mult
         n_bars  = self.level_interaction_bars * bar_multiplier
         recent  = df.tail(n_bars)
         touched = ((recent["low"]  <= level + zone) &
@@ -1556,14 +1567,16 @@ class AgentZeroBot:
         # POC bias gate is applied later in this method (after a setup
         # is selected). The previous daily-bias gate has been retired —
         # POC is now the singular bias filter, mirroring the backtester.
+        _pair_params  = self._get_pair_tuned_params(symbol)
+        atr_tol_mult  = _pair_params["atr_tolerance_mult"]
         atr           = self._calculate_atr(df)
         current_price = df.iloc[-1]["close"]
-        zone          = atr * self.atr_tolerance_multiplier
+        zone          = atr * atr_tol_mult
 
-        near_high_choch = self._level_interacted(df, daily_levels["high"], atr, 2)
-        near_low_choch  = self._level_interacted(df, daily_levels["low"],  atr, 2)
-        near_high       = self._level_interacted(df, daily_levels["high"], atr)
-        near_low        = self._level_interacted(df, daily_levels["low"],  atr)
+        near_high_choch = self._level_interacted(df, daily_levels["high"], atr, 2, atr_mult=atr_tol_mult)
+        near_low_choch  = self._level_interacted(df, daily_levels["low"],  atr, 2, atr_mult=atr_tol_mult)
+        near_high       = self._level_interacted(df, daily_levels["high"], atr,    atr_mult=atr_tol_mult)
+        near_low        = self._level_interacted(df, daily_levels["low"],  atr,    atr_mult=atr_tol_mult)
 
         choch_data = self.detect_choch_on_m15(symbol, df)
         cont_data  = self.detect_trend_continuation(symbol, df)
@@ -1599,13 +1612,15 @@ class AgentZeroBot:
             except Exception:
                 pass
 
-            sl_mult = self.get_sl_multiplier(symbol)
+            _tp = self._get_pair_tuned_params(symbol)
+            sl_mult = _tp["sl_atr_mult"]
+            tp_mult = _tp["tp_atr_mult"]
             if is_buy:
                 sl = round(entry - atr * sl_mult, 5)
-                tp = round(entry + atr * self.tp_atr_mult, 5)
+                tp = round(entry + atr * tp_mult, 5)
             else:
                 sl = round(entry + atr * sl_mult, 5)
-                tp = round(entry - atr * self.tp_atr_mult, 5)
+                tp = round(entry - atr * tp_mult, 5)
             return round(entry, 5), sl, tp
 
         def profile_adjustment(env: int) -> tuple[int, str, dict]:
@@ -2064,13 +2079,15 @@ class AgentZeroBot:
         atr        = float(signal.get("atr") or 0.0)
 
         if atr > 0:
-            sl_mult = self.get_sl_multiplier(symbol)
+            _tp = self._get_pair_tuned_params(symbol)
+            sl_mult = _tp["sl_atr_mult"]
+            tp_mult = _tp["tp_atr_mult"]
             if is_buy:
                 sl = round(price - atr * sl_mult, digits)
-                tp = round(price + atr * self.tp_atr_mult, digits)
+                tp = round(price + atr * tp_mult, digits)
             else:
                 sl = round(price + atr * sl_mult, digits)
-                tp = round(price - atr * self.tp_atr_mult, digits)
+                tp = round(price - atr * tp_mult, digits)
         else:
             sl = round(signal["stop_loss"], digits)
             tp = round(signal["take_profit"], digits)
@@ -2746,21 +2763,31 @@ class Bot:
                     continue
 
                 try:
+                    _tuned  = get_learning_loop().get_tuned_params(sym) if _LEARNING_LOOP_OK and get_learning_loop else {}
                     agent   = _ai_agent.get_pair_agent(sym)
-                    verdict = agent.manage_position(ctx)
+                    verdict = agent.manage_position(ctx, tuned_params=_tuned)
                 except Exception as exc:
                     log.warning("[%s] pair agent error ticket #%d: %s — hold",
                                 sym, ticket, exc)
                     verdict = {"action": "hold", "reason": f"agent error: {exc!s}"}
 
                 verdicts.append({
-                    "symbol": sym,
-                    "ticket": ticket,
-                    "action": verdict.get("action", "hold"),
-                    "new_sl": verdict.get("new_sl"),
-                    "reason": verdict.get("reason", ""),
-                    "pos":    pos,
-                    "agent":  f"{sym}_agent",
+                    "symbol":           sym,
+                    "ticket":           ticket,
+                    "action":           verdict.get("action", "hold"),
+                    "new_sl":           verdict.get("new_sl"),
+                    "reason":           verdict.get("reason", ""),
+                    "pos":              pos,
+                    "agent":            f"{sym}_agent",
+                    # price action context for orchestrator LLM
+                    "entry":            float(pos.price_open),
+                    "cur_price":        ctx.cur_price,
+                    "direction":        ctx.side,
+                    "profit_pts":       ctx.profit_pts,
+                    "structure_broken": ctx.structure_broken,
+                    "trend_intact":     ctx.trend_intact,
+                    "fresh_structure":  ctx.fresh_structure,
+                    "atr":              atr,
                 })
 
         return verdicts
@@ -2858,19 +2885,69 @@ class Bot:
                             "falling back to deterministic verdicts", exc)
                 refined = approved
 
-            # Detect what the LLM did so we can log it for the dashboard.
+            # Log every orchestrator decision to the Zero Log.
             refined_by_ticket = {v["ticket"]: v for v in refined}
             for original in approved:
-                touched = refined_by_ticket.get(original["ticket"], original)
-                orch_reason = touched.get("orchestrator_reason")
-                if orch_reason:
-                    log_thought(
-                        "orchestrator", original["symbol"],
-                        "llm_orchestrator",
-                        f"#{original['ticket']} {original['action']} -> "
-                        f"{touched.get('action', original['action'])}",
-                        detail=orch_reason, action=touched.get("action"),
-                    )
+                touched      = refined_by_ticket.get(original["ticket"], original)
+                reason_code  = touched.get("reason_code", "ORC_APPROVE")
+                orch_reason  = touched.get("orchestrator_reason", "")
+                final_action = touched.get("action", original["action"])
+
+                # Price action context captured when verdict was built
+                entry        = original.get("entry")
+                cur_price    = original.get("cur_price")
+                profit_pts   = original.get("profit_pts")
+                atr          = original.get("atr") or 0.0
+                direction    = original.get("direction", "")
+                struct_broken= original.get("structure_broken")
+                trend_intact = original.get("trend_intact")
+
+                entry_str  = f"{entry:.5f}"     if entry     is not None else "?"
+                price_str  = f"{cur_price:.5f}" if cur_price is not None else "?"
+                profit_str = (
+                    f"{profit_pts:+.0f}pts ({profit_pts/atr:.1f}R)"
+                    if profit_pts is not None and atr > 0
+                    else f"{profit_pts:+.0f}pts" if profit_pts is not None else "?"
+                )
+                struct_str = (
+                    "STRUCTURE BROKEN" if struct_broken
+                    else "structure ok"
+                )
+                trend_str = (
+                    "TREND BROKEN" if trend_intact is False
+                    else "trend ok"
+                )
+
+                action_label = {
+                    "ORC_VETO":        "VETO",
+                    "ORC_OVERRIDE":    "OVERRIDE",
+                    "ORC_APPROVE":     "APPROVE",
+                    "ORC_FORCE_CLOSE": "FORCE CLOSE",
+                    "ORC_FREEZE":      "FREEZE",
+                }.get(reason_code, reason_code)
+
+                summary = (
+                    f"#{original['ticket']} {original['symbol']} {direction} "
+                    f"— {action_label}: {original['action']} → {final_action}"
+                )
+                detail = (
+                    f"entry={entry_str} price={price_str} P&L={profit_str} | "
+                    f"{struct_str} | {trend_str}"
+                    + (f" | {orch_reason}" if orch_reason else "")
+                )
+                confidence = (
+                    1.0 if reason_code == "ORC_APPROVE"
+                    else 0.6 if reason_code == "ORC_VETO"
+                    else 0.4
+                )
+                log_thought(
+                    "orchestrator", original["symbol"],
+                    "llm_orchestrator",
+                    summary,
+                    detail=detail,
+                    action=final_action,
+                    confidence=confidence,
+                )
             approved = refined
 
         # Filter holds out at the very end — they're no-ops, but we kept
