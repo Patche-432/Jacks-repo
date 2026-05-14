@@ -81,7 +81,7 @@ class _TradeProxy:
             self.symbol      = row.get('symbol', '')
             self.signal      = row.get('signal', 'BUY')
             self.confidence  = float(row.get('confidence', 0.0) or 0.0)
-            self.rr_ratio    = float(row.get('rr_ratio',   0.0) or 0.0)
+            self.rr_ratio    = float(row.get('rr_ratio', None) or row.get('rr_achieved', 0.0) or 0.0)
             self.entry_price = float(row.get('entry_price', 0.0) or 0.0)
             self.stop_loss   = float(row.get('sl',  0.0) or 0.0)
             self.take_profit = float(row.get('tp',  0.0) or 0.0)
@@ -266,21 +266,32 @@ class Backtester:
         intrabar_policy: str = "conservative",
         lot_size: float = 0.5,
         # ── Realism params ───────────────────────────────────────────────────
-        # Typical broker spread (in price points, not pips) added on BUY entry.
-        # EURUSD: 1 point = 0.00001 → 1.0 point spread ≈ 1 pip (0.0001 / 0.00001)
-        # GBPJPY: 1 point = 0.001  → 2.0 point spread ≈ 2 pips
-        default_spread_points_major: float = 1.0,
-        default_spread_points_jpy:   float = 2.0,
+        # Default spread in price points (5-digit broker points for majors,
+        # 3-digit for JPY). 10 pts = 1 pip for majors; 20 pts = 2 pips for JPY.
+        default_spread_points_major: float = 10.0,
+        default_spread_points_jpy:   float = 20.0,
         # Asian-session spread widening multiplier applied on top of the above.
-        # GBPJPY ~17 pt typical → 33–35 pt during Asian session, while
-        # EURUSD widens to ~1.4 pt — realistic but not catastrophic.
+        # GBPJPY ~20 pt typical → 44 pt during Asian session, while
+        # EURUSD widens to ~14 pt — realistic but not catastrophic.
         asian_session_jpy_multiplier: float = 2.2,
         asian_session_other_multiplier: float = 1.4,
         # Maximum spread (points) that a signal is allowed to trade through.
-        # Signals with estimated spread above this are silently skipped, the
-        # same way the live bot rejects them.
         max_spread_points_jpy:   float = 30.0,
-        max_spread_points_major: float = 3.0,
+        max_spread_points_major: float = 30.0,
+        # ── Convenience / test-facing params ─────────────────────────────────
+        # Spread in pips: overrides default_spread_points_* when provided.
+        # 1 pip = 10 points for both majors and JPY pairs.
+        spread_pips: Optional[float] = None,
+        # Max bars a trade can be held before timeout exit.
+        # run_backtest() overrides this with days×24×4 each call.
+        max_trade_duration_bars: int = 672,
+        # Set False to disable the respective realism gate (research/legacy).
+        enforce_position_overlap: bool = True,
+        enforce_spread_filter:    bool = True,
+        # Single max-spread threshold in points (overrides jpy/major when set).
+        max_spread_points: Optional[float] = None,
+        # Reserved for future multi-symbol batching; ignored at runtime.
+        symbols: Optional[List[str]] = None,
     ) -> None:
         self._strategy  = strategy
         self.intrabar_policy = intrabar_policy
@@ -293,8 +304,20 @@ class Backtester:
         self.max_spread_points_jpy          = float(max_spread_points_jpy)
         self.max_spread_points_major        = float(max_spread_points_major)
 
+        if spread_pips is not None:
+            spts = float(spread_pips) * 10.0   # pips → broker points
+            self.default_spread_points_major = spts
+            self.default_spread_points_jpy   = spts
+        if max_spread_points is not None:
+            self.max_spread_points_jpy   = float(max_spread_points)
+            self.max_spread_points_major = float(max_spread_points)
+
+        self.max_trade_duration_bars  = int(max_trade_duration_bars)
+        self.enforce_position_overlap = bool(enforce_position_overlap)
+        self.enforce_spread_filter    = bool(enforce_spread_filter)
+
         # Set by simulate_trades; inspected by tests and the SSE stream handler.
-        self._last_skip_stats: Dict[str, int] = {}
+        self._last_skip_stats: Dict[str, Any] = {}
         self._active_until: Dict[str, datetime] = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -353,7 +376,8 @@ class Backtester:
 
         # ── 3. Simulate trades ───────────────────────────────────────────────
         try:
-            trades = self.simulate_trades(symbol, df, signals, progress_cb=progress_cb)
+            self.max_trade_duration_bars = int(days * 24 * 4)
+            trades = self.simulate_trades(symbol, signals, df, progress_cb=progress_cb)
         except Exception as exc:
             log.error("Trade simulation failed for %s: %s", symbol, exc)
             return {"symbol": symbol, "error": f"Simulation failed: {exc}"}
@@ -433,7 +457,11 @@ class Backtester:
             except Exception as exc:
                 log.warning("%s: could not load historical trades for ML: %s", symbol, exc)
 
-        fi = self.compute_feature_importance(all_trades_for_ml)
+        try:
+            fi = self.compute_feature_importance(all_trades_for_ml)
+        except Exception as exc:
+            log.warning("%s: ML feature importance failed: %s", symbol, exc)
+            fi = {"error": f"ML compute error: {exc}"}
         if fi is not None:
             results["feature_importance"] = fi
 
@@ -464,10 +492,18 @@ class Backtester:
         # so the strategy can build swing points / structure before trading.
         bars_needed = int(days * 24 * 4) + 200   # 200-bar warm-up
 
+        # _fetch_m15(symbol) uses self.lookback_candles for the bar count.
+        # Temporarily raise it so we fetch the full backtest window.
+        _orig_lookback = getattr(self._strategy, "lookback_candles", None)
         try:
-            df = self._strategy._fetch_m15(symbol, bars_needed)
+            if _orig_lookback is not None:
+                self._strategy.lookback_candles = bars_needed
+            df = self._strategy._fetch_m15(symbol)
         except Exception as exc:
             raise RuntimeError(f"_fetch_m15 failed for {symbol}: {exc}") from exc
+        finally:
+            if _orig_lookback is not None:
+                self._strategy.lookback_candles = _orig_lookback
 
         if df is None or (hasattr(df, 'empty') and df.empty):
             raise RuntimeError(f"_fetch_m15 returned empty data for {symbol}")
@@ -622,8 +658,8 @@ class Backtester:
             df_slice = df.iloc[:i + 1].copy()
 
             # Mock data fetcher so the strategy only sees history up to bar i
-            def mock_fetch(sym, n, _df=df_slice):   # noqa: E731
-                return _df.iloc[-min(n, len(_df)):]
+            def mock_fetch(sym, _df=df_slice):   # noqa: E731
+                return _df
 
             # Reconstruct daily / weekly levels from bars up to this point
             from_day  = df_slice["time"].dt.date
@@ -677,7 +713,7 @@ class Backtester:
                             rr_ratio=raw_signal.get("rr_ratio", 0.0),
                             atr=float(raw_signal.get("atr") or 0.0),
                             component_scores=raw_signal.get("component_scores", {}),
-                            environment=raw_signal.get("signal_source", "?").split("-")[0] if raw_signal.get("signal_source") else "?",
+                            environment=str(raw_signal.get("signal_source", "?")).split("-")[0] if raw_signal.get("signal_source") else "?",
                             volume_profile=dict(raw_signal.get("volume_profile") or {}),
                             poc=poc_value,
                         )
@@ -730,8 +766,8 @@ class Backtester:
     def simulate_trades(
         self,
         symbol: str,
-        df,
         signals: List[Signal],
+        df,
         progress_cb: Optional[Callable[[dict], None]] = None,
     ) -> List[Trade]:
         """
@@ -780,10 +816,19 @@ class Backtester:
         # fresh simulate_trades() invocation doesn't carry state across
         # symbols / windows.
         self._active_until: Dict[str, "datetime"] = {}
+        _is_jpy_sym = "JPY" in symbol.upper()
+        _max_sp = (self.max_spread_points_jpy if _is_jpy_sym
+                   else self.max_spread_points_major)
+        _default_spread_pts = (self.default_spread_points_jpy if _is_jpy_sym
+                               else self.default_spread_points_major)
         self._last_skip_stats = {
-            "raw_signals":     len(signals),
-            "skipped_overlap": 0,
-            "skipped_spread":  0,
+            "raw_signals":      len(signals),
+            "skipped_overlap":  0,
+            "skipped_spread":   0,
+            "taken":            0,
+            "max_spread_points": _max_sp,
+            "overlap_enforced": self.enforce_position_overlap,
+            "spread_enforced":  self.enforce_spread_filter,
         }
 
         def _resolve_intrabar(c_open: float, tp: float, sl: float,
@@ -834,7 +879,7 @@ class Backtester:
             point_size   = 0.001 if is_jpy else 0.00001
             spread_price = spread_pts * point_size
 
-            if spread_pts > max_spread:
+            if self.enforce_spread_filter and spread_pts > max_spread:
                 self._last_skip_stats["skipped_spread"] += 1
                 continue
 
@@ -847,10 +892,11 @@ class Backtester:
                 continue
 
             # ── Position-overlap gate ────────────────────────────────────
-            active_until = self._active_until.get(symbol)
-            if active_until is not None and entry_time <= active_until:
-                self._last_skip_stats["skipped_overlap"] += 1
-                continue
+            if self.enforce_position_overlap:
+                active_until = self._active_until.get(symbol)
+                if active_until is not None and entry_time <= active_until:
+                    self._last_skip_stats["skipped_overlap"] += 1
+                    continue
 
             # ── Entry price ──────────────────────────────────────────────
             if side == "BUY":
@@ -900,11 +946,11 @@ class Backtester:
                 entry_time=entry_time,
             )
 
-            max_bars      = int(days * 24 * 4)   # max hold = look-back window
-            max_exit_idx  = min(sig_bar_idx + 2 + max_bars, len(df_records) - 1)
+            max_bars      = self.max_trade_duration_bars
+            max_exit_idx  = min(sig_bar_idx + 1 + max_bars, len(df_records) - 1)
             resolved      = False
 
-            for j in range(sig_bar_idx + 2, max_exit_idx + 1):
+            for j in range(sig_bar_idx + 1, max_exit_idx + 1):
                 c = df_records[j]
                 c_high = float(c["high"])
                 c_low  = float(c["low"])
@@ -956,6 +1002,7 @@ class Backtester:
                 )
 
             trades.append(trade)
+            self._last_skip_stats["taken"] += 1
             if trade.exit_time:
                 self._active_until[symbol] = trade.exit_time
 
@@ -968,7 +1015,7 @@ class Backtester:
             "(spread=%.1fp, intrabar=%s, skipped: overlap=%d spread=%d of %d raw)",
             len(trades),
             sum(1 for t in trades if t.exit_time),
-            spread_pts,
+            _default_spread_pts,
             self.intrabar_policy,
             self._last_skip_stats["skipped_overlap"],
             self._last_skip_stats["skipped_spread"],
@@ -981,11 +1028,21 @@ class Backtester:
 
     def analyze_results(
         self,
-        symbol: str,
-        trades: List[Trade],
+        symbol_or_trades,
+        trades: Optional[List[Trade]] = None,
         df=None,
     ) -> Dict[str, Any]:
-        """Compute per-symbol statistics from the simulated trade list."""
+        """Compute per-symbol statistics from the simulated trade list.
+
+        Can be called as analyze_results(symbol, trades, df) or
+        analyze_results(trades) — the first form is used internally by
+        run_backtest; the second is used directly by tests.
+        """
+        if isinstance(symbol_or_trades, list):
+            trades = symbol_or_trades
+            symbol: Optional[str] = None
+        else:
+            symbol = symbol_or_trades
 
         if not trades:
             return {
@@ -1116,6 +1173,7 @@ class Backtester:
         # ── By hour / day-of-week ─────────────────────────────────────────────
         by_hour: Dict[str, Any] = {}
         by_dow:  Dict[str, Any] = {}
+        _by_dow_dates: Dict[str, set] = {}
         _dow_map = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
         for t in trades:
             ts = t.entry_time or t.signal.ts
@@ -1123,6 +1181,7 @@ class Backtester:
                 continue
             h  = str(ts.hour)
             dw = _dow_map.get(ts.weekday(), "?")
+            _by_dow_dates.setdefault(dw, set()).add(ts.date())
             for bucket, key in [(by_hour, h), (by_dow, dw)]:
                 if key not in bucket:
                     bucket[key] = {"count":0,"wins":0,"losses":0,"total_pnl":0.0,"avg_pips":0.0,"_p":0.0}
@@ -1137,6 +1196,30 @@ class Backtester:
                 d["win_rate"] = d["wins"] / n if n else 0.0
                 d["avg_pips"] = d["_p"]   / n if n else 0.0
                 del d["_p"]
+        for dw_key, d in by_dow.items():
+            dates_sorted = sorted(_by_dow_dates.get(dw_key, set()))
+            d["dates"]      = [str(x) for x in dates_sorted]
+            d["date_count"] = len(dates_sorted)
+            d["date_range"] = {
+                "start": str(dates_sorted[0])  if dates_sorted else None,
+                "end":   str(dates_sorted[-1]) if dates_sorted else None,
+            }
+
+        # ── Top-level date range ──────────────────────────────────────────────
+        _all_dates = sorted({
+            t.entry_time.date()
+            for t in trades
+            if getattr(t, "entry_time", None) is not None
+        })
+        if _all_dates:
+            date_range_info: Optional[Dict[str, Any]] = {
+                "start_date":    str(_all_dates[0]),
+                "end_date":      str(_all_dates[-1]),
+                "trading_days":  len(_all_dates),
+                "calendar_days": (_all_dates[-1] - _all_dates[0]).days + 1,
+            }
+        else:
+            date_range_info = None
 
         # ── Confidence buckets ────────────────────────────────────────────────
         confidence_buckets: Dict[str, Any] = {}
@@ -1192,10 +1275,13 @@ class Backtester:
             outcomes_arr = np.array([1.0 if t.outcome == "WIN" else 0.0 for t in decided])
             score_keys   = set()
             for t in decided:
-                score_keys.update((t.signal.component_scores or {}).keys())
+                cs = t.signal.component_scores
+                if isinstance(cs, dict):
+                    score_keys.update(cs.keys())
             for key in score_keys:
                 vals = np.array([
-                    float((t.signal.component_scores or {}).get(key, 0.0))
+                    float((t.signal.component_scores or {}).get(key, 0.0)
+                          if isinstance(t.signal.component_scores, dict) else 0.0)
                     for t in decided
                 ])
                 if vals.std() > 1e-9 and outcomes_arr.std() > 1e-9:
@@ -1265,6 +1351,7 @@ class Backtester:
             "by_side":               by_side,
             "by_hour":               by_hour,
             "by_dow":                by_dow,
+            "date_range":            date_range_info,
             "confidence_buckets":    confidence_buckets,
             "pnl_distribution":      pnl_distribution,
             "component_correlations":component_correlations,
@@ -1272,9 +1359,9 @@ class Backtester:
             "assumptions":           self._build_assumptions(symbol),
         }
 
-    def _build_assumptions(self, symbol: str) -> Dict[str, Any]:
+    def _build_assumptions(self, symbol: Optional[str]) -> Dict[str, Any]:
         """Return the modelling-assumptions block shown in the dashboard."""
-        is_jpy    = "JPY" in symbol.upper()
+        is_jpy    = "JPY" in (symbol or "").upper()
         spread_pt = (self.default_spread_points_jpy if is_jpy
                      else self.default_spread_points_major)
         return {
