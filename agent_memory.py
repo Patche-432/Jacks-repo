@@ -61,18 +61,20 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS decisions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          TEXT    NOT NULL,           -- ISO-8601 UTC
-    symbol      TEXT    NOT NULL,
-    ticket      INTEGER NOT NULL,
-    action_bot  TEXT    NOT NULL,           -- what the pair bot proposed
-    action_taken TEXT   NOT NULL,           -- what was actually executed
-    new_sl      REAL,
-    bot_reason  TEXT,
-    orch_reason TEXT,                       -- orchestrator's stated reason
-    session     TEXT,                       -- London / NewYork / Asian / Overlap
-    hour_utc    INTEGER,
-    dow         INTEGER                     -- 0=Mon..6=Sun
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT    NOT NULL,           -- ISO-8601 UTC
+    symbol          TEXT    NOT NULL,
+    ticket          INTEGER NOT NULL,
+    action_bot      TEXT    NOT NULL,           -- what the pair bot proposed
+    action_taken    TEXT    NOT NULL,           -- what was actually executed
+    new_sl          REAL,
+    bot_reason      TEXT,
+    orch_reason     TEXT,                       -- orchestrator's stated reason
+    session         TEXT,                       -- London / NewYork / Asian / Overlap
+    hour_utc        INTEGER,
+    dow             INTEGER,                    -- 0=Mon..6=Sun
+    trend_intact    INTEGER,                    -- 1=HH/HL intact, 0=broken, NULL=unknown
+    structure_broken INTEGER                    -- 1=structure broken, 0=ok, NULL=unknown
 );
 
 CREATE INDEX IF NOT EXISTS idx_dec_symbol ON decisions(symbol);
@@ -164,7 +166,16 @@ class AgentMemory:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_DDL)
-            conn.commit()
+            # Migrate existing DBs that predate the price-action columns
+            for col, typedef in (
+                ("trend_intact",     "INTEGER"),
+                ("structure_broken", "INTEGER"),
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {typedef}")
+                    conn.commit()
+                except Exception:
+                    pass  # column already exists
 
     # ── Write ─────────────────────────────────────────────────────────────────
 
@@ -199,6 +210,9 @@ class AgentMemory:
                 continue
             ticket = int(ticket)
             d = out_by_ticket.get(ticket, v)  # fallback: treated as approved
+
+            ti = v.get("trend_intact")
+            sb = v.get("structure_broken")
             rows.append((
                 ts,
                 str(v.get("symbol", "?")),
@@ -211,6 +225,8 @@ class AgentMemory:
                 sess,
                 hour,
                 dow,
+                (1 if ti else 0) if ti is not None else None,
+                (1 if sb else 0) if sb is not None else None,
             ))
 
         if not rows:
@@ -220,8 +236,9 @@ class AgentMemory:
             conn.executemany(
                 """INSERT INTO decisions
                    (ts, symbol, ticket, action_bot, action_taken,
-                    new_sl, bot_reason, orch_reason, session, hour_utc, dow)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    new_sl, bot_reason, orch_reason, session, hour_utc, dow,
+                    trend_intact, structure_broken)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 rows,
             )
             conn.commit()
@@ -345,7 +362,29 @@ class AgentMemory:
                 (cutoff,),
             ).fetchall()
 
-            # ── 4. Recent decisions (last 5 with outcomes) ───────────────
+            # ── 4. Price-action conditional win rates ────────────────────
+            # "When trend intact at review time, did the trade win?"
+            price_action_rows = conn.execute(
+                """
+                SELECT d.symbol,
+                       d.trend_intact,
+                       d.structure_broken,
+                       o.outcome,
+                       COUNT(*) AS n,
+                       AVG(o.profit_pips) AS avg_pips
+                FROM decisions d
+                JOIN outcomes o ON o.decision_id = d.id
+                WHERE d.ts >= ?
+                  AND d.trend_intact    IS NOT NULL
+                  AND d.structure_broken IS NOT NULL
+                  AND o.outcome IN ('WIN','LOSS')
+                GROUP BY d.symbol, d.trend_intact, d.structure_broken, o.outcome
+                ORDER BY d.symbol, d.trend_intact DESC, d.structure_broken
+                """,
+                (cutoff,),
+            ).fetchall()
+
+            # ── 5. Recent decisions (last 5 with outcomes) ───────────────
             recent_rows = conn.execute(
                 """
                 SELECT d.ts, d.symbol, d.action_bot, d.action_taken,
@@ -359,7 +398,7 @@ class AgentMemory:
                 (cutoff,),
             ).fetchall()
 
-            # ── 5. Total labelled decisions ──────────────────────────────
+            # ── 6. Total labelled decisions ──────────────────────────────
             total_labelled = conn.execute(
                 "SELECT COUNT(*) FROM outcomes o JOIN decisions d ON d.id=o.decision_id WHERE d.ts>=?",
                 (cutoff,),
@@ -431,6 +470,44 @@ class AgentMemory:
             )
         if sym_lines:
             parts.append("PER-SYMBOL:\n" + "\n".join(sym_lines))
+
+        # ── Price-action conditional win rates ───────────────────────────
+        # Aggregate: by symbol + (trend_intact, structure_broken) state
+        pa_agg: Dict[str, Dict] = {}
+        for r in price_action_rows:
+            key = (r["symbol"], int(r["trend_intact"] or 0), int(r["structure_broken"] or 0))
+            if key not in pa_agg:
+                pa_agg[key] = {"win": 0, "loss": 0, "pips": 0.0}
+            if r["outcome"] == "WIN":
+                pa_agg[key]["win"] += r["n"]
+                pa_agg[key]["pips"] += (r["avg_pips"] or 0.0) * r["n"]
+            elif r["outcome"] == "LOSS":
+                pa_agg[key]["loss"] += r["n"]
+
+        pa_lines: List[str] = []
+        for (sym, ti, sb), d in sorted(pa_agg.items()):
+            total = d["win"] + d["loss"]
+            if total < 2:
+                continue
+            wr = d["win"] / total
+            avg_p = d["pips"] / total
+            state = (
+                "trend=OK struct=OK"  if ti == 1 and sb == 0 else
+                "trend=OK struct=BRK" if ti == 1 and sb == 1 else
+                "trend=BRK struct=OK" if ti == 0 and sb == 0 else
+                "trend=BRK struct=BRK"
+            )
+            pa_lines.append(
+                f"  {sym} [{state}]: {d['win']}W/{d['loss']}L "
+                f"({wr:.0%} WR, avg {avg_p:+.1f}p)"
+            )
+        if pa_lines:
+            parts.append(
+                "PRICE ACTION AT REVIEW TIME (live data):\n"
+                + "\n".join(pa_lines)
+                + "\n  Use these to calibrate: if trend=OK struct=OK WR is high → "
+                "APPROVE holds. If trend=BRK → consider OVERRIDE."
+            )
 
         # ── Session patterns ─────────────────────────────────────────────
         sess_agg: Dict[str, Dict] = {}
