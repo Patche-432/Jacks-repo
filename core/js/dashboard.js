@@ -793,6 +793,60 @@ function fetchPerformance() {
         renderEquityCurve(equityData, data.error || null);
         renderPairPerformance(data.pair_stats || []);
     }).catch(() => { renderKPIs({}); renderEquityCurve([], 'Failed to reach /bot/performance'); renderPairPerformance([]); });
+    fetch('/api/agent/edge').then(r => r.json()).then(renderEdgePanel).catch(() => renderEdgePanel({}));
+}
+
+function renderEdgePanel(d) {
+    const el = document.getElementById('perf-edge-body');
+    if (!el) return;
+    if (!d || !d.ok || !d.total_labelled) {
+        el.innerHTML = `<div style="font-size:10px;color:var(--txt3)">No labelled outcomes yet — edge stats will appear as trades close.</div>`;
+        return;
+    }
+
+    function _row(label, stat, highlight) {
+        if (!stat || stat.n === 0) return '';
+        const wr   = stat.win_rate != null ? stat.win_rate.toFixed(1) + '%' : '—';
+        const pl   = stat.net_pnl  != null ? (stat.net_pnl >= 0 ? '+' : '') + '$' + Math.abs(stat.net_pnl).toFixed(2) : '—';
+        const plC  = (stat.net_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)';
+        const wrC  = stat.win_rate == null ? 'var(--txt3)' : stat.win_rate >= 55 ? 'var(--green)' : stat.win_rate >= 40 ? '#e67e22' : 'var(--red)';
+        const hlStyle = highlight ? `background:${highlight};border-radius:4px;padding:0 4px;` : '';
+        return `<div style="display:grid;grid-template-columns:130px 40px 40px 70px 80px;gap:8px;align-items:center;padding:5px 0;border-top:1px solid var(--line);font-size:10px">
+            <span style="color:var(--txt2);${hlStyle}">${label}</span>
+            <span style="color:var(--txt3);text-align:right">${stat.n}</span>
+            <span style="color:${wrC};font-weight:600;text-align:right">${wr}</span>
+            <span style="color:var(--txt3);text-align:right">${stat.wins}W · ${stat.losses}L</span>
+            <span style="color:${plC};font-weight:600;font-family:var(--mono);text-align:right">${pl}</span>
+        </div>`;
+    }
+
+    let html = `<div style="display:grid;grid-template-columns:130px 40px 40px 70px 80px;gap:8px;padding:0 0 4px;font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:.05em">
+        <span></span><span style="text-align:right">n</span><span style="text-align:right">WR</span><span style="text-align:right">W·L</span><span style="text-align:right">Net P&L</span>
+    </div>`;
+    html += _row('Bot approved', d.approved);
+    html += _row('Orchestrator VETO', d.vetoed, 'rgba(230,126,34,0.15)');
+    html += _row('Orchestrator OVERRIDE', d.overridden, 'rgba(255,107,107,0.15)');
+
+    if (d.price_action && d.price_action.length) {
+        html += `<div style="font-size:9px;color:var(--txt3);text-transform:uppercase;letter-spacing:.05em;margin:10px 0 4px;font-weight:600">Price Action at Review</div>`;
+        d.price_action.forEach(p => {
+            if (p.n < 2) return;
+            const wr  = p.win_rate != null ? p.win_rate.toFixed(0) + '%' : '—';
+            const pl  = (p.net_pnl >= 0 ? '+' : '') + '$' + Math.abs(p.net_pnl).toFixed(2);
+            const wrC = p.win_rate == null ? 'var(--txt3)' : p.win_rate >= 55 ? 'var(--green)' : p.win_rate >= 40 ? '#e67e22' : 'var(--red)';
+            const plC = p.net_pnl >= 0 ? 'var(--green)' : 'var(--red)';
+            html += `<div style="display:grid;grid-template-columns:130px 40px 40px 70px 80px;gap:8px;align-items:center;padding:5px 0;border-top:1px solid var(--line);font-size:10px">
+                <span style="color:var(--txt2);font-size:9px">${p.state}</span>
+                <span style="color:var(--txt3);text-align:right">${p.n}</span>
+                <span style="color:${wrC};font-weight:600;text-align:right">${wr}</span>
+                <span style="color:var(--txt3);text-align:right">${p.wins}W · ${p.losses}L</span>
+                <span style="color:${plC};font-weight:600;font-family:var(--mono);text-align:right">${pl}</span>
+            </div>`;
+        });
+    }
+
+    html += `<div style="font-size:9px;color:var(--txt3);margin-top:8px">${d.total_labelled} labelled outcomes total</div>`;
+    el.innerHTML = html;
 }
 
 function renderPairPerformance(pairStats) {

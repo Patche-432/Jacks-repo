@@ -591,6 +591,7 @@ class AgentZeroBot:
         self._ai_peak_profit: dict         = {}   # ticket -> float pts
         self._ai_last_review_ts: dict      = {}   # ticket -> unix seconds (last Agent Zero risk review)
         self._ai_last_heartbeat_ts: dict   = {}   # ticket -> unix seconds (last "monitoring" log)
+        self._known_tickets: set           = set()  # tickets seen open last cycle (broker-close detection)
 
         # Per-symbol margin circuit breaker. mt5.order_check() runs before
         # every order_send so we never hit the broker with a request that
@@ -2720,6 +2721,44 @@ class Bot:
         """
         if not self.use_ai or not (_AGENT_IMPORT_OK and _ai_agent is not None):
             return
+
+        # ── Broker-close detection ────────────────────────────────────────
+        # Tickets that were open last cycle but are gone now were closed by
+        # the broker (SL/TP hit). Label their agent_memory outcome so the
+        # learning loop gets credit for those trades too.
+        try:
+            import MetaTrader5 as mt5
+            current_positions = list(mt5.positions_get() or [])
+            current_tickets   = {int(p.ticket) for p in current_positions}
+            vanished          = self._known_tickets - current_tickets
+            if vanished:
+                from agent_memory import get_memory as _amem
+                from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                date_from = _dt.now(_tz.utc) - _td(hours=24)
+                deals     = mt5.history_deals_get(date_from, _dt.now(_tz.utc)) or []
+                pnl_by_ticket: dict = {}
+                for deal in deals:
+                    pid = int(getattr(deal, "position_id", 0) or 0)
+                    if pid in vanished:
+                        pnl_by_ticket[pid] = pnl_by_ticket.get(pid, 0.0) + float(deal.profit or 0)
+                for ticket in vanished:
+                    pnl = pnl_by_ticket.get(ticket)
+                    if pnl is None:
+                        continue
+                    outcome = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "BE"
+                    try:
+                        _amem().record_outcome(
+                            ticket=ticket,
+                            outcome=outcome,
+                            profit_pips=0.0,
+                            profit_usd=round(pnl, 2),
+                        )
+                        log.info("broker-close detected ticket #%d → %s ($%.2f)", ticket, outcome, pnl)
+                    except Exception as exc:
+                        log.debug("broker-close record_outcome failed #%d: %s", ticket, exc)
+            self._known_tickets = current_tickets
+        except Exception as exc:
+            log.debug("broker-close detection failed: %s", exc)
 
         raw_verdicts = self._collect_pair_verdicts()
         if not raw_verdicts:

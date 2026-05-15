@@ -1448,6 +1448,96 @@ def api_agent_matrix():
     })
 
 
+@app.route('/api/agent/edge', methods=['GET'])
+def api_agent_edge():
+    """Orchestrator edge stats — how much value VETO/OVERRIDE interventions add."""
+    try:
+        from agent_memory import AgentMemory
+        import sqlite3
+        mem = AgentMemory()
+        with mem._conn() as conn:
+            rows = conn.execute("""
+                SELECT
+                    d.action_bot,
+                    d.action_taken,
+                    o.outcome,
+                    o.profit_usd,
+                    d.trend_intact,
+                    d.structure_broken,
+                    d.symbol
+                FROM decisions d
+                JOIN outcomes o ON o.decision_id = d.id
+                WHERE o.outcome IN ('WIN','LOSS','BE')
+            """).fetchall()
+
+        total = approved = vetoed = overridden = 0
+        approve_wins = approve_losses = 0
+        approve_pnl  = 0.0
+        veto_wins    = veto_losses    = 0
+        veto_pnl     = 0.0
+        override_wins= override_losses= 0
+        override_pnl = 0.0
+        pa_stats: dict = {}   # (trend_intact, structure_broken) -> {win,loss,pnl}
+
+        for r in rows:
+            total += 1
+            bot    = r["action_bot"]
+            taken  = r["action_taken"]
+            out    = r["outcome"]
+            pnl    = float(r["profit_usd"] or 0.0)
+            changed = bot != taken
+
+            if not changed:
+                approved += 1
+                if out == "WIN":   approve_wins   += 1; approve_pnl += pnl
+                elif out == "LOSS":approve_losses += 1; approve_pnl += pnl
+            elif taken == "hold" and bot in ("close","move_sl"):
+                vetoed += 1
+                if out == "WIN":   veto_wins   += 1; veto_pnl += pnl
+                elif out == "LOSS":veto_losses += 1; veto_pnl += pnl
+            elif taken == "close" and bot == "hold":
+                overridden += 1
+                if out == "WIN":   override_wins   += 1; override_pnl += pnl
+                elif out == "LOSS":override_losses += 1; override_pnl += pnl
+
+            # Price action conditional stats
+            ti = r["trend_intact"]
+            sb = r["structure_broken"]
+            if ti is not None and sb is not None:
+                key = (int(ti), int(sb))
+                if key not in pa_stats:
+                    pa_stats[key] = {"win": 0, "loss": 0, "pnl": 0.0}
+                if out == "WIN":   pa_stats[key]["win"]  += 1; pa_stats[key]["pnl"] += pnl
+                elif out == "LOSS":pa_stats[key]["loss"] += 1; pa_stats[key]["pnl"] += pnl
+
+        def _wr(w, l): return round(w / (w+l) * 100, 1) if (w+l) > 0 else None
+
+        pa_list = []
+        labels = {(1,0):"trend=OK struct=OK", (1,1):"trend=OK struct=BRK",
+                  (0,0):"trend=BRK struct=OK",(0,1):"trend=BRK struct=BRK"}
+        for key, d in sorted(pa_stats.items()):
+            n = d["win"] + d["loss"]
+            pa_list.append({
+                "state":    labels.get(key, str(key)),
+                "wins":     d["win"],  "losses": d["loss"],
+                "win_rate": _wr(d["win"], d["loss"]),
+                "net_pnl":  round(d["pnl"], 2),
+                "n":        n,
+            })
+
+        return jsonify({
+            "ok": True,
+            "total_labelled":   total,
+            "approved":  {"n": approved,   "wins": approve_wins,  "losses": approve_losses,  "win_rate": _wr(approve_wins,  approve_losses),  "net_pnl": round(approve_pnl,  2)},
+            "vetoed":    {"n": vetoed,     "wins": veto_wins,     "losses": veto_losses,     "win_rate": _wr(veto_wins,     veto_losses),     "net_pnl": round(veto_pnl,     2)},
+            "overridden":{"n": overridden, "wins": override_wins, "losses": override_losses, "win_rate": _wr(override_wins, override_losses), "net_pnl": round(override_pnl, 2)},
+            "price_action": pa_list,
+        })
+    except Exception as exc:
+        log.error("api_agent_edge error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)})
+
+
 @app.route('/api/agent/portfolio', methods=['GET'])
 def api_agent_portfolio():
     """Live PortfolioSnapshot for the risk dial / alignment / exposure cards."""
