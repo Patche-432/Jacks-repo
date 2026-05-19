@@ -77,7 +77,7 @@ signal confidence over time.
 - **Windows** (the `MetaTrader5` Python package is Windows-only)
 - **Python 3.10+**
 - **MetaTrader 5 desktop terminal** installed and logged into a broker account
-- **Ollama** running locally — only needed for Agent 0 (Orchestrator). Default model: `qwen2.5:3b-instruct`
+- **Ollama** running locally — only needed for Agent 0 (Orchestrator). Default model: `qwen2.5:14b-instruct` (requires ~10 GB RAM)
 
 ## First-time setup
 
@@ -172,8 +172,8 @@ Output is clamped to `[60, 95]`.
 | Variable | Default | Effect |
 |---|---|---|
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server location |
-| `OLLAMA_MODEL` | `qwen2.5:3b-instruct` | Orchestrator model |
-| `AGENT_TIMEOUT_S` | `60` | Max wait per LLM call |
+| `OLLAMA_MODEL` | `qwen2.5:14b-instruct` | Orchestrator model (downgrade to 7b/3b on smaller boxes) |
+| `AGENT_TIMEOUT_S` | `90` | Max wait per LLM call (14b on CPU needs 40-60s) |
 | `AI_BACKEND` | `agent` | Set to `off` to disable orchestrator |
 | `FORTIS_HOST` | `127.0.0.1` | Dashboard bind address |
 | `FORTIS_PORT` | `5000` | Dashboard port |

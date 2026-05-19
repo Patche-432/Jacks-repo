@@ -1088,33 +1088,31 @@ class Backtester:
             if any(t.rr_achieved > 0 for t in losses) else 0.0
         )
 
-        # ── By signal quality ────────────────────────────────────────────────
-        by_quality: Dict[str, Any] = {}
-        for quality in ["strong", "good", "fair", "weak"]:
-            q_trades = [t for t in trades if t.signal.quality == quality]
-            if q_trades:
-                q_wins = sum(1 for t in q_trades if t.outcome == "WIN")
-                by_quality[quality] = {
-                    "count": len(q_trades),
-                    "win_rate": q_wins / len(q_trades),
-                    "avg_pnl": sum(t.profit for t in q_trades) / len(q_trades),
-                    "avg_rr": sum(t.rr_achieved for t in q_trades) / len(q_trades),
-                }
+        # by_quality_detailed is computed further down and is what we return —
+        # the dashboard reads it via the "by_quality" output key.
 
         # Calculate average trade duration
         durations = [t.duration_minutes for t in trades if t.duration_minutes > 0]
         avg_duration = np.mean(durations) if durations else 0
 
-        # Breakdown by exit reason
+        # Breakdown by exit reason — schema matches every other bucket
+        # (by_env, by_side, by_hour, by_dow, by_quality_detailed) so the
+        # dashboard's _btAggregateBuckets can render P&L and W/L correctly.
         by_exit_reason: Dict[str, Any] = {}
         for reason in ["sl", "tp", "timeout"]:
             r_trades = [t for t in trades if t.exit_reason == reason]
             if r_trades:
-                r_wins = sum(1 for t in r_trades if t.outcome == "WIN")
+                r_wins   = sum(1 for t in r_trades if t.outcome == "WIN")
+                r_losses = sum(1 for t in r_trades if t.outcome == "LOSS")
+                n        = len(r_trades)
                 by_exit_reason[reason] = {
-                    "count": len(r_trades),
-                    "win_rate": r_wins / len(r_trades),
-                    "avg_pnl": sum(t.profit for t in r_trades) / len(r_trades),
+                    "count":     n,
+                    "wins":      r_wins,
+                    "losses":    r_losses,
+                    "win_rate":  r_wins / n,
+                    "total_pnl": sum(t.profit      for t in r_trades),
+                    "avg_pips":  sum(t.profit_pips for t in r_trades) / n,
+                    "avg_pnl":   sum(t.profit      for t in r_trades) / n,
                 }
 
         # ── Max drawdown (equity-curve based) ──────────────────────

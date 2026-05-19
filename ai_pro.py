@@ -108,17 +108,16 @@ sessions:
 risk:
   max_risk_per_trade_pct:   1.0
   # Per-symbol cap on simultaneous open positions. 0 = UNLIMITED.
-  # Default 5 is a soft brake so a misfiring strategy can't stack 100 trades
-  # on one symbol before the broker's margin check catches up.
-  max_open_positions:       5
+  max_open_positions:       0
   # Account-wide cap on simultaneous open positions across all symbols.
-  # 0 = UNLIMITED. Provides a global ceiling on total exposure.
-  max_open_positions_total: 20
+  # 0 = UNLIMITED.
+  max_open_positions_total: 0
   # Circuit breaker: halt new entries for the rest of today (UTC) once
   # realised P&L for the day drops below -N% of the start-of-day balance.
   # 0 = DISABLED. Existing positions keep being managed.
   max_daily_loss_pct:       3.0
-  max_spread_points:        30
+  # Spread gate. 0 = DISABLED (no spread filtering on entry).
+  max_spread_points:        0
 
 entry:
   min_confluence_signals: 1
@@ -356,11 +355,12 @@ class TradingRules:
         risk: dict = raw.get("risk") or {}
         self.max_risk_per_trade_pct: float         = float(risk.get("max_risk_per_trade_pct", 1.0))
         # 0 = unlimited for both caps (per-symbol and account-wide).
-        self.max_open_positions: int               = int(risk.get("max_open_positions", 5))
-        self.max_open_positions_total: int         = int(risk.get("max_open_positions_total", 20))
+        self.max_open_positions: int               = int(risk.get("max_open_positions", 0))
+        self.max_open_positions_total: int         = int(risk.get("max_open_positions_total", 0))
         # 0 = daily loss circuit breaker disabled.
         self.max_daily_loss_pct: float             = float(risk.get("max_daily_loss_pct", 0.0))
-        self.max_spread_points: int                = int(risk.get("max_spread_points", 30))
+        # 0 = spread filter disabled.
+        self.max_spread_points: int                = int(risk.get("max_spread_points", 0))
 
         entry: dict = raw.get("entry") or {}
         self.min_confluence_signals: int = int(entry.get("min_confluence_signals", 1))
@@ -592,6 +592,7 @@ class AgentZeroBot:
         self._ai_last_review_ts: dict      = {}   # ticket -> unix seconds (last Agent Zero risk review)
         self._ai_last_heartbeat_ts: dict   = {}   # ticket -> unix seconds (last "monitoring" log)
         self._known_tickets: set           = set()  # tickets seen open last cycle (broker-close detection)
+        self._entry_signals: dict          = {}   # ticket -> {confidence, dist_to_poc_atr} at entry time
 
         # Per-symbol margin circuit breaker. mt5.order_check() runs before
         # every order_send so we never hit the broker with a request that
@@ -604,6 +605,15 @@ class AgentZeroBot:
         self._margin_breaker_last_reason: dict = {}   # symbol -> str
         self._margin_breaker_lock              = threading.Lock()
         self._margin_breaker_threshold         = 3
+
+        # Execution lock — serialises the order_check + order_send sequence
+        # against ALL other MT5 calls in the process.  The MT5 Python API
+        # is a single global session: background threads (dashboard polls,
+        # auto-connect, connection monitor) can call mt5.shutdown() or
+        # re-initialize() mid-order, which makes the broker reject a valid
+        # order_send with retcode 10019 / last_error (1,'Success').  Holding
+        # this lock across the whole send sequence prevents that race.
+        self._exec_lock = threading.RLock()
 
     def mt5_snapshot(self) -> dict:
         return dict(self._mt5_info_cache)
@@ -631,6 +641,12 @@ class AgentZeroBot:
             (mt5.ORDER_FILLING_RETURN, "RETURN"),
             (mt5.ORDER_FILLING_BOC,    "BOC"),
         ]
+        # Accept BOTH retcode==0 and TRADE_RETCODE_DONE (10009) as a clean
+        # probe — different brokers return one or the other from order_check
+        # on a valid request. Without this, brokers that return 10009 cause
+        # every candidate to "fail" and we silently fall back to FOK, which
+        # some brokers reject with a generic retcode (sometimes 10019 with
+        # margin_free=0 margin_required=0, masquerading as NO_MONEY).
         for mode, name in candidates:
             probe = {
                 "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol,
@@ -640,7 +656,7 @@ class AgentZeroBot:
                 "type_time": mt5.ORDER_TIME_GTC, "type_filling": mode,
             }
             result = mt5.order_check(probe)
-            if result is not None and result.retcode == 0:
+            if result is not None and result.retcode in (0, mt5.TRADE_RETCODE_DONE):
                 log.info("[FILL MODE] %s: %s", symbol, name)
                 self._filling_mode_cache[symbol] = mode
                 return mode
@@ -2020,6 +2036,33 @@ class AgentZeroBot:
         if retcode in (0, mt5.TRADE_RETCODE_DONE):
             info["ok"] = True
             return True, info
+
+        # ── Phantom "No money" guard ──────────────────────────────────────
+        # Some brokers return retcode 10019 ("No money") from order_check()
+        # when margin_free AND margin_required are BOTH 0.00.  This means
+        # MT5 failed to calculate the margin requirement (e.g. the symbol
+        # is temporarily unavailable for margin calc, or the filling-mode
+        # probe produced a zero-volume result).  The account actually has
+        # funds — it is NOT a genuine insufficient-margin situation.
+        # Treating this as a hard block arms the circuit breaker and locks
+        # out trading for the entire session.  Instead we log a warning and
+        # let the order through so order_send() can attempt execution and
+        # return a real response from the broker.
+        if retcode == 10019 and info["margin_free"] == 0.0 and info["margin"] == 0.0:
+            log.warning(
+                "[PRE-CHECK] Phantom 10019 on %s — margin_free=0 margin_required=0; "
+                "MT5 could not calculate margin. Bypassing pre-check and letting "
+                "order_send decide. equity=%.2f balance=%.2f",
+                request.get("symbol", "?"),
+                info["equity"],
+                info["balance"],
+            )
+            info["ok"]       = True
+            info["no_money"] = False
+            info["comment"]  = f"[phantom-10019 bypassed] {comment}"
+            return True, info
+        # ─────────────────────────────────────────────────────────────────
+
         return False, info
 
     # ------------------------------------------------------------------ #
@@ -2106,7 +2149,29 @@ class AgentZeroBot:
         source_short = signal.get('signal_source', '?')[:15]
         direction_short = signal['signal'][:3]
         comment_str = f"AP_{source_short[:10]}_{direction_short}"[:31]
-        
+
+        # ── Clamp lot_size to broker volume limits ────────────────────────
+        # If lot_size exceeds volume_max the broker returns retcode 10019
+        # ("No money") from order_check with margin_free=0/margin_required=0
+        # — a misleading error.  Guard against it here.
+        vol_min  = float(getattr(info, "volume_min",  0.01) or 0.01)
+        vol_max  = float(getattr(info, "volume_max",  100.0) or 100.0)
+        vol_step = float(getattr(info, "volume_step", 0.01) or 0.01)
+        safe_lot = max(vol_min, min(float(lot_size), vol_max))
+        # Round to the broker's volume step so we don't get a rounding reject
+        if vol_step > 0:
+            import math
+            safe_lot = round(math.floor(safe_lot / vol_step) * vol_step, 8)
+            safe_lot = max(vol_min, safe_lot)
+        if safe_lot != float(lot_size):
+            log.warning(
+                "[VOLUME CLAMP] %s: requested %.2f lots clamped to %.2f "
+                "(min=%.2f max=%.2f step=%.2f)",
+                symbol, lot_size, safe_lot, vol_min, vol_max, vol_step,
+            )
+        lot_size = safe_lot
+        # ─────────────────────────────────────────────────────────────────
+
         # Market order (spot entry only)
         request = {
             "action":       mt5.TRADE_ACTION_DEAL,
@@ -2124,6 +2189,24 @@ class AgentZeroBot:
         }
 
         # ------------------------------------------------------------- #
+        # Pre-flight margin / validity check + send.                     #
+        # The whole order_check + order_send sequence runs UNDER the
+        # execution lock so no background thread (dashboard poll,
+        # auto-connect, connection monitor) can call mt5.shutdown() or
+        # re-initialize() between the check and the send.  That race was
+        # the cause of valid orders being rejected with retcode 10019 and
+        # a contradictory last_error of (1, 'Success').
+        # ------------------------------------------------------------- #
+        with self._exec_lock:
+            return self._do_pre_check_and_send(
+                mt5, symbol, signal, request, sl, tp,
+                vol_min, vol_step,
+            )
+
+    def _do_pre_check_and_send(self, mt5, symbol, signal, request, sl, tp,
+                               vol_min, vol_step) -> dict:
+        """Pre-flight check + order_send, executed under self._exec_lock."""
+        # ------------------------------------------------------------- #
         # Pre-flight margin / validity check.                            #
         # mt5.order_check() asks the broker to validate the request
         # WITHOUT routing it to the market. This catches "No money"
@@ -2132,6 +2215,7 @@ class AgentZeroBot:
         # history. On consecutive failures we arm the per-symbol margin
         # breaker so we stop hammering the broker with rejects.
         # ------------------------------------------------------------- #
+        lot_size = float(request["volume"])
         ok, check_info = self._margin_pre_check(mt5, request)
         if not ok:
             n = self._record_margin_failure(
@@ -2164,12 +2248,43 @@ class AgentZeroBot:
         # Pre-check passed — clear any prior failure streak for this symbol.
         self._record_margin_success(symbol)
 
-        result = mt5.order_send(request)
+        # ── order_send with automatic lot-size fallback ──────────────────
+        # If the broker returns 10019 (No money) on order_send, retry with
+        # progressively smaller lot sizes down to volume_min before giving
+        # up. This handles accounts where the configured lot size is too
+        # large for current free margin (e.g. small or demo accounts).
+        _attempt_lots = [lot_size]
+        if lot_size > vol_min:
+            # Add midpoint and minimum as fallback steps
+            mid = round(math.floor((lot_size / 2) / vol_step) * vol_step, 8)
+            mid = max(vol_min, mid)
+            if mid != lot_size and mid != vol_min:
+                _attempt_lots.append(mid)
+            _attempt_lots.append(vol_min)
+
+        result = None
+        used_lot = lot_size
+        for _lot in _attempt_lots:
+            request["volume"] = float(_lot)
+            result = mt5.order_send(request)
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                used_lot = _lot
+                break
+            if result and result.retcode == 10019 and _lot != _attempt_lots[-1]:
+                log.warning(
+                    "[LOT FALLBACK] %s: %.2f lots rejected (10019 No money) — "
+                    "retrying with smaller size",
+                    symbol, _lot,
+                )
+                continue
+            break  # any other retcode: don't retry
+        # ─────────────────────────────────────────────────────────────────
+
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             log_thought(
                 "execution", symbol, "order_placed",
                 f"Market order #{result.order} {signal['signal']} "
-                f"@ {result.price:.5f}  SL={sl:.5f}  TP={tp:.5f}",
+                f"@ {result.price:.5f}  SL={sl:.5f}  TP={tp:.5f}  vol={used_lot}",
                 action=signal["signal"].lower(),
                 confidence=signal.get("ai_confidence"),
             )
@@ -2188,6 +2303,23 @@ class AgentZeroBot:
         comment = result.comment if result else "N/A"
         retcode = result.retcode if result else "N/A"
         last_error = mt5.last_error()
+        # If still 10019 after all fallback attempts, surface a clear message
+        if result and result.retcode == 10019:
+            log_thought(
+                "execution", symbol, "order_failed",
+                f"Order FAILED (No money) even at min lot {vol_min} — "
+                f"free margin too low or instrument not tradeable. "
+                f"(retcode {retcode}, last_error {last_error})",
+                action="hold",
+            )
+            return {
+                "success":  False,
+                "message":  f"Insufficient margin even at min lot ({vol_min}). "
+                            f"Check account free margin and instrument settings.",
+                "retcode":  retcode,
+                "comment":  comment,
+                "last_error": last_error,
+            }
         log_thought("execution", symbol, "order_failed",
                     f"Order FAILED: {comment} (retcode {retcode}, last_error {last_error})",
                     action="hold")
@@ -2475,6 +2607,11 @@ class Bot:
         # Track the first cycle so we can emit a once-per-cycle summary the
         # first time the loop runs even if no symbol fires a signal.
         self._cycle_count = 0
+        # Reset any margin breakers that may have been armed in a previous
+        # session.  A fresh start means a fresh slate — operators restarting
+        # the bot expect symbols to be tradeable again immediately.
+        self._strategy.reset_margin_breaker()
+        log.info("Margin breakers reset on startup")
         # Orchestrator preflight — confirm Ollama is reachable and the
         # configured model is pulled before starting the poll loop.
         # The pair bots are deterministic and don't need Ollama, but the
@@ -2810,6 +2947,13 @@ class Bot:
                                 sym, ticket, exc)
                     verdict = {"action": "hold", "reason": f"agent error: {exc!s}"}
 
+                # Entry context — signal type from MT5 comment, metrics from stored signals
+                _comment  = getattr(pos, "comment", "") or ""
+                _sig_type = ("CHoCH"        if "CHoCH" in _comment
+                             else "Continuation" if "Cont"  in _comment
+                             else "")
+                _entry_ctx = self._entry_signals.get(ticket, {})
+
                 verdicts.append({
                     "symbol":           sym,
                     "ticket":           ticket,
@@ -2821,12 +2965,21 @@ class Bot:
                     # price action context for orchestrator LLM
                     "entry":            float(pos.price_open),
                     "cur_price":        ctx.cur_price,
+                    "cur_sl":           ctx.cur_sl,
+                    "cur_tp":           ctx.cur_tp,
                     "direction":        ctx.side,
                     "profit_pts":       ctx.profit_pts,
+                    "peak_pts":         ctx.peak_pts,
                     "structure_broken": ctx.structure_broken,
                     "trend_intact":     ctx.trend_intact,
                     "fresh_structure":  ctx.fresh_structure,
                     "atr":              atr,
+                    "point":            point,
+                    "notes":            ctx.notes,
+                    # entry-time context
+                    "signal_type":      _sig_type,
+                    "confidence":       _entry_ctx.get("confidence"),
+                    "dist_to_poc_atr":  _entry_ctx.get("dist_to_poc_atr"),
                 })
 
         return verdicts
@@ -2926,36 +3079,111 @@ class Bot:
 
             # Log every orchestrator decision to the Zero Log.
             refined_by_ticket = {v["ticket"]: v for v in refined}
+
+            # Log the cycle-level market context once so it sets the scene
+            # for the per-ticket entries that follow.
+            _market_ctx_one = next(
+                (v.get("market_context") for v in refined if v.get("market_context")),
+                "",
+            )
+            if _market_ctx_one:
+                log_thought(
+                    "orchestrator", "*", "market_context",
+                    f"Market: {_market_ctx_one}",
+                    action="hold",
+                )
+
+            # Log the LLM's cycle-level reasoning once at the top so it's
+            # not duplicated on every per-ticket entry.
+            _llm_reasoning_one = next(
+                (v.get("llm_reasoning") for v in refined if v.get("llm_reasoning")),
+                "",
+            )
+            if _llm_reasoning_one:
+                log_thought(
+                    "orchestrator", "*", "llm_reasoning",
+                    f"LLM reasoning: {_llm_reasoning_one}",
+                    action="hold",
+                )
+
             for original in approved:
                 touched      = refined_by_ticket.get(original["ticket"], original)
                 reason_code  = touched.get("reason_code", "ORC_APPROVE")
                 orch_reason  = touched.get("orchestrator_reason", "")
                 final_action = touched.get("action", original["action"])
 
-                # Price action context captured when verdict was built
+                # Inputs the orchestrator actually saw, in price units.
                 entry        = original.get("entry")
                 cur_price    = original.get("cur_price")
-                profit_pts   = original.get("profit_pts")
+                cur_tp       = original.get("cur_tp")
+                cur_sl       = original.get("cur_sl")
+                peak_pts     = original.get("peak_pts")
+                point        = original.get("point") or 0.0
                 atr          = original.get("atr") or 0.0
-                direction    = original.get("direction", "")
+                direction    = (original.get("direction") or "").upper()
                 struct_broken= original.get("structure_broken")
                 trend_intact = original.get("trend_intact")
+                sig_type     = original.get("signal_type") or ""
+                conf         = original.get("confidence")
+                dist_poc     = original.get("dist_to_poc_atr")
 
-                entry_str  = f"{entry:.5f}"     if entry     is not None else "?"
-                price_str  = f"{cur_price:.5f}" if cur_price is not None else "?"
-                profit_str = (
-                    f"{profit_pts:+.0f}pts ({profit_pts/atr:.1f}R)"
-                    if profit_pts is not None and atr > 0
-                    else f"{profit_pts:+.0f}pts" if profit_pts is not None else "?"
-                )
-                struct_str = (
-                    "STRUCTURE BROKEN" if struct_broken
-                    else "structure ok"
-                )
-                trend_str = (
-                    "TREND BROKEN" if trend_intact is False
-                    else "trend ok"
-                )
+                # Correct R math: ATR is price-unit, profit_pts is broker points.
+                cur_r = peak_r = r_to_go = None
+                if atr > 0 and entry is not None and cur_price is not None and direction in ("BUY", "SELL"):
+                    price_profit = (cur_price - entry) if direction == "BUY" else (entry - cur_price)
+                    cur_r = price_profit / atr
+                if atr > 0 and peak_pts is not None and point > 0:
+                    peak_r = (peak_pts * point) / atr
+                if atr > 0 and cur_tp is not None and cur_price is not None:
+                    r_to_go = abs(cur_tp - cur_price) / atr
+                gave_back = (peak_r - cur_r) if (peak_r is not None and cur_r is not None) else None
+
+                is_risk_free = False
+                if cur_sl and entry is not None and direction in ("BUY", "SELL"):
+                    is_risk_free = (cur_sl >= entry if direction == "BUY" else cur_sl <= entry)
+
+                entry_str = f"{entry:.5f}"     if entry     is not None else "?"
+                price_str = f"{cur_price:.5f}" if cur_price is not None else "?"
+                r_str     = f"{cur_r:+.1f}R"   if cur_r     is not None else "?R"
+                tp_str    = f" to-TP={r_to_go:.1f}R" if r_to_go is not None else ""
+                gave_str  = (f" gave-back={gave_back:.1f}R"
+                             if gave_back is not None and gave_back > 0.1 else "")
+
+                struct_str = "STRUCTURE BROKEN" if struct_broken else "structure ok"
+                trend_str  = "TREND BROKEN"    if trend_intact is False else "trend ok"
+
+                # Compact entry context line — shows what the LLM weighed.
+                ent_bits = []
+                if sig_type:        ent_bits.append(sig_type)
+                if conf is not None: ent_bits.append(f"conf={conf}%")
+                if dist_poc is not None: ent_bits.append(f"dist_poc={dist_poc:.1f}R")
+                if is_risk_free:    ent_bits.append("RISK-FREE")
+                ent_str = " | ".join(ent_bits)
+
+                # Working memory — direction, streaks, prior decision.
+                # These come from touched (the refined verdict) which carries
+                # the wm_* fields spread through _apply_decisions.
+                wm_delta   = touched.get("wm_delta_r")
+                wm_sb_str  = touched.get("wm_struct_streak", 0)
+                wm_ti_str  = touched.get("wm_trend_streak", 0)
+                wm_last    = touched.get("wm_last_decision", "")
+                wm_cycles  = touched.get("wm_cycles_held", 0)
+
+                wm_bits: list = []
+                if wm_delta is not None:
+                    word = ("falling" if wm_delta < -0.1
+                            else "rising" if wm_delta > 0.1
+                            else "flat")
+                    wm_bits.append(f"ΔR={wm_delta:+.2f}({word})")
+                if wm_sb_str >= 2:
+                    wm_bits.append(f"struct×{wm_sb_str}")
+                if wm_ti_str >= 2:
+                    wm_bits.append(f"trend×{wm_ti_str}")
+                if wm_last:
+                    wm_bits.append(f"prev={wm_last}")
+                if wm_cycles > 0:
+                    wm_bits.append(f"{wm_cycles}cy")
+                wm_str = " | ".join(wm_bits)
 
                 action_label = {
                     "ORC_VETO":        "VETO",
@@ -2970,8 +3198,10 @@ class Bot:
                     f"— {action_label}: {original['action']} → {final_action}"
                 )
                 detail = (
-                    f"entry={entry_str} price={price_str} P&L={profit_str} | "
+                    f"entry={entry_str} price={price_str} | {r_str}{gave_str}{tp_str} | "
                     f"{struct_str} | {trend_str}"
+                    + (f" | {ent_str}" if ent_str else "")
+                    + (f" | wm: {wm_str}" if wm_str else "")
                     + (f" | {orch_reason}" if orch_reason else "")
                 )
                 confidence = (
@@ -3293,6 +3523,19 @@ class Bot:
             lot_size=self.volume,
         )
 
+        # Store entry context so the orchestrator can use it at review time
+        _tr = (result or {}).get("trade_result") or {}
+        if _tr.get("success") and _tr.get("order_ticket"):
+            _sig  = (result or {}).get("signal") or {}
+            _poc  = (_sig.get("volume_profile") or {}).get("poc", 0)
+            _px   = _tr.get("price") or _sig.get("entry_price") or 0
+            _atr  = _sig.get("atr") or 0
+            _dist = abs(_px - _poc) / _atr if (_poc and _atr > 0) else None
+            self._entry_signals[int(_tr["order_ticket"])] = {
+                "confidence":      _sig.get("confidence"),
+                "dist_to_poc_atr": _dist,
+            }
+
         with self._results_lock:
             self._results[symbol] = result
 
@@ -3368,7 +3611,7 @@ _bot_thread: Optional[threading.Thread] = None
 _bot_last_error: Optional[str] = None
 _last_bot_config: dict = {
     "symbols":    ["EURUSD", "GBPUSD", "EURJPY", "GBPJPY"],
-    "volume":     0.50,
+    "volume":     float(os.getenv("BOT_AUTOSTART_VOLUME", "0.50")),  # default 0.50 lots
     "poll_secs":  180.0,
 
     "auto_trade": True,
@@ -3424,8 +3667,23 @@ def _mt5_snapshot(shutdown_when_done: bool = True) -> dict:
     """
     Connect, read terminal + account info, then disconnect.
     Returns a serialisable dict; 'connected' is False on any failure.
+
+    IMPORTANT: if a bot is currently running, this NEVER calls
+    mt5.shutdown() — doing so would tear the session out from under the
+    bot's in-flight order_send and cause spurious 10019 rejections.
+    When the bot is live we read from its already-open session instead.
     """
     import os
+    # If the bot is running, the session is already up and owned by the
+    # bot. Read from it WITHOUT connecting or disconnecting.
+    try:
+        _b, _t = _get_bot()
+        if _b and _t and _t.is_alive():
+            snap = _b.mt5_snapshot()
+            if snap and snap.get("connected"):
+                return snap
+    except Exception:
+        pass
     cfg = dict(MT5_CONFIG)
     if os.getenv("MT5_PATH"):     cfg["path"]     = os.environ["MT5_PATH"]
     if os.getenv("MT5_LOGIN"):    cfg["login"]    = os.environ["MT5_LOGIN"]
@@ -3442,10 +3700,18 @@ def _mt5_snapshot(shutdown_when_done: bool = True) -> dict:
         err = mt5.last_error()
         return {"connected": False, "error": f"MT5 initialize failed: {err}"}
 
+    # Never shut the session down if a bot started between our check and
+    # now — belt-and-braces against the race.
+    try:
+        _b, _t = _get_bot()
+        bot_live = bool(_b and _t and _t.is_alive())
+    except Exception:
+        bot_live = False
+
     try:
         return conn.runtime_info()
     finally:
-        if shutdown_when_done:
+        if shutdown_when_done and not bot_live:
             conn.disconnect()
 
 

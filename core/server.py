@@ -263,6 +263,12 @@ def _sync_mt5_status() -> None:
 def serve_dashboard():
     return send_from_directory(root_path, 'index.html')
 
+@app.route('/favicon.ico')
+def favicon():
+    # No favicon shipped. Return 204 so the browser's automatic request
+    # doesn't show as a 404 in DevTools every page load.
+    return ('', 204)
+
 # Disable caching for the dashboard's HTML/CSS/JS so a stale browser copy
 # never masks a server-side fix. Without this, Chrome will happily serve the
 # previous dashboard.js even after a hard refresh under some configs.
@@ -582,13 +588,33 @@ def bot_status():
     if not running:
         bot_running = False
 
-    # Sync MT5 connection state
+    # Sync MT5 connection state.
+    # Build a flattened mt5_payload with the same shape /api/mt5/status returns,
+    # so the dashboard can call /bot/status alone and skip the second socket
+    # it would otherwise open every 2 seconds (fixes ERR_NO_BUFFER_SPACE under
+    # aggressive polling). The nested `account` field is retained for any
+    # older caller that already reads it.
     _sync_mt5_status()
-    mt5_payload = {
-        'connected': bool(mt5_status.get('mt5_connected')),
-        'error': mt5_status.get('error'),
-        'account': mt5_status.get('account'),
-    }
+    _account = mt5_status.get('account') or {}
+    if mt5_status.get('mt5_connected') and _account:
+        mt5_payload = {
+            'connected':     True,
+            'error':         None,
+            'server':        _account.get('server'),
+            'login':         _account.get('login'),
+            'account_name':  _account.get('name'),
+            'currency':      _account.get('currency'),
+            'balance':       _account.get('balance'),
+            'equity':        _account.get('equity'),
+            'trade_allowed': _account.get('trade_allowed'),
+            'account':       _account,
+        }
+    else:
+        mt5_payload = {
+            'connected': False,
+            'error':     mt5_status.get('error', 'Not connected'),
+            'account':   None,
+        }
 
     # ── Live open trades from MT5 ──────────────────────────────────────────
     open_trades = []
@@ -819,6 +845,7 @@ def clear_thoughts_api():
 def _empty_kpis() -> dict:
     return {
         'win_rate': 0.0, 'profit_factor': 0.0, 'total_trades': 0,
+        'avg_pnl_per_trade': 0.0,
         'equity_return': 0.0, 'max_drawdown': 0.0, 'sharpe': 0.0,
         'avg_win_loss_ratio': 0.0, 'current_drawdown': 0.0,
         'recovery_factor': 0.0, 'sortino': 0.0,
@@ -1159,10 +1186,16 @@ def bot_performance():
         # we also surface the raw $ figure for the subtitle.
         current_dd_abs = max(0.0, peak - current_val)
 
+        # Average P&L per closed trade — net across wins and losses.
+        # Uses the same `profits` list the equity curve is built from
+        # (deal.profit + swap + commission per closed deal).
+        avg_pnl_per_trade = (running / total) if total > 0 else 0.0
+
         kpis = {
             'win_rate': round(win_rate, 1),
             'profit_factor': round(profit_factor, 2),
             'total_trades': total,
+            'avg_pnl_per_trade': round(avg_pnl_per_trade, 2),
             'equity_return': round(equity_return, 2),
             'max_drawdown': round(max_dd_pct, 2),
             'sharpe': round(sharpe, 2),

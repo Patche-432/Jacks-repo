@@ -6,7 +6,7 @@
 <title>FORTIS AI Pro</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/core/css/dashboard.css?v=20260504i">
+<link rel="stylesheet" href="/core/css/dashboard.css?v=20260518b">
 </head>
 <body>
 
@@ -43,7 +43,7 @@
   </div>
 
   <div class="hdr-center">
-    <button class="tab-btn active" data-tab="signals" onclick="showTab('signals', this)">Signals</button>
+    <button class="tab-btn active" data-tab="market-scanner" onclick="showTab('market-scanner', this)">Market Scanner</button>
     <button class="tab-btn" data-tab="thoughts" onclick="showTab('thoughts', this)">Zero Log</button>
     <button class="tab-btn" data-tab="positions" onclick="showTab('positions', this)">Positions</button>
     <button class="tab-btn" data-tab="history" onclick="showTab('history', this)">History</button>
@@ -358,7 +358,7 @@
   <div class="main">
 
     <!-- SIGNALS — Agent Decision Board -->
-    <div class="tab-panel active" id="tab-signals">
+    <div class="tab-panel active" id="tab-market-scanner">
       <!-- Portfolio risk strip (kept for compatibility) -->
       <div id="sig-risk-strip" style="display:none"></div>
       <!-- 4-pair decision cards — fills remaining height -->
@@ -433,6 +433,12 @@
           <div class="kpi-value" id="kpi-trades">0</div>
           <div class="kpi-sub"   id="kpi-trades-sub">— closed · — open</div>
           <div class="kpi-deco">last 90 days</div>
+        </div>
+        <div class="kpi-card" id="kpi-avgpnl-card">
+          <div class="kpi-label">Avg P&amp;L / Trade</div>
+          <div class="kpi-value" id="kpi-avgpnl">$0.00</div>
+          <div class="kpi-sub"   id="kpi-avgpnl-sub">across 0 trades</div>
+          <div class="kpi-deco">net per closed trade</div>
         </div>
         <div class="kpi-card" id="kpi-return-card">
           <div class="kpi-label">Equity Return</div>
@@ -666,8 +672,8 @@
 
   </div>
 </div>
-<script src="/core/js/dashboard.js?v=20260504h"></script>
-<script src="/core/js/memory-panel.js?v=20260509a"></script>
+<script src="/core/js/dashboard.js?v=20260518b"></script>
+<script src="/core/js/memory-panel.js?v=20260518b"></script>
 <script src="/core/js/agents.js?v=20260504h"></script>
 </body>
 </html>

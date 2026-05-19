@@ -66,8 +66,8 @@ PUBLIC SURFACE (used by ai_pro.py)
 CONFIG
 ======
   OLLAMA_URL      (default http://localhost:11434)
-  OLLAMA_MODEL    (default qwen2.5:3b-instruct)
-  AGENT_TIMEOUT_S (default 60)
+  OLLAMA_MODEL    (default qwen2.5:14b-instruct)
+  AGENT_TIMEOUT_S (default 90; 14b on CPU needs 40-60s, this gives headroom)
   AI_BACKEND      ("off" / "none" / "disabled" => kill switch)
 """
 
@@ -137,8 +137,8 @@ class OllamaClient:
                  model: Optional[str] = None,
                  timeout: Optional[float] = None) -> None:
         self.url = (url or os.getenv("OLLAMA_URL", "http://localhost:11434")).rstrip("/")
-        self.model = model or os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
-        self.timeout = float(timeout or os.getenv("AGENT_TIMEOUT_S", "60"))
+        self.model = model or os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct")
+        self.timeout = float(timeout or os.getenv("AGENT_TIMEOUT_S", "90"))
 
     def chat(self,
              system: str,
@@ -543,29 +543,41 @@ def get_pair_agent(symbol: str) -> PairBotBase:
 #     - override (only "hold" -> "close")
 
 ORCHESTRATOR_SYSTEM_PROMPT = (
-    "You are AGENT ZERO, supervisor for a 4-pair forex bot trading CHoCH + daily-levels strategy.\n"
+    "You are AGENT ZERO, supervisor for a 4-pair FX bot trading CHoCH + daily-levels.\n"
     "\n"
-    "PRIMARY MISSION: protect the entry reason. Every trade was opened because price showed a "
-    "Change of Character (CHoCH) at a key daily level. Your only job is to assess whether "
-    "that entry reason is still valid or has been invalidated by current price action.\n"
+    "TWO JOBS: hold winners longer. Cut losers early.\n"
     "\n"
-    "DEFAULT: APPROVE. The bots are correct unless price action has clearly spoken against the trade.\n"
+    "Each trade shows:\n"
+    "  cur_R      — current profit as R-multiple (negative = in loss)\n"
+    "  peak_R     — best profit this trade has reached\n"
+    "  gave-back  — how much of peak has been given back (peak_R - cur_R)\n"
+    "  to-TP      — R remaining to the original take-profit\n"
+    "  PA         — structure/trend state from price action detectors\n"
+    "  bot        — what the deterministic pair bot decided\n"
     "\n"
-    "Authority — judge each trade individually on its own price action:\n"
-    "  APPROVE      → entry reason still intact. Price respecting structure. Let the bot run its plan.\n"
-    "  VETO         → bot wants to close or tighten, but price action shows the setup is still valid\n"
-    "                  (structure holding, no opposing CHoCH, still within the daily level range).\n"
-    "                  Block the premature exit — the edge has not played out yet.\n"
-    "  OVERRIDE     → bot is holding, but price action has INVALIDATED the entry reason:\n"
-    "                  opposing CHoCH printed, price has broken back through the entry level,\n"
-    "                  or the original directional bias is structurally broken.\n"
-    "                  Force close — the reason this trade exists is gone.\n"
+    "VETO the bot (hold the trade) when:\n"
+    "  • to-TP ≥ 1R AND structure intact — bot is exiting with significant room left\n"
+    "  • gave-back < 0.5R AND structure intact — normal retracement noise, not a reversal\n"
     "\n"
-    "Never act on portfolio metrics, daily P&L, or what other pairs are doing. "
-    "Each decision is based solely on whether that pair's price action still supports its entry.\n"
+    "OVERRIDE to close (cut the loser) when:\n"
+    "  • Structure AND trend are both broken AND gave-back ≥ 1R from peak\n"
+    "  • Trade is in loss (cur_R < 0) AND structure is broken — no reason to hold\n"
+    "  • Price has reversed through entry AND structure broken — entry reason is gone\n"
     "\n"
-    "Reply JSON only, one line:\n"
-    "  {\"decisions\": [{\"ticket\": <int>, \"verdict\": \"approve|veto|override_close\", \"reason\": \"<20w\"}, ...]}\n"
+    "APPROVE in all other cases — the bots are correct more often than not.\n"
+    "Only act when the R-to-go or peak-drawdown numbers make the right call obvious.\n"
+    "\n"
+    "Use entry context shown per trade:\n"
+    "  signal=CHoCH: highest-quality setup — hold through noise, raise bar for override_close.\n"
+    "  signal=Continuation: already partially played out — lower patience if structure breaks.\n"
+    "  conf≥75: high-conviction entry — give more room.\n"
+    "  conf<65: marginal entry — cut sooner on same signals.\n"
+    "  risk_free=yes (SL past break-even): almost never override_close — downside is zero.\n"
+    "  open_cycles: trade held long at low R = setup failing to play out — consider override_close.\n"
+    "\n"
+    "First reason briefly using what you know about FX behaviour, then decide. Reply JSON only:\n"
+    "  {\"reasoning\": \"<20w on what the price action and session suggest>\","
+    " \"decisions\": [{\"ticket\": <int>, \"verdict\": \"approve|veto|override_close\", \"reason\": \"<15w\"}, ...]}\n"
 )
 
 
@@ -611,16 +623,38 @@ class Orchestrator:
     name = "Agent 0"
     _ML_CONTEXT_CACHE: dict = {"path": None, "mtime": -1.0, "text": ""}
 
+    _SESSION_WINDOW: int = 8   # cycles to track for session character
+    _ATR_WINDOW:     int = 20  # cycles to track for volatility regime
+
     def __init__(self, client=None):
         self.client = client or OllamaClient()
+        self._wm:              dict = {}  # working memory: ticket -> state dict
+        self._session_tracker: list = []  # recent cycle aggregate ΔR values
+        self._atr_history:     dict = {}  # symbol -> list of recent ATR values
 
     # ------------------------------------------------------------------ #
     # Helpers                                                               #
     # ------------------------------------------------------------------ #
 
+    # Maps top feature name \u2192 plain-English instruction the LLM can act on.
+    _FEATURE_HINTS: dict = {
+        "hour_of_day":      "session timing drives outcomes",
+        "confidence":       "signal confidence predicts wins \u2014 high-confidence entries deserve more patience",
+        "rr_ratio":         "original RR quality matters \u2014 only high-RR setups run to target",
+        "dist_to_poc_atr":  "distance to daily level matters \u2014 trades near POC are more reliable",
+        "dist_to_poc_pips": "distance to daily level matters \u2014 trades near POC are more reliable",
+        "dow":              "day of week matters \u2014 mid-week setups tend to outperform Mon/Fri",
+        "is_choch":         "CHoCH quality matters \u2014 confirmed CHoCH entries outperform continuations",
+        "is_continuation":  "continuation vs reversal type matters",
+    }
+
     @classmethod
     def _load_ml_context(cls) -> str:
-        """Return ML insights block string, cached by file mtime."""
+        """Return ML pair tendencies as actionable instructions, cached by file mtime.
+
+        Placed in the system prompt (not user message) so the LLM treats it as
+        standing behavioural guidance rather than per-cycle data to parse.
+        """
         try:
             import os as _os, json as _j
             path = _os.path.join(
@@ -635,40 +669,64 @@ class Orchestrator:
                 return cache["text"]
             with open(path, "r", encoding="utf-8") as fh:
                 ins = _j.load(fh)
-            ml_lines = []
-            tp_lines = []
+
+            lines: list = []
+            session_sensitive: list = []  # pairs where hour_of_day is top predictor
+
             for sym, d in sorted(ins.items()):
-                wr   = d.get("win_rate") or 0.0
-                imps = d.get("importances") or {}
-                top  = max(imps, key=imps.get) if imps else None
-                tv   = imps.get(top, 0.0) if top else 0.0
-                n    = d.get("trade_count", 0)
-                ml_lines.append(
-                    f"  {sym}: WR={wr*100:.0f}% n={n}"
-                    + (f" top={top}({tv:.2f})" if top else "")
-                )
-                tp = d.get("tuned_params") or {}
-                if tp:
-                    tp_lines.append(
-                        f"  {sym}: SL={tp.get('sl_atr_mult', 2.5):.2f}\u00d7"
-                        f" TP={tp.get('tp_atr_mult', 4.5):.2f}\u00d7"
-                        f" BE={tp.get('be_buffer_pips', 1.0):.1f}p"
-                        f" trail={tp.get('trail_atr_mult', 1.0):.2f}\u00d7"
-                    )
-            text = ""
-            if ml_lines:
+                wr    = d.get("win_rate") or 0.0
+                n     = d.get("trade_count", 0)
+                imps  = d.get("importances") or {}
+                top   = max(imps, key=imps.get) if imps else None
+                tp    = d.get("tuned_params") or {}
+                sl_mult = tp.get("sl_atr_mult", 0.0)
+
+                if wr >= 0.75:
+                    wr_label  = "high WR"
+                    wr_action = "be patient \u2014 raise the bar for override_close"
+                elif wr >= 0.55:
+                    wr_label  = "moderate WR"
+                    wr_action = "follow bot signals \u2014 intervene only on clear structure failure"
+                else:
+                    wr_label  = "low WR"
+                    wr_action = "lower conviction \u2014 override_close sooner on any structure weakness"
+
+                hint = cls._FEATURE_HINTS.get(top, f"{top} is most predictive") if top else ""
+
+                sl_note = ""
+                if sl_mult >= 4.0:
+                    sl_note = (f" Wide SL ({sl_mult:.1f}\u00d7ATR) means normal retracements"
+                               f" look large \u2014 do not override_close on noise alone.")
+
+                line = f"  {sym} WR={wr*100:.0f}% (n={n}, {wr_label}): {wr_action}."
+                if hint:
+                    line += f" Key predictor: {hint}."
+                if sl_note:
+                    line += sl_note
+                lines.append(line)
+
+                if top == "hour_of_day":
+                    session_sensitive.append(sym)
+
+            if not lines:
+                text = ""
+            else:
                 text = (
-                    "\nML INSIGHTS (backtest-derived):\n"
-                    + "\n".join(ml_lines)
-                    + "\n  Higher WR = give more patience before overriding holds."
-                    + "\n  Top feature = what predicts wins for this pair."
+                    "PAIR TENDENCIES (backtest-derived \u2014 calibrate patience per pair):\n"
+                    + "\n".join(lines)
                 )
-                if tp_lines:
+                if session_sensitive:
                     text += (
-                        "\n\nTUNED SL/TP (live bot uses these per pair):\n"
-                        + "\n".join(tp_lines)
-                        + "\n  Wider SL = position needs more room, don't override too early."
+                        f"\n  SESSION RULE: {', '.join(session_sensitive)} outcome depends strongly"
+                        f" on time of day. In Asian/Overnight session these pairs produce weaker"
+                        f" setups \u2014 lower your bar for override_close."
+                        f" Cross-reference with the SESSION label you see in TRADES."
                     )
+                text += (
+                    "\nHigh-WR pairs deserve more patience before you override;"
+                    " low-WR pairs get override_close earlier on the same signals."
+                )
+
             cache.update({"path": path, "mtime": mtime, "text": text})
             return text
         except Exception as exc:
@@ -676,8 +734,11 @@ class Orchestrator:
             return ""
 
     def _build_system_prompt(self) -> str:
-        """Build system prompt, optionally appending agent-memory context."""
+        """Build system prompt: base rules → ML pair tendencies → agent memory."""
         prompt = ORCHESTRATOR_SYSTEM_PROMPT
+        ml_ctx = self._load_ml_context()
+        if ml_ctx:
+            prompt = prompt + "\n\n" + ml_ctx
         if HAS_AGENT_MEMORY and _get_agent_memory is not None:
             try:
                 mem_ctx = _get_agent_memory().build_context()
@@ -701,58 +762,295 @@ class Orchestrator:
         return "NY-Afternoon"
 
     @staticmethod
-    def _build_user_message(verdicts, portfolio, ml_context: str) -> str:
-        """Format bot verdicts + price action context as the LLM user message."""
+    def _build_user_message(verdicts, portfolio, market_ctx: str = "") -> str:
+        """Format bot verdicts + trader-relevant metrics as the LLM user message."""
         import datetime as _dt
         now     = _dt.datetime.now(_dt.timezone.utc)
         session = Orchestrator._session_label(now.hour)
 
         lines = []
         for v in verdicts:
-            new_sl    = v.get("new_sl")
-            sl_str    = f"{new_sl:.5f}" if isinstance(new_sl, (int, float)) else "\u2014"
+            atr       = v.get("atr") or 0.0
             entry     = v.get("entry")
             cur_price = v.get("cur_price")
-            atr       = v.get("atr") or 0.0
-            direction = v.get("direction", "?")
-            profit_pts= v.get("profit_pts")
+            cur_tp    = v.get("cur_tp")
+            peak_pts  = v.get("peak_pts")
+            point     = v.get("point") or 0.0
+            direction = (v.get("direction") or "?").upper()
+            notes     = v.get("notes") or ""
 
-            entry_str  = f"{entry:.5f}"     if entry     is not None else "?"
-            price_str  = f"{cur_price:.5f}" if cur_price is not None else "?"
-            profit_str = (f"{profit_pts:+.0f}pts"
-                          f"({profit_pts/atr:.1f}R)" if profit_pts is not None and atr > 0
-                          else f"{profit_pts:+.0f}pts" if profit_pts is not None else "?")
+            # R values \u2014 all computed in price units so units are consistent.
+            # atr is price-unit ATR; profit_pts is broker points, so we use
+            # entry/cur_price directly rather than profit_pts/atr (wrong units).
+            cur_r: Optional[float] = None
+            peak_r: Optional[float] = None
+            r_to_go: Optional[float] = None
 
-            struct_broken   = v.get("structure_broken")
-            trend_intact    = v.get("trend_intact")
-            fresh_structure = v.get("fresh_structure")
+            if atr > 0 and entry is not None and cur_price is not None:
+                price_profit = (cur_price - entry) if direction == "BUY" else (entry - cur_price)
+                cur_r = price_profit / atr
 
-            struct_str = (
-                "STRUCTURE_BROKEN" if struct_broken
-                else "fresh_structure" if fresh_structure
-                else "structure_ok"
-            )
-            trend_str = (
-                "TREND_BROKEN" if trend_intact is False
-                else "trend_ok"
-            )
+            if atr > 0 and peak_pts is not None and point > 0:
+                peak_r = (peak_pts * point) / atr
+
+            if atr > 0 and cur_tp is not None and cur_price is not None:
+                r_to_go = abs(cur_tp - cur_price) / atr
+
+            gave_back = (peak_r - cur_r) if (peak_r is not None and cur_r is not None) else None
+
+            cur_r_s  = f"{cur_r:+.1f}R"        if cur_r   is not None else "?R"
+            peak_s   = f" peak={peak_r:+.1f}R"  if peak_r  is not None else ""
+            gave_s   = (f" gave-back={gave_back:.1f}R"
+                        if gave_back is not None and gave_back > 0.1 else "")
+            tp_s     = f" to-TP={r_to_go:.1f}R" if r_to_go is not None else " to-TP=?"
+
+            entry_s = f"{entry:.5f}"     if entry     is not None else "?"
+            price_s = f"{cur_price:.5f}" if cur_price is not None else "?"
+
+            struct_broken = v.get("structure_broken")
+            trend_intact  = v.get("trend_intact")
+            struct_s = "STRUCTURE_BROKEN" if struct_broken else "struct_ok"
+            trend_s  = "TREND_BROKEN" if trend_intact is False else "trend_ok"
+
+            short_notes = (notes
+                           .replace("trend_reason=", "trend=")
+                           .replace("struct_reason=", "struct="))[:100].strip()
+
+            new_sl = v.get("new_sl")
+            sl_s = f"{new_sl:.5f}" if isinstance(new_sl, (int, float)) else "\u2014"
+
+            # Risk-free flag \u2014 SL at or beyond break-even
+            cur_sl_val = v.get("cur_sl") or 0.0
+            is_risk_free = False
+            if cur_sl_val and entry is not None:
+                is_risk_free = (cur_sl_val >= entry if direction == "BUY"
+                                else cur_sl_val <= entry)
+
+            # Entry context
+            sig_type     = v.get("signal_type") or ""
+            confidence   = v.get("confidence")
+            dist_poc     = v.get("dist_to_poc_atr")
+            wm_cycles    = v.get("wm_cycles_held", 0)
+
+            entry_parts: list = []
+            if sig_type:
+                entry_parts.append(f"signal={sig_type}")
+            if confidence is not None:
+                entry_parts.append(f"conf={confidence}%")
+            if dist_poc is not None:
+                entry_parts.append(f"dist_poc={dist_poc:.1f}R")
+            if is_risk_free:
+                entry_parts.append("RISK-FREE")
+            if wm_cycles > 0:
+                entry_parts.append(f"open {wm_cycles} cycles")
+            entry_line = ("\n    entry: " + " | ".join(entry_parts)) if entry_parts else ""
+
+            # Working memory \u2014 only shown when there is something meaningful to say
+            wm_delta    = v.get("wm_delta_r")
+            wm_sb_str   = v.get("wm_struct_streak", 0)
+            wm_ti_str   = v.get("wm_trend_streak", 0)
+            wm_last_dec = v.get("wm_last_decision", "")
+            wm_last_rsn = (v.get("wm_last_reason") or "")[:50]
+
+            wm_parts: list = []
+            if wm_delta is not None:
+                word = "falling" if wm_delta < -0.1 else "rising" if wm_delta > 0.1 else "flat"
+                wm_parts.append(f"\u0394R={wm_delta:+.2f} ({word})")
+            if wm_sb_str >= 2:
+                wm_parts.append(f"struct_broken {wm_sb_str} cycles")
+            if wm_ti_str >= 2:
+                wm_parts.append(f"trend_broken {wm_ti_str} cycles")
+            if wm_last_dec:
+                wm_parts.append(
+                    f"prev={wm_last_dec}" + (f': "{wm_last_rsn}"' if wm_last_rsn else "")
+                )
+            wm_line = ("\n    wm: " + " | ".join(wm_parts)) if wm_parts else ""
 
             lines.append(
-                f"  ticket={v['ticket']} {v['symbol']} {direction} "
-                f"entry={entry_str} price={price_str} P&L={profit_str}\n"
-                f"    price_action: {struct_str} | {trend_str}\n"
-                f"    bot_verdict:  action={v['action']} new_sl={sl_str}\n"
-                f"    bot_reason:   {(v.get('reason') or '')[:120]}"
+                f"  #{v['ticket']} {v['symbol']} {direction} "
+                f"entry={entry_s} px={price_s} | "
+                f"{cur_r_s}{peak_s}{gave_s}{tp_s}\n"
+                f"    PA: {struct_s} | {trend_s}"
+                + (f" | {short_notes}" if short_notes else "")
+                + entry_line
+                + wm_line + "\n"
+                f"    bot: {v['action']} sl={sl_s} \u2014 {(v.get('reason') or '')[:80]}"
             )
 
+        portfolio_line = portfolio.summary() if portfolio is not None else ""
         msg = (
-            f"SESSION: {session} (UTC {now.hour:02d}h)\n\n"
-            f"TRADES ({len(verdicts)})\n"
+            f"SESSION: {session} (UTC {now.hour:02d}h)"
+            + (f" | {portfolio_line}" if portfolio_line else "") + "\n"
+            + (f"MARKET: {market_ctx}\n" if market_ctx else "")
+            + f"\nTRADES ({len(verdicts)})\n"
             + "\n".join(lines)
         )
-        if ml_context:
-            msg += ml_context
         return msg
+
+    # ------------------------------------------------------------------ #
+    # Working memory                                                        #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _compute_cur_r(v: dict) -> Optional[float]:
+        """Current R in price units from a verdict dict. None when inputs missing."""
+        atr       = v.get("atr") or 0.0
+        entry     = v.get("entry")
+        cur_price = v.get("cur_price")
+        direction = (v.get("direction") or "").upper()
+        if atr > 0 and entry is not None and cur_price is not None and direction in ("BUY", "SELL"):
+            price_profit = (cur_price - entry) if direction == "BUY" else (entry - cur_price)
+            return price_profit / atr
+        return None
+
+    def _enrich_with_working_memory(self, verdicts: list) -> list:
+        """Return copies of verdicts with per-ticket working memory deltas attached."""
+        enriched = []
+        for v in verdicts:
+            ticket = v.get("ticket")
+            mem    = self._wm.get(ticket, {})
+            cur_r  = self._compute_cur_r(v)
+
+            sb = v.get("structure_broken")
+            ti = v.get("trend_intact")
+            sb_streak = (mem.get("sb_streak", 0) + 1) if sb         else 0
+            ti_streak = (mem.get("ti_streak", 0) + 1) if ti is False else 0
+
+            prev_r  = mem.get("prev_r")
+            delta_r = (cur_r - prev_r) if (cur_r is not None and prev_r is not None) else None
+
+            enriched.append({
+                **v,
+                "wm_prev_r":        prev_r,
+                "wm_delta_r":       delta_r,
+                "wm_struct_streak": sb_streak,
+                "wm_trend_streak":  ti_streak,
+                "wm_last_decision": mem.get("last_decision", ""),
+                "wm_last_reason":   mem.get("last_reason", ""),
+                "wm_cycles_held":   mem.get("cycles_held", 0),
+            })
+        return enriched
+
+    def _wm_needs_review(self, enriched: list) -> bool:
+        """True when working memory flags a trade that warrants LLM review even if all bots hold.
+
+        Catches two cases the fast-path would otherwise miss:
+          • Trade falling fast (>0.5R drop in one cycle) — may be a loser to cut
+          • Persistent structure/trend break (3+ cycles) — not noise, a real reversal
+        """
+        for v in enriched:
+            delta_r = v.get("wm_delta_r")
+            if delta_r is not None and delta_r < -0.5:
+                return True
+            if v.get("wm_struct_streak", 0) >= 3:
+                return True
+            if v.get("wm_trend_streak", 0) >= 3:
+                return True
+        return False
+
+    def _update_working_memory(self, enriched: list, llm_out: list) -> None:
+        """Persist this cycle's state and orchestrator decisions into working memory."""
+        decided = {v["ticket"]: v for v in llm_out}
+        active  = {v["ticket"] for v in enriched}
+
+        for v in enriched:
+            ticket = v["ticket"]
+            cur_r  = self._compute_cur_r(v)
+            dec    = decided.get(ticket, {})
+            rc     = dec.get("reason_code", "")
+            if rc == "ORC_VETO":
+                last_dec = "veto"
+            elif rc == "ORC_OVERRIDE":
+                last_dec = "override_close"
+            else:
+                last_dec = "approve"
+            last_reason = (dec.get("orchestrator_reason") or "")[:80]
+
+            self._wm[ticket] = {
+                "prev_r":        cur_r,
+                "sb_streak":     v.get("wm_struct_streak", 0),
+                "ti_streak":     v.get("wm_trend_streak", 0),
+                "last_decision": last_dec,
+                "last_reason":   last_reason,
+                "cycles_held":   v.get("wm_cycles_held", 0) + 1,
+            }
+
+        # Prune tickets that are no longer open
+        for t in [t for t in self._wm if t not in active]:
+            del self._wm[t]
+
+    # ------------------------------------------------------------------ #
+    # Session character + volatility regime                                #
+    # ------------------------------------------------------------------ #
+
+    def _update_session_tracker(self, enriched: list) -> None:
+        """Append aggregate portfolio ΔR for this cycle to the session window."""
+        deltas = [v["wm_delta_r"] for v in enriched if v.get("wm_delta_r") is not None]
+        if deltas:
+            self._session_tracker.append(sum(deltas))
+            if len(self._session_tracker) > self._SESSION_WINDOW:
+                self._session_tracker.pop(0)
+
+    def _session_character(self) -> str:
+        """Return a one-line session sentiment string, or '' if not enough data."""
+        if len(self._session_tracker) < 3:
+            return ""
+        n   = len(self._session_tracker)
+        neg = sum(1 for d in self._session_tracker if d < -0.1)
+        pos = sum(1 for d in self._session_tracker if d >  0.1)
+        if neg >= n * 0.6:
+            return f"Session: {neg}/{n} cycles adverse — choppy/deteriorating conditions"
+        if pos >= n * 0.6:
+            return f"Session: {pos}/{n} cycles improving — trending conditions"
+        return f"Session: mixed ({pos} improving, {neg} deteriorating of {n} cycles)"
+
+    def _update_atr_history(self, enriched: list) -> None:
+        """Maintain a rolling ATR history per symbol."""
+        for v in enriched:
+            sym = v.get("symbol", "")
+            atr = v.get("atr") or 0.0
+            if sym and atr > 0:
+                hist = self._atr_history.setdefault(sym, [])
+                hist.append(atr)
+                if len(hist) > self._ATR_WINDOW:
+                    hist.pop(0)
+
+    def _atr_regime(self, enriched: list) -> str:
+        """Return volatility regime string for pairs that deviate from their baseline."""
+        parts = []
+        seen  = set()
+        for v in enriched:
+            sym  = v.get("symbol", "")
+            atr  = v.get("atr") or 0.0
+            hist = self._atr_history.get(sym, [])
+            if sym in seen or not atr or len(hist) < 5:
+                continue
+            seen.add(sym)
+            baseline = sum(hist[:-1]) / len(hist[:-1])
+            ratio    = atr / baseline if baseline > 0 else 1.0
+            if ratio >= 1.3:
+                parts.append(f"{sym} {ratio:.1f}×ATR (high vol)")
+            elif ratio <= 0.75:
+                parts.append(f"{sym} {ratio:.1f}×ATR (low vol)")
+        return ("Volatility: " + ", ".join(parts)) if parts else ""
+
+    def _build_market_context(self, enriched: list) -> str:
+        """Compile session character, ATR regime, and today's results into one string."""
+        parts = []
+        sc = self._session_character()
+        if sc:
+            parts.append(sc)
+        ar = self._atr_regime(enriched)
+        if ar:
+            parts.append(ar)
+        if HAS_AGENT_MEMORY and _get_agent_memory is not None:
+            try:
+                ts = _get_agent_memory().get_today_summary()
+                if ts:
+                    parts.append(ts)
+            except Exception:
+                pass
+        return " | ".join(parts)
 
     @staticmethod
     def _apply_decisions(verdicts, decisions) -> list:
@@ -858,9 +1156,25 @@ class Orchestrator:
         if not remaining:
             return directive_out
 
-        # Fast path: all remaining bots say hold and no breach \u2014 skip LLM.
-        if all(v.get("action") == "hold" for v in remaining) and not portfolio.daily_loss_breach:
-            return directive_out + [{**v, "reason_code": "ORC_APPROVE"} for v in remaining]
+        # Enrich with per-ticket working memory deltas before any decision
+        enriched = self._enrich_with_working_memory(remaining)
+
+        # Update session and volatility trackers every cycle (even on fast path)
+        self._update_session_tracker(enriched)
+        self._update_atr_history(enriched)
+
+        # Build market context once per cycle so the dashboard can show it
+        # regardless of whether the LLM was actually called.
+        market_ctx = self._build_market_context(enriched)
+
+        # Fast path: all bots hold, no breach, and no WM alert \u2014 skip LLM.
+        if (all(v.get("action") == "hold" for v in enriched)
+                and not portfolio.daily_loss_breach
+                and not self._wm_needs_review(enriched)):
+            fast_out = [{**v, "reason_code": "ORC_APPROVE",
+                         "market_context": market_ctx} for v in enriched]
+            self._update_working_memory(enriched, fast_out)
+            return directive_out + fast_out
 
         # Append operator notes to portfolio context if set
         if d.notes:
@@ -870,24 +1184,40 @@ class Orchestrator:
             })
 
         system_prompt = self._build_system_prompt()
-        ml_context    = self._load_ml_context()
-        user          = self._build_user_message(remaining, portfolio, ml_context)
+        user          = self._build_user_message(enriched, portfolio, market_ctx=market_ctx)
 
         try:
-            raw = self.client.chat(system_prompt, user, expect_json=True, max_tokens=400)
+            raw = self.client.chat(system_prompt, user, expect_json=True, max_tokens=512)
         except Exception as exc:
             log.warning(
                 "orchestrator transport error: %s \u2014 approving all verdicts as-is", exc,
             )
-            return directive_out + [{**v, "reason_code": "ORC_APPROVE"} for v in remaining]
+            fast_out = [{**v, "reason_code": "ORC_APPROVE",
+                         "market_context": market_ctx} for v in enriched]
+            self._update_working_memory(enriched, fast_out)
+            return directive_out + fast_out
 
         parsed    = _extract_json_dict(raw) or {}
         decisions = parsed.get("decisions") or []
         if not isinstance(decisions, list):
             log.warning("orchestrator returned non-list decisions; approving all as-is")
-            return directive_out + [{**v, "reason_code": "ORC_APPROVE"} for v in remaining]
+            fast_out = [{**v, "reason_code": "ORC_APPROVE",
+                         "market_context": market_ctx} for v in enriched]
+            self._update_working_memory(enriched, fast_out)
+            return directive_out + fast_out
 
-        llm_out = self._apply_decisions(remaining, decisions)
+        llm_out = self._apply_decisions(enriched, decisions)
+
+        # Attach the LLM's reasoning and the cycle's market context to each
+        # output so the dashboard can show them alongside the decisions.
+        llm_reasoning = (parsed.get("reasoning") or "").strip()[:200]
+        for v in llm_out:
+            if llm_reasoning:
+                v["llm_reasoning"] = llm_reasoning
+            if market_ctx:
+                v["market_context"] = market_ctx
+
+        self._update_working_memory(enriched, llm_out)
         out = directive_out + llm_out
 
         if HAS_AGENT_MEMORY and _get_agent_memory is not None:

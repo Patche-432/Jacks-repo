@@ -39,8 +39,8 @@ ready.
 | Setting           | Default                  | Override via env var | Purpose                                              |
 |-------------------|--------------------------|----------------------|------------------------------------------------------|
 | Ollama URL        | `http://localhost:11434` | `OLLAMA_URL`         | Where the Ollama HTTP server is listening            |
-| Model             | `qwen2.5:3b-instruct`    | `OLLAMA_MODEL`       | Which model the agents call                          |
-| Per-call timeout  | 60 seconds               | `AGENT_TIMEOUT_S`    | Max wait for a single chat call                      |
+| Model             | `qwen2.5:14b-instruct`   | `OLLAMA_MODEL`       | Which model the agents call                          |
+| Per-call timeout  | 90 seconds               | `AGENT_TIMEOUT_S`    | Max wait for a single chat call                      |
 | Agent kill-switch | `agent` (on)             | `AI_BACKEND`         | Set to `off` / `none` / `disabled` to bypass the LLM |
 
 These are all read by `OllamaClient` in `ai_agent.py`. A copy of these is
@@ -48,21 +48,22 @@ also kept in `.env.example` for reference.
 
 ## Picking a model
 
-The default is small and CPU-friendly so the bot runs on essentially any
-machine, including ARM laptops:
+The default is sized for a modern desktop CPU (Ryzen 7000-class) with 16 GB RAM.
+Downgrade to 7b/3b on lighter hardware:
 
 | Model                  | Memory   | Notes                                              |
 |------------------------|----------|----------------------------------------------------|
-| `qwen2.5:3b-instruct`  | ~3–4 GB  | Default. CPU-friendly, follows the JSON contract well. |
-| `qwen2.5:7b-instruct`  | ~6–8 GB  | Better reasoning, fine on a modest GPU.            |
-| `qwen2.5:14b-instruct` | ~12+ GB  | Strong, GPU recommended.                           |
+| `qwen2.5:14b-instruct` | ~9 GB    | Default. Real multi-signal reasoning. Recommended on Ryzen 7000 + 16 GB RAM. |
+| `phi4:14b`             | ~9 GB    | Alternative 14b — slightly stronger reasoning, occasionally drifts on JSON. |
+| `qwen2.5:7b-instruct`  | ~6 GB    | Adequate rule-follower. Use on mini PCs / N100-class. |
+| `qwen2.5:3b-instruct`  | ~3 GB    | Minimal. Weak reasoning but very fast.             |
 | `llama3.2:3b`          | ~3 GB    | Alternative small model, decent on ARM.            |
 
 Switch model:
 
 ```powershell
-$env:OLLAMA_MODEL = "qwen2.5:7b-instruct"
-ollama pull qwen2.5:7b-instruct
+$env:OLLAMA_MODEL = "qwen2.5:14b-instruct"
+ollama pull qwen2.5:14b-instruct
 .\scripts\setup_ollama.ps1   # idempotent — re-validates with the new model
 ```
 
@@ -72,7 +73,7 @@ ollama pull qwen2.5:7b-instruct
   dashboard can poll this without starting the bot. Returns:
   ```json
   {"reachable": true, "model_loaded": true, "url": "http://localhost:11434",
-   "model": "qwen2.5:3b-instruct", "error": null}
+   "model": "qwen2.5:14b-instruct", "error": null}
   ```
 - `POST /bot/start` — when "AI review" is enabled in the sidebar, the
   endpoint runs a preflight check before launching the bot subprocess. If
@@ -116,8 +117,8 @@ covered separately in the deployment notes.)
 - Open the Ollama desktop app once — that starts the service.
 - Or run `ollama serve` in a separate terminal.
 
-**"Ollama model 'qwen2.5:3b-instruct' is not pulled"**
-- Run: `ollama pull qwen2.5:3b-instruct`
+**"Ollama model 'qwen2.5:14b-instruct' is not pulled"**
+- Run: `ollama pull qwen2.5:14b-instruct`
 - Or run `.\scripts\setup_ollama.ps1` to do the same plus a smoke test.
 
 **"agent transport error" appearing in `ai_thoughts.jsonl` while the bot is running**
@@ -129,5 +130,5 @@ covered separately in the deployment notes.)
 
 **Slow first response after a restart**
 - Ollama lazy-loads models. The first chat call after a model isn't in
-  memory can take 10–30 seconds. The default `AGENT_TIMEOUT_S=60` accounts
-  for this.
+  memory can take 10–30 seconds for small models, 30–60s for 14b on CPU.
+  The default `AGENT_TIMEOUT_S=90` accounts for this.

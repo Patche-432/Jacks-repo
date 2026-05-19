@@ -741,13 +741,13 @@ input[type=range]:focus{outline:none}
 #tab-performance .equity-container{flex-shrink:0}
 #perf-pair-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 
-/* ── Signals tab — flush, no inner padding ── */
-#tab-signals{padding:0;display:none;flex-direction:column}
+/* ── Market Scanner tab — flush, no inner padding ── */
+#tab-market-scanner{padding:0;display:none;flex-direction:column}
 
 /* ── Zero Log tab — flex column when active ── */
 #tab-thoughts{padding:0;overflow:hidden}
 #tab-thoughts.active{display:flex;flex-direction:column}
-#tab-signals.active{display:flex}
+#tab-market-scanner.active{display:flex}
 #signal-cards{flex:1;display:flex;flex-direction:column;overflow-y:auto}
 #signal-cards .sig-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line)}
 

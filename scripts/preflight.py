@@ -163,7 +163,7 @@ def check_ollama_model(health: dict) -> bool:
         return _record("Ollama: model pulled", True, health.get("model", "?"))
     return _record("Ollama: model pulled", False,
                    f"'{health.get('model','?')}' not found. "
-                   f"Run: ollama pull {health.get('model','qwen2.5:3b-instruct')}")
+                   f"Run: ollama pull {health.get('model','qwen2.5:14b-instruct')}")
 
 
 def check_orchestrator_smoke_test() -> bool:

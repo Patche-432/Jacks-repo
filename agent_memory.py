@@ -580,6 +580,33 @@ class AgentMemory:
             "db_path": str(self.db_path),
         }
 
+    def get_today_summary(self) -> str:
+        """Return today's closed trade results as a compact string for the LLM.
+
+        Example output: "Today: 2W 1L 0BE"
+        Returns empty string when no outcomes recorded today.
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+        cutoff = today + "T00:00:00+00:00"
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT o.outcome, COUNT(*) AS n
+                FROM outcomes o
+                JOIN decisions d ON d.id = o.decision_id
+                WHERE d.ts >= ?
+                GROUP BY o.outcome
+                """,
+                (cutoff,),
+            ).fetchall()
+        if not rows:
+            return ""
+        counts = {r["outcome"]: r["n"] for r in rows}
+        w  = counts.get("WIN",  0)
+        lo = counts.get("LOSS", 0)
+        be = counts.get("BE",   0)
+        return f"Today: {w}W {lo}L {be}BE"
+
 
 # ── Module-level singleton ────────────────────────────────────────────────────
 _memory: Optional[AgentMemory] = None

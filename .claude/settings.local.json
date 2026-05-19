@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(python -c \"import json; d=json.load\\(open\\('backtest_insights.json'\\)\\); [print\\(k, '-> tuned_params:', bool\\(v.get\\('tuned_params'\\)\\)\\) for k,v in d.items\\(\\)]\")",
+      "Bash(python -c \"import json; d=json.load\\(open\\('backtest_insights.json'\\)\\); print\\(json.dumps\\(d.get\\('EURJPY',{}\\), indent=2\\)\\)\")",
+      "Bash(python -c \"import odl.backtest as b; print\\([x for x in dir\\(b\\) if not x.startswith\\('_'\\)][:20]\\)\")"
     ]
   }
 }

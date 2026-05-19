@@ -43,7 +43,7 @@ function showTab(tab, btn) {
     let targetBtn = btn || document.querySelector('.tab-btn[data-tab="' + tab + '"]');
     if (targetBtn) targetBtn.classList.add('active');
     try {
-        if (tab === 'signals') fetchMarketScanBreakdown();
+        if (tab === 'market-scanner') fetchMarketScanBreakdown();
         if (tab === 'thoughts') { lastThoughtTs = null; thoughtsBuffer = []; fetchThoughtsNow(); }
         if (tab === 'positions') fetchPositions();
         if (tab === 'history') fetchHistory();
@@ -901,6 +901,8 @@ function renderKPIs(kpis) {
     const pfVal = Number(kpis.profit_factor || 0);
     _setKPI('kpi-profitfactor', pfVal >= 999 ? '\u221e' : pfVal.toFixed(2));
     _setKPI('kpi-trades', kpis.total_trades || 0);
+    const avgP = Number(kpis.avg_pnl_per_trade || 0);
+    _setKPI('kpi-avgpnl', (avgP >= 0 ? '+$' : '−$') + Math.abs(avgP).toFixed(2));
     _setKPI('kpi-return', (kpis.equity_return || 0).toFixed(2) + '%');
     _setKPI('kpi-drawdown', (kpis.max_drawdown || 0).toFixed(2) + '%');
     _setKPI('kpi-sharpe', (kpis.sharpe || 0).toFixed(2));
@@ -916,6 +918,11 @@ function renderKPIs(kpis) {
     const openCnt=kpis.open_positions||0,openPnl=Number(kpis.open_pnl||0);
     const openStr=openCnt>0?openCnt+' open ('+(openPnl>=0?'+':'')+'$'+openPnl.toFixed(2)+')':'0 open';
     _setKPI('kpi-trades-sub',(kpis.total_trades||0)+' closed \u00b7 '+openStr);
+    const _tt = kpis.total_trades || 0;
+    _setKPI('kpi-avgpnl-sub','across '+_tt+' trade'+(_tt===1?'':'s'));
+    // Colour the Avg P&L value green when positive, red when negative.
+    const _avgEl = document.getElementById('kpi-avgpnl');
+    if (_avgEl) _avgEl.style.color = avgP > 0 ? 'var(--green)' : avgP < 0 ? 'var(--red,#ff6b6b)' : '';
     const netPnl=Number(kpis.total_pnl||0);
     _setKPI('kpi-return-sub',(netPnl>=0?'+':'')+'$'+netPnl.toFixed(2)+' net');
     const mddAbs=Number(kpis.max_drawdown_abs||0);
@@ -1023,26 +1030,36 @@ function updatePortfolioWatch(positions) {
     });
 }
 
+// Pause aggressive polling when the tab is in the background — saves
+// hundreds of fetches per minute and prevents Windows socket exhaustion
+// (ERR_NO_BUFFER_SPACE) when the dashboard is left open in another tab.
+function _shouldPoll() { return document.visibilityState === 'visible'; }
+
+// One combined poll: /bot/status now carries the flattened mt5_payload,
+// so we no longer need a nested /api/mt5/status fetch (which doubled
+// socket churn on this 2-second tick).
 setInterval(() => {
-    fetch('/api/mt5/status').then(r => r.json()).then(data => {
-        updateMt5Display(data); setConnectButtonState(!!data.connected);
-        fetch('/bot/status').then(b => b.json()).then(botData => {
-            const bot = botData.bot || {}; const runningNow = !!(bot.running && data.connected);
-            if (runningNow && !__botWasRunning) autoShowAiLogTab();
-            if (!runningNow && !__userHasChosenTab) __autoAiLogShown = false;
-            __botWasRunning = runningNow; _setBotRunning(runningNow);
-            const signalsTab = document.getElementById('tab-signals');
-            if (signalsTab && signalsTab.classList.contains('active') && data.connected) fetchMarketScanBreakdown();
-        }).catch(() => {});
+    if (!_shouldPoll()) return;
+    fetch('/bot/status').then(r => r.json()).then(botData => {
+        const mt5 = botData.mt5_payload || botData.mt5 || {};
+        updateMt5Display(mt5); setConnectButtonState(!!mt5.connected);
+        const bot = botData.bot || {}; const runningNow = !!(bot.running && mt5.connected);
+        if (runningNow && !__botWasRunning) autoShowAiLogTab();
+        if (!runningNow && !__userHasChosenTab) __autoAiLogShown = false;
+        __botWasRunning = runningNow; _setBotRunning(runningNow);
+        const scannerTab = document.getElementById('tab-market-scanner');
+        if (scannerTab && scannerTab.classList.contains('active') && mt5.connected) fetchMarketScanBreakdown();
     }).catch(() => {});
 }, 2000);
 
 setInterval(() => {
+    if (!_shouldPoll()) return;
     const url = lastThoughtTs ? '/bot/ai_thoughts?limit=60&since=' + encodeURIComponent(lastThoughtTs) : '/bot/ai_thoughts?limit=60';
     fetch(url).then(r => r.json()).then(data => { if (!data.ok) return; const thoughts = data.thoughts || []; if (thoughts.length > 0) lastThoughtTs = thoughts[thoughts.length - 1].ts; displayThoughts(thoughts); }).catch(() => {});
 }, 2000);
 
 setInterval(() => {
+    if (!_shouldPoll()) return;
     fetch('/bot/positions').then(r => r.json()).then(data => {
         const positions = data.positions || [];
         // Rebuild per-symbol lookup so signal cards can show active trade info
@@ -1051,15 +1068,15 @@ setInterval(() => {
         positions.forEach(p => { if (p.symbol) openPositionsBySymbol[p.symbol] = p; });
         updatePortfolioWatch(positions);
         // Re-render signal cards so the active-trade overlay stays current
-        const sigTab = document.getElementById('tab-signals');
-        if (sigTab && sigTab.classList.contains('active')) renderMarketScanBreakdown();
+        const scannerTab = document.getElementById('tab-market-scanner');
+        if (scannerTab && scannerTab.classList.contains('active')) renderMarketScanBreakdown();
     }).catch(() => {});
     const posTab = document.getElementById('tab-positions'); if (posTab && posTab.classList.contains('active')) fetchPositions();
 }, 5000);
 
-setInterval(() => { const snapTab = document.getElementById('tab-snapshot'); if (snapTab && snapTab.classList.contains('active')) fetchBotSnapshot(); }, 3000);
-setInterval(() => { const histTab = document.getElementById('tab-history'); if (histTab && histTab.classList.contains('active')) fetchHistory(); }, 10000);
-setInterval(() => { const perfTab = document.getElementById('tab-performance'); if (perfTab && perfTab.classList.contains('active')) fetchPerformance(); }, 10000);
+setInterval(() => { if (!_shouldPoll()) return; const snapTab = document.getElementById('tab-snapshot'); if (snapTab && snapTab.classList.contains('active')) fetchBotSnapshot(); }, 3000);
+setInterval(() => { if (!_shouldPoll()) return; const histTab = document.getElementById('tab-history'); if (histTab && histTab.classList.contains('active')) fetchHistory(); }, 10000);
+setInterval(() => { if (!_shouldPoll()) return; const perfTab = document.getElementById('tab-performance'); if (perfTab && perfTab.classList.contains('active')) fetchPerformance(); }, 10000);
 
 // ── Per-Pair Strategy tuning panel ────────────────────────────
 // Fetches /api/agent/tuning every 8 s and renders per-pair strategy

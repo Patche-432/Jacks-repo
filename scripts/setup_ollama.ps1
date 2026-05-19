@@ -10,7 +10,7 @@
 #      if it isn't).
 #   2. Verifies the Ollama service is running on the configured URL
 #      (defaults to http://localhost:11434, override via $env:OLLAMA_URL).
-#   3. Pulls the configured model (default qwen2.5:3b-instruct, override
+#   3. Pulls the configured model (default qwen2.5:14b-instruct, override
 #      via $env:OLLAMA_MODEL).
 #   4. Sends a tiny test chat to confirm the agent stack will work.
 #
@@ -21,7 +21,7 @@ $ErrorActionPreference = "Stop"
 
 # -- Config (env-var overridable) --------------------------------------------
 $OllamaUrl   = if ($env:OLLAMA_URL)   { $env:OLLAMA_URL }   else { "http://localhost:11434" }
-$OllamaModel = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL } else { "qwen2.5:3b-instruct" }
+$OllamaModel = if ($env:OLLAMA_MODEL) { $env:OLLAMA_MODEL } else { "qwen2.5:14b-instruct" }
 
 # Make sure the default Ollama install dir is on PATH for this session.
 if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {

@@ -6,12 +6,26 @@
 function _btRenderMemory(data) {
     var host = document.getElementById("bt-memory-panel");
     if (!host) {
+        // Primary anchor: insert immediately after the ML Insights card.
+        // Fallback: when no backtest has run yet, bt-ml-insights doesn't
+        // exist — append to the backtest scrollable container instead so
+        // the panel still renders. Uses bt-pairs-body's grandparent, the
+        // same container ML Insights uses, so positioning is consistent.
         var mlHost = document.getElementById("bt-ml-insights");
-        if (!mlHost || !mlHost.parentNode) return;
-        host = document.createElement("div");
-        host.id = "bt-memory-panel";
-        host.style.cssText = "margin-top:16px;border:1px solid var(--bd,#2a2f3a);padding:14px;border-radius:8px;background:var(--bg0)";
-        mlHost.parentNode.insertBefore(host, mlHost.nextSibling);
+        if (mlHost && mlHost.parentNode) {
+            host = document.createElement("div");
+            host.id = "bt-memory-panel";
+            host.style.cssText = "margin-top:16px;border:1px solid var(--bd,#2a2f3a);padding:14px;border-radius:8px;background:var(--bg0)";
+            mlHost.parentNode.insertBefore(host, mlHost.nextSibling);
+        } else {
+            var body = document.getElementById("bt-pairs-body");
+            var container = body && body.parentNode && body.parentNode.parentNode;
+            if (!container) return;
+            host = document.createElement("div");
+            host.id = "bt-memory-panel";
+            host.style.cssText = "margin-top:16px;border:1px solid var(--bd,#2a2f3a);padding:14px;border-radius:8px;background:var(--bg0)";
+            container.appendChild(host);
+        }
     }
     if (!data || !data.ok) {
         host.innerHTML = "<div style=\"color:var(--txt3);font-size:11px\">\uD83D\uDCBE Trade Memory \u2014 SQLite not yet initialised (run first backtest).</div>";

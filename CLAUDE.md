@@ -90,8 +90,8 @@ Set in `.env` (see `.env.example`):
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `OLLAMA_URL` | `http://localhost:11434` | Orchestrator LLM |
-| `OLLAMA_MODEL` | `qwen2.5:3b-instruct` | Also supports `qwen2.5:7b`, `llama3.2:3b` |
-| `AGENT_TIMEOUT_S` | `60` | Max LLM wait per call |
+| `OLLAMA_MODEL` | `qwen2.5:14b-instruct` | Also supports `qwen2.5:7b`, `qwen2.5:3b`, `phi4:14b`, `llama3.2:3b` |
+| `AGENT_TIMEOUT_S` | `90` | Max LLM wait per call (14b on CPU needs 40-60s; 90s gives headroom) |
 | `AI_BACKEND` | `agent` | Set to `off`/`none`/`disabled` to kill-switch agents |
 | `FORTIS_HOST` | `127.0.0.1` | Dashboard bind address |
 | `FORTIS_PORT` | `5000` | Dashboard port |
