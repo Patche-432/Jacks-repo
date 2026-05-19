@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol          TEXT    NOT NULL,
     run_at          TEXT    NOT NULL,           -- ISO-8601 UTC
-    days            INTEGER,
+    requested_days  INTEGER,
     total_trades    INTEGER DEFAULT 0,
     wins            INTEGER DEFAULT 0,
     losses          INTEGER DEFAULT 0,
@@ -171,7 +171,7 @@ class TradeMemory:
             cur = conn.execute(
                 """
                 INSERT INTO backtest_runs
-                    (symbol, run_at, days,
+                    (symbol, run_at, requested_days,
                      total_trades, wins, losses, win_rate,
                      total_pnl, avg_pnl, avg_win_pips, avg_loss_pips,
                      profit_factor, avg_rr, avg_duration_m)
